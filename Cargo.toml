@@ -1,0 +1,22 @@
+[package]
+name = "breadcrumbs"
+version = "2.0.0"
+edition = "2021"
+description = "Profile-aware Wi-Fi state machine with Tailscale handling and self-healing watch daemon"
+license = "MIT"
+
+[[bin]]
+name = "breadcrumbs"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"

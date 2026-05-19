@@ -1,0 +1,58 @@
+# breadcrumbs configuration template.
+#
+# Copy to ~/.config/breadcrumbs/breadcrumbs.toml and fill in real values, OR
+# just run breadcrumbs once (it generates a skeleton) and then use
+# `breadcrumbs add` / `breadcrumbs edit` to fill in your networks.
+# The real breadcrumbs.toml is gitignored and never committed.
+
+[settings]
+dns = "1.1.1.1"
+nmcli_wait = 8
+exit_node = "my-exit-node"     # Tailscale hostname of your preferred exit node
+default_profile = "away"
+watch_interval = 12
+connectivity_url = "http://connectivitycheck.gstatic.com/generate_204"
+ping_host = "1.1.1.1"
+
+[[networks]]
+ssid = "HomeWifi"
+password = "REPLACE_ME"
+hidden = false
+
+[[networks]]
+ssid = "WorkGuest"
+password = "REPLACE_ME"
+hidden = false
+
+[[networks]]
+ssid = "CorpWifi"
+password = "REPLACE_ME"
+hidden = false
+
+# Location state machine. Switch with: breadcrumbs profile set <name>
+#
+# detect_ssids: list any SSIDs that reliably indicate you are at this location.
+# `breadcrumbs detect` scans for visible networks and switches to the first
+# profile whose detect_ssids list contains a match. Profiles without
+# detect_ssids are skipped during detection; the default_profile is used as
+# the final fallback.
+
+[profiles.away]
+networks = ["HomeWifi"]
+tailscale = false
+include_all_known = true
+# No detect_ssids: "away" is the catch-all fallback (set as default_profile).
+
+[profiles.home]
+networks = ["HomeWifi"]
+tailscale = false
+include_all_known = false
+detect_ssids = ["HomeWifi"]
+
+[profiles.work]
+bootstrap = "WorkGuest"        # connect here first so Tailscale can come up
+networks = ["CorpWifi"]
+tailscale = true
+exit_node = "my-exit-node"
+include_all_known = false
+detect_ssids = ["CorpWifi", "WorkGuest"]
