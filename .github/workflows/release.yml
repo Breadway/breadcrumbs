@@ -4,6 +4,9 @@ on:
   push:
     tags: ["v*"]
 
+permissions:
+  contents: write
+
 env:
   DL_DIR: /srv/breadway-dl
   ECOSYSTEM_DIR: /home/breadway/Projects/bread-ecosystem
