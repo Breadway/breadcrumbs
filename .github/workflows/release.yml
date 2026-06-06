@@ -54,6 +54,8 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           PKG_DIR="${DL_DIR}/breadcrumbs/${VERSION}"
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "breadcrumbs v${VERSION}" --generate-notes 2>/dev/null || true
           gh release upload "${GITHUB_REF_NAME}" \
             "${PKG_DIR}/breadcrumbs-x86_64" \
             "${PKG_DIR}/breadcrumbs-x86_64.sha256" \
