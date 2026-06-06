@@ -47,15 +47,13 @@ fn resolve_candidates<'a>(cfg: &'a Config, p: &crate::config::Profile) -> Vec<&'
 }
 
 /// Try to connect + confirm it actually carries traffic.
-fn connect_and_verify(iface: &str, def: &NetworkDef, cfg: &Config) -> bool {
-    if !nm::connect(iface, def, cfg.settings.nmcli_wait, &cfg.settings.dns) {
-        return false;
-    }
-    // Associated. Confirm DHCP/route by checking the device is connected.
+/// Returns Ok(()) on success, Err(reason) on failure.
+fn connect_and_verify(iface: &str, def: &NetworkDef, cfg: &Config) -> Result<(), String> {
+    nm::connect_verbose(iface, def, cfg.settings.nmcli_wait, &cfg.settings.dns)?;
     if !nm::device_connected(iface) {
-        return false;
+        return Err("device not connected after nmcli success".into());
     }
-    true
+    Ok(())
 }
 
 /// Run the connection state machine for `profile_name`.
@@ -116,11 +114,12 @@ pub fn run(cfg: &Config, profile_name: &str) -> Outcome {
             match cfg.network(&bs_ssid) {
                 Some(bdef) => {
                     if visible.contains(&bdef.ssid) || bdef.hidden {
-                        if connect_and_verify(&iface, bdef, cfg) {
-                            on_bootstrap = true;
-                            log(&format!("bootstrap connected: {}", bdef.ssid));
-                        } else {
-                            log(&format!("bootstrap connect failed: {}", bdef.ssid));
+                        match connect_and_verify(&iface, bdef, cfg) {
+                            Ok(()) => {
+                                on_bootstrap = true;
+                                log(&format!("bootstrap connected: {}", bdef.ssid));
+                            }
+                            Err(e) => log(&format!("bootstrap connect failed: {} — {e}", bdef.ssid)),
                         }
                     } else {
                         log(&format!("bootstrap not in range: {}", bdef.ssid));
@@ -155,56 +154,81 @@ pub fn run(cfg: &Config, profile_name: &str) -> Outcome {
 
     // ---- Connect to the priority list ----------------------------------
     // Pass 1: visible networks in priority order.
+    let mut any_attempted = false;
     for def in &candidates {
         if visible.contains(&def.ssid) {
-            if connect_and_verify(&iface, def, cfg) {
-                let note = if internet_ok(cfg) {
-                    None
-                } else {
-                    Some("associated but no internet yet".to_string())
-                };
-                finish_connected(&def.ssid, profile_name, &note);
-                return Outcome::Connected {
-                    ssid: def.ssid.clone(),
-                    note,
-                };
+            any_attempted = true;
+            match connect_and_verify(&iface, def, cfg) {
+                Ok(()) => {
+                    let note = if internet_ok(cfg) {
+                        None
+                    } else {
+                        Some("associated but no internet yet".to_string())
+                    };
+                    finish_connected(&def.ssid, profile_name, &note);
+                    return Outcome::Connected {
+                        ssid: def.ssid.clone(),
+                        note,
+                    };
+                }
+                Err(e) => log(&format!("connect failed (visible): {} — {e}", def.ssid)),
             }
-            log(&format!("connect failed (visible): {}", def.ssid));
         }
     }
     // Pass 2: hidden networks we couldn't see in the scan.
     for def in &candidates {
         if def.hidden && !visible.contains(&def.ssid) {
-            if connect_and_verify(&iface, def, cfg) {
-                let note = if internet_ok(cfg) {
-                    None
-                } else {
-                    Some("associated but no internet yet".to_string())
-                };
-                finish_connected(&def.ssid, profile_name, &note);
-                return Outcome::Connected {
-                    ssid: def.ssid.clone(),
-                    note,
-                };
+            any_attempted = true;
+            match connect_and_verify(&iface, def, cfg) {
+                Ok(()) => {
+                    let note = if internet_ok(cfg) {
+                        None
+                    } else {
+                        Some("associated but no internet yet".to_string())
+                    };
+                    finish_connected(&def.ssid, profile_name, &note);
+                    return Outcome::Connected {
+                        ssid: def.ssid.clone(),
+                        note,
+                    };
+                }
+                Err(e) => log(&format!("connect failed (hidden): {} — {e}", def.ssid)),
             }
-            log(&format!("connect failed (hidden): {}", def.ssid));
         }
     }
 
     // ---- Nothing in the priority list connected ------------------------
     if on_bootstrap {
-        // We still have working internet via the bootstrap + Tailscale.
-        let ssid = profile
+        // The failed candidate connect attempt disconnected us from bootstrap.
+        // Re-establish it before returning so the claimed state is real.
+        let bs_ssid = profile
             .bootstrap
             .clone()
             .unwrap_or_else(|| "bootstrap".into());
-        let note = format!("target network not in range — staying on {ssid} (Tailscale OK)");
-        notify("breadcrumbs: using bootstrap", &note, Urgency::Normal);
-        log(&format!("flow end: on bootstrap {ssid}; {note}"));
-        return Outcome::Connected {
-            ssid,
-            note: Some(note),
-        };
+        if !nm::device_connected(&iface) {
+            if let Some(bdef) = profile.bootstrap.as_deref().and_then(|s| cfg.network(s)) {
+                match connect_and_verify(&iface, bdef, cfg) {
+                    Ok(()) => log(&format!("bootstrap reconnected: {}", bdef.ssid)),
+                    Err(e) => {
+                        log(&format!("bootstrap reconnect failed: {} — {e}", bdef.ssid));
+                        on_bootstrap = false;
+                    }
+                }
+            }
+        }
+        if on_bootstrap {
+            let reason = if any_attempted {
+                format!("target network connect failed — staying on {bs_ssid} (Tailscale OK)")
+            } else {
+                format!("target network not in range — staying on {bs_ssid} (Tailscale OK)")
+            };
+            notify("breadcrumbs: using bootstrap", &reason, Urgency::Normal);
+            log(&format!("flow end: on bootstrap {bs_ssid}; {reason}"));
+            return Outcome::Connected {
+                ssid: bs_ssid,
+                note: Some(reason),
+            };
+        }
     }
 
     let names = candidates

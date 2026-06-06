@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::config::NetworkDef;
-use crate::util::{run, run_ok, run_with_stdin};
+use crate::util::{run, run_ok};
 
 /// nmcli `-t` escapes `:` and `\` in field values; undo that.
 fn unescape(s: &str) -> String {
@@ -242,37 +242,45 @@ fn enforce_dns(uuid: &str, iface: &str, dns: &str) {
 
 /// Connect to a network and pin DNS. Returns true only if associated.
 pub fn connect(iface: &str, net: &NetworkDef, wait: u32, dns: &str) -> bool {
+    connect_verbose(iface, net, wait, dns).is_ok()
+}
+
+/// Connect to a network and pin DNS. Returns the nmcli error on failure.
+///
+/// Uses `nmcli device wifi connect ... password <psk>` so the provided PSK
+/// always takes effect, even when NM already has a stale saved profile for
+/// the same SSID. The PSK is briefly visible in /proc/<pid>/cmdline, which is
+/// an acceptable trade-off for a personal desktop tool.
+pub fn connect_verbose(iface: &str, net: &NetworkDef, wait: u32, dns: &str) -> Result<(), String> {
     let wait_s = wait.to_string();
     let hidden = if net.hidden { "yes" } else { "no" };
-    // `--ask` makes nmcli read the PSK from stdin instead of taking it on the
-    // command line, so the password never appears in `ps`/`/proc`.
     let args = [
         "--wait",
         &wait_s,
-        "--ask",
         "device",
         "wifi",
         "connect",
         net.ssid.as_str(),
+        "password",
+        net.password.as_str(),
         "hidden",
         hidden,
         "ifname",
         iface,
     ];
-    let secret = format!("{}\n", net.password);
-    let o = run_with_stdin(
-        "nmcli",
-        &args,
-        Some(&secret),
-        Duration::from_secs(wait as u64 + 15),
-    );
+    let o = run("nmcli", &args, Duration::from_secs(wait as u64 + 15));
     if !o.success {
-        return false;
+        let detail = o.stderr.trim().to_string();
+        return Err(if detail.is_empty() {
+            o.stdout.trim().to_string()
+        } else {
+            detail
+        });
     }
     if let Some(uuid) = active_uuid(iface) {
         enforce_dns(&uuid, iface, dns);
     }
-    true
+    Ok(())
 }
 
 /// Delete every saved connection profile whose name or 802-11-wireless SSID

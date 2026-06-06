@@ -1,0 +1,12 @@
+name = "breadcrumbs"
+description = "Profile-aware Wi-Fi state machine with Tailscale integration"
+binaries = ["breadcrumbs"]
+system_deps = ["networkmanager"]
+bread_deps = []
+
+[config]
+dir = "~/.config/breadcrumbs"
+example = "breadcrumbs.example.toml"
+
+[install]
+post_install = []
