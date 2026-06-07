@@ -37,7 +37,7 @@ jobs:
             > "${PKG_DIR}/breadcrumbs-x86_64.sha256"
           cp breadcrumbs.example.toml "${PKG_DIR}/"
           cp bakery.toml "${PKG_DIR}/bakery.toml"
-          ln -sfn "${PKG_DIR}" "${DL_DIR}/breadcrumbs/latest"
+          ln -sfn "${VERSION}" "${DL_DIR}/breadcrumbs/latest"
 
       - name: ensure bread-ecosystem
         run: |
