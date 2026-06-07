@@ -240,6 +240,40 @@ fn enforce_dns(uuid: &str, iface: &str, dns: &str) {
     }
 }
 
+/// Return the name of the first saved NM connection profile whose name is
+/// either exactly `ssid` or `ssid N` (NM's numbered-duplicate convention).
+/// Returns `None` if no such profile exists.
+fn first_profile_for_ssid(ssid: &str) -> Option<String> {
+    let o = run(
+        "nmcli",
+        &["-t", "-f", "NAME,TYPE", "connection", "show"],
+        Duration::from_secs(8),
+    );
+    if !o.success {
+        return None;
+    }
+    let mut fallback: Option<String> = None;
+    for line in o.stdout.lines() {
+        let parts: Vec<&str> = line.splitn(2, ':').collect();
+        if parts.len() < 2 || !parts[1].contains("wireless") {
+            continue;
+        }
+        let name = unescape(parts[0]);
+        if name == ssid {
+            return Some(name);
+        }
+        if fallback.is_none() {
+            if let Some(suffix) = name.strip_prefix(ssid) {
+                let s = suffix.trim();
+                if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) {
+                    fallback = Some(name);
+                }
+            }
+        }
+    }
+    fallback
+}
+
 /// Connect to a network and pin DNS. Returns true only if associated.
 pub fn connect(iface: &str, net: &NetworkDef, wait: u32, dns: &str) -> bool {
     connect_verbose(iface, net, wait, dns).is_ok()
@@ -247,12 +281,62 @@ pub fn connect(iface: &str, net: &NetworkDef, wait: u32, dns: &str) -> bool {
 
 /// Connect to a network and pin DNS. Returns the nmcli error on failure.
 ///
-/// Uses `nmcli device wifi connect ... password <psk>` so the provided PSK
-/// always takes effect, even when NM already has a stale saved profile for
-/// the same SSID. The PSK is briefly visible in /proc/<pid>/cmdline, which is
-/// an acceptable trade-off for a personal desktop tool.
+/// Reuses an existing saved profile for the SSID when one exists (updating its
+/// PSK) so that repeated connections do not accumulate numbered duplicates in
+/// NetworkManager ("NCC", "NCC 1", "NCC 2", …). Falls back to
+/// `nmcli device wifi connect` — which creates a new profile — only when no
+/// saved profile is found.
 pub fn connect_verbose(iface: &str, net: &NetworkDef, wait: u32, dns: &str) -> Result<(), String> {
     let wait_s = wait.to_string();
+
+    if let Some(profile) = first_profile_for_ssid(&net.ssid) {
+        // Update the saved PSK and, for hidden networks, ensure the flag is set.
+        if !net.password.is_empty() {
+            let _ = run(
+                "nmcli",
+                &[
+                    "connection",
+                    "modify",
+                    &profile,
+                    "802-11-wireless-security.psk",
+                    net.password.as_str(),
+                ],
+                Duration::from_secs(6),
+            );
+        }
+        if net.hidden {
+            let _ = run(
+                "nmcli",
+                &[
+                    "connection",
+                    "modify",
+                    &profile,
+                    "802-11-wireless.hidden",
+                    "yes",
+                ],
+                Duration::from_secs(6),
+            );
+        }
+        let o = run(
+            "nmcli",
+            &["--wait", &wait_s, "connection", "up", &profile, "ifname", iface],
+            Duration::from_secs(wait as u64 + 15),
+        );
+        if !o.success {
+            let detail = o.stderr.trim().to_string();
+            return Err(if detail.is_empty() {
+                o.stdout.trim().to_string()
+            } else {
+                detail
+            });
+        }
+        if let Some(uuid) = active_uuid(iface) {
+            enforce_dns(&uuid, iface, dns);
+        }
+        return Ok(());
+    }
+
+    // No saved profile — create one via device wifi connect.
     let hidden = if net.hidden { "yes" } else { "no" };
     let args = [
         "--wait",

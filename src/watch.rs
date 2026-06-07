@@ -67,10 +67,7 @@ fn spawn_nm_monitor(tx: mpsc::Sender<()>) {
                 let l = line.to_lowercase();
                 let interesting = l.contains("disconnect")
                     || l.contains("unavailable")
-                    || l.contains("connected")
-                    || l.contains("connection")
-                    || l.contains("now")
-                    || l.contains("state");
+                    || l.contains("failed");
                 if interesting && last.elapsed() > Duration::from_millis(1500) {
                     last = Instant::now();
                     let _ = tx.send(());
@@ -126,6 +123,8 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
     let mut prev_health: Option<Health> = None;
     let mut prev_profile = profile.clone();
     let mut fail_streak: u32 = 0;
+    let mut last_flow_at: Option<Instant> = None;
+    const FLOW_COOLDOWN: u64 = 20;
 
     loop {
         // Reload config + state so edits and `profile set` take effect live.
@@ -146,6 +145,7 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
             );
             prev_profile = profile.clone();
             prev_health = None; // force re-evaluation/recovery for new profile
+            last_flow_at = None; // allow immediate recovery on profile change
         }
 
         let (health, ssid) = classify(&cfg, &profile);
@@ -199,17 +199,26 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
                         Urgency::Normal,
                     );
                 }
-                log(&format!(
-                    "watch: down ({:?}) profile={profile} ssid={:?} — running flow",
-                    health, ssid
-                ));
-                let outcome = flow::run(&cfg, &profile);
-                log(&format!("watch: recovery outcome = {:?}", outcome));
-                fail_streak = if outcome.ok() {
-                    0
+                let elapsed = last_flow_at.map(|t| t.elapsed().as_secs()).unwrap_or(u64::MAX);
+                if elapsed >= FLOW_COOLDOWN {
+                    log(&format!(
+                        "watch: down ({:?}) profile={profile} ssid={:?} — running flow",
+                        health, ssid
+                    ));
+                    let outcome = flow::run(&cfg, &profile);
+                    log(&format!("watch: recovery outcome = {:?}", outcome));
+                    last_flow_at = Some(Instant::now());
+                    fail_streak = if outcome.ok() {
+                        0
+                    } else {
+                        fail_streak.saturating_add(1)
+                    };
                 } else {
-                    fail_streak.saturating_add(1)
-                };
+                    log(&format!(
+                        "watch: down ({:?}) — cooldown ({elapsed}s/{FLOW_COOLDOWN}s), skipping flow",
+                        health
+                    ));
+                }
             }
         }
 
