@@ -2,6 +2,7 @@ name = "breadcrumbs"
 description = "Profile-aware Wi-Fi state machine with Tailscale integration"
 binaries = ["breadcrumbs"]
 system_deps = ["networkmanager"]
+optional_system_deps = ["tailscale", "sudo", "xdg-utils"]
 bread_deps = []
 
 [config]
