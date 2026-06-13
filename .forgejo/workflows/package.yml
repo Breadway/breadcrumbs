@@ -9,38 +9,32 @@ jobs:
     runs-on: [self-hosted, hestia]
     container:
       image: archlinux:latest
-      options: --privileged
-
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Set version
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_ENV
-
-      - name: Install build dependencies
-        run: pacman -Syu --noconfirm base-devel git rust cargo networkmanager
-
-      - name: Create builder user
-        run: useradd -m builder
-
-      - name: Prepare source
+      # Note: no actions/checkout — the archlinux image has no Node, which JS
+      # actions require. Everything runs as shell steps and clones manually.
+      - name: Build and publish
+        env:
+          PUBLISH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git archive --format=tar.gz \
-            --prefix=breadcrumbs-${VERSION}/ \
-            HEAD > packaging/arch/breadcrumbs-${VERSION}.tar.gz
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          pacman -Syu --noconfirm base-devel git rust cargo networkmanager
+          useradd -m builder
+          git config --global --add safe.directory '*'
+          git clone --branch "${GITHUB_REF_NAME}" --depth 1 \
+            "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" /home/builder/src
+          cd /home/builder/src
+          git archive --format=tar.gz --prefix="breadcrumbs-${VERSION}/" HEAD \
+            > packaging/arch/breadcrumbs-${VERSION}.tar.gz
           SHA=$(sha256sum packaging/arch/breadcrumbs-${VERSION}.tar.gz | awk '{print $1}')
           sed -i "s/^pkgver=.*/pkgver=${VERSION}/" packaging/arch/PKGBUILD
           sed -i "s/^sha256sums=.*/sha256sums=('${SHA}')/" packaging/arch/PKGBUILD
-          cp -r . /home/builder/src
           chown -R builder:builder /home/builder/src
-
-      - name: Build package
-        run: su builder -c "cd /home/builder/src/packaging/arch && makepkg -sf --noconfirm"
-
-      - name: Publish to Forgejo registry
-        run: |
+          # --nocheck: packaging builds the artifact; tests belong in a CI job.
+          su builder -c "cd /home/builder/src/packaging/arch && makepkg -f --noconfirm --nocheck"
           PKG=$(find /home/builder/src/packaging/arch -name '*.pkg.tar.zst' | head -1)
           curl -fsS -X PUT \
-            -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
-            --upload-file "${PKG}" \
-            "https://git.breadway.dev/api/packages/breadway/arch/push?distrib=breadway"
+            -H "Authorization: token ${PUBLISH_TOKEN}" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary "@${PKG}" \
+            "https://git.breadway.dev/api/packages/Breadway/arch/os"
