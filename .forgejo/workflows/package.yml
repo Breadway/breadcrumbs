@@ -22,7 +22,7 @@ jobs:
           useradd -m builder
           git config --global --add safe.directory '*'
           git clone --branch "${GITHUB_REF_NAME}" --depth 1 \
-            "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" /home/builder/src
+            "https://git.breadway.dev/${GITHUB_REPOSITORY}.git" /home/builder/src
           cd /home/builder/src
           git archive --format=tar.gz --prefix="breadcrumbs-${VERSION}/" HEAD \
             > packaging/arch/breadcrumbs-${VERSION}.tar.gz

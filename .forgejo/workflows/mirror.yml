@@ -12,7 +12,7 @@ jobs:
       - name: Mirror to GitHub
         run: |
           set -euo pipefail
-          git clone --mirror "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" repo.git
+          git clone --mirror "https://git.breadway.dev/${GITHUB_REPOSITORY}.git" repo.git
           cd repo.git
           # Mirror only branches and tags (not refs/pull/*, which GitHub rejects);
           # --prune deletes GitHub refs that no longer exist on Forgejo.
