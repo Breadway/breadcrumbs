@@ -10,7 +10,7 @@ license=('MIT')
 # Some Rust deps (ring/mlua) build vendored C/asm into static archives; makepkg's
 # default -flto=auto emits GCC LTO bitcode the Rust (lld) link cannot read,
 # causing undefined-symbol errors. Disable LTO.
-options=(!lto)
+options=(!lto !debug)
 depends=('networkmanager')
 optdepends=(
   'tailscale: Tailscale VPN profile integration'
