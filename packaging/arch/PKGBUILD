@@ -7,6 +7,10 @@ pkgdesc="Profile-aware Wi-Fi state machine with Tailscale integration"
 arch=('x86_64')
 url="https://github.com/Breadway/breadcrumbs"
 license=('MIT')
+# Some Rust deps (ring/mlua) build vendored C/asm into static archives; makepkg's
+# default -flto=auto emits GCC LTO bitcode the Rust (lld) link cannot read,
+# causing undefined-symbol errors. Disable LTO.
+options=(!lto)
 depends=('networkmanager')
 optdepends=(
   'tailscale: Tailscale VPN profile integration'
