@@ -17,5 +17,5 @@ jobs:
           # Mirror only branches and tags (not refs/pull/*, which GitHub rejects);
           # --prune deletes GitHub refs that no longer exist on Forgejo.
           git push --prune \
-            "https://x-access-token:${{ secrets.GITHUB_MIRROR_TOKEN }}@github.com/Breadway/breadcrumbs.git" \
+            "https://x-access-token:${{ secrets.MIRROR_TOKEN }}@github.com/Breadway/breadcrumbs.git" \
             '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*'
