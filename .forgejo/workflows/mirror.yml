@@ -1,0 +1,20 @@
+name: Mirror to GitHub
+
+on:
+  push:
+    branches: ['**']
+    tags: ['**']
+
+jobs:
+  mirror:
+    runs-on: [self-hosted, hestia]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Push to GitHub
+        run: |
+          git remote add github \
+            "https://x-access-token:${{ secrets.GITHUB_MIRROR_TOKEN }}@github.com/Breadway/breadcrumbs.git"
+          git push github --mirror
