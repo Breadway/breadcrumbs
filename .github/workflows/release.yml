@@ -9,7 +9,7 @@ permissions:
 
 env:
   DL_DIR: /srv/breadway-dl
-  ECOSYSTEM_DIR: /home/breadway/Projects/bread-ecosystem
+  ECOSYSTEM_DIR: /tmp/bread-ecosystem-ci
 
 jobs:
   build:
@@ -41,12 +41,8 @@ jobs:
 
       - name: ensure bread-ecosystem
         run: |
-          if [[ -d "${ECOSYSTEM_DIR}/.git" ]]; then
-            git -C "${ECOSYSTEM_DIR}" pull --ff-only
-          else
-            mkdir -p "$(dirname "${ECOSYSTEM_DIR}")"
-            git clone https://github.com/Breadway/bread-ecosystem.git "${ECOSYSTEM_DIR}"
-          fi
+          rm -rf "${ECOSYSTEM_DIR}"
+          git clone https://github.com/Breadway/bread-ecosystem.git "${ECOSYSTEM_DIR}"
 
       - name: regenerate index.json
         run: bash "${ECOSYSTEM_DIR}/scripts/gen-index.sh"

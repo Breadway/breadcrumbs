@@ -119,7 +119,9 @@ pub fn run(cfg: &Config, profile_name: &str) -> Outcome {
                                 on_bootstrap = true;
                                 log(&format!("bootstrap connected: {}", bdef.ssid));
                             }
-                            Err(e) => log(&format!("bootstrap connect failed: {} — {e}", bdef.ssid)),
+                            Err(e) => {
+                                log(&format!("bootstrap connect failed: {} — {e}", bdef.ssid))
+                            }
                         }
                     } else {
                         log(&format!("bootstrap not in range: {}", bdef.ssid));

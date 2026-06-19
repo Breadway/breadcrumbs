@@ -65,9 +65,8 @@ fn spawn_nm_monitor(tx: mpsc::Sender<()>) {
             let mut last = Instant::now() - Duration::from_secs(10);
             for line in reader.lines().map_while(Result::ok) {
                 let l = line.to_lowercase();
-                let interesting = l.contains("disconnect")
-                    || l.contains("unavailable")
-                    || l.contains("failed");
+                let interesting =
+                    l.contains("disconnect") || l.contains("unavailable") || l.contains("failed");
                 if interesting && last.elapsed() > Duration::from_millis(1500) {
                     last = Instant::now();
                     let _ = tx.send(());
@@ -199,7 +198,9 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
                         Urgency::Normal,
                     );
                 }
-                let elapsed = last_flow_at.map(|t| t.elapsed().as_secs()).unwrap_or(u64::MAX);
+                let elapsed = last_flow_at
+                    .map(|t| t.elapsed().as_secs())
+                    .unwrap_or(u64::MAX);
                 if elapsed >= FLOW_COOLDOWN {
                     log(&format!(
                         "watch: down ({:?}) profile={profile} ssid={:?} — running flow",

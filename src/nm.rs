@@ -319,7 +319,15 @@ pub fn connect_verbose(iface: &str, net: &NetworkDef, wait: u32, dns: &str) -> R
         }
         let o = run(
             "nmcli",
-            &["--wait", &wait_s, "connection", "up", &profile, "ifname", iface],
+            &[
+                "--wait",
+                &wait_s,
+                "connection",
+                "up",
+                &profile,
+                "ifname",
+                iface,
+            ],
             Duration::from_secs(wait as u64 + 15),
         );
         if !o.success {
