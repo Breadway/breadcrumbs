@@ -99,6 +99,20 @@ enum Cmd {
         #[arg(long)]
         show_passwords: bool,
     },
+    /// Connect to a specific saved network by SSID, bypassing profile routing
+    Join { ssid: String },
+    /// List saved network SSIDs
+    Networks {
+        /// Emit a JSON array instead of one-per-line
+        #[arg(long)]
+        json: bool,
+    },
+    /// Scan for visible networks and list them with signal strength
+    ScanList {
+        /// Emit JSON instead of human-readable output
+        #[arg(long)]
+        json: bool,
+    },
     /// Open the config file in $EDITOR
     Edit,
     /// Quick connectivity / Tailscale diagnostics
@@ -192,6 +206,9 @@ fn real_main(cli: Cli) -> Result<i32, String> {
             at,
         } => cmd_add(&mut cfg, ssid, password, hidden, to, at),
         Cmd::Forget { ssid } => cmd_forget(&mut cfg, &ssid),
+        Cmd::Join { ssid } => cmd_join(&be, &cfg, &ssid),
+        Cmd::Networks { json } => cmd_networks(&cfg, json),
+        Cmd::ScanList { json } => cmd_scan_list(&cfg, json),
         Cmd::Scan { to } => cmd_scan(&mut cfg, to),
         Cmd::List { show_passwords } => cmd_list(&cfg, show_passwords),
         Cmd::Edit => cmd_edit(),
@@ -511,6 +528,65 @@ fn cmd_add(
     }
     cfg.save()?;
     println!("{C_GREEN}saved{C_RESET} {ssid}");
+    Ok(0)
+}
+
+fn cmd_join(be: &dyn Backend, cfg: &Config, ssid: &str) -> Result<i32, String> {
+    let net = cfg
+        .network(ssid)
+        .ok_or_else(|| format!("no saved network '{ssid}' — add it first with `breadcrumbs add {ssid}`"))?;
+    let iface = be
+        .wifi_interface()
+        .ok_or_else(|| "no Wi-Fi adapter found".to_string())?;
+    be.radio_on();
+    match nm::connect_verbose(&iface, net, cfg.settings.nmcli_wait, &cfg.settings.dns) {
+        Ok(()) => {
+            println!("{C_GREEN}connected{C_RESET} {C_BOLD}{ssid}{C_RESET}");
+            Ok(0)
+        }
+        Err(e) => {
+            eprintln!("{C_RED}connect failed{C_RESET}: {e}");
+            Ok(1)
+        }
+    }
+}
+
+fn cmd_scan_list(cfg: &Config, json: bool) -> Result<i32, String> {
+    let iface = nm::wifi_interface().ok_or("no Wi-Fi adapter found")?;
+    let entries = nm::scan_list(&iface);
+    let saved: std::collections::HashSet<&str> =
+        cfg.networks.iter().map(|n| n.ssid.as_str()).collect();
+    if json {
+        let v: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "ssid":     e.ssid,
+                    "signal":   e.signal,
+                    "security": e.security,
+                    "saved":    saved.contains(e.ssid.as_str()),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string(&v).unwrap_or_else(|_| "[]".into()));
+    } else {
+        for e in &entries {
+            let mark = if saved.contains(e.ssid.as_str()) { "*" } else { " " };
+            println!("{mark} {:>3}%  {}  {}", e.signal, e.ssid, e.security);
+        }
+    }
+    Ok(0)
+}
+
+fn cmd_networks(cfg: &Config, json: bool) -> Result<i32, String> {
+    let ssids: Vec<&str> = cfg.networks.iter().map(|n| n.ssid.as_str()).collect();
+    if json {
+        println!("{}", serde_json::to_string(&ssids).unwrap_or_else(|_| "[]".into()));
+    } else {
+        for ssid in &ssids {
+            println!("{ssid}");
+        }
+    }
     Ok(0)
 }
 
