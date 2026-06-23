@@ -11,6 +11,8 @@ nmcli_wait = 8
 exit_node = "my-exit-node"     # Tailscale hostname of your preferred exit node
 default_profile = "away"
 watch_interval = 12
+# Must be a "generate_204"-style endpoint: only an empty HTTP 204 counts as
+# online, so a captive portal (200 login page / 30x redirect) is detected.
 connectivity_url = "http://connectivitycheck.gstatic.com/generate_204"
 ping_host = "1.1.1.1"
 

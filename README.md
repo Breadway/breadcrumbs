@@ -9,8 +9,10 @@ breadcrumbs sits on top of NetworkManager (`nmcli`) and manages your Wi-Fi based
 - **Profile-based connection management** — define ordered network priority lists per location
 - **Bootstrap + Tailscale gating** — connect to an interim network first, bring up Tailscale, then move to the target network
 - **Self-healing watch daemon** — monitors for drops, auto-recovers, reacts within seconds via `nmcli monitor`
-- **Auto-detection** — scans visible SSIDs and guesses your location from config-defined markers
-- **Secure credential handling** — passwords fed to `nmcli` via stdin (never in argv/`ps`), config stored at 0600
+- **Auto-detection** — scans visible SSIDs and guesses your location from config-defined markers (picks the profile with the most markers in range)
+- **Captive-portal detection** — distinguishes a real connection from a sign-in page and surfaces the portal URL instead of falsely reporting "online"
+- **Secure credential handling** — passwords fed to `nmcli` out-of-band (via stdin with `--ask`, or a 0600 `passwd-file`), never in argv/`ps`; config stored at 0600
+- **Machine-readable status** — `breadcrumbs status --json` for bars/scripts
 - **Desktop notifications** via `notify-send` (optional)
 - **systemd user service** generation via `breadcrumbs install-service`
 
@@ -25,7 +27,7 @@ breadcrumbs sits on top of NetworkManager (`nmcli`) and manages your Wi-Fi based
 ## Installation
 
 ```bash
-git clone https://github.com/breadway/breadcrumbs
+git clone https://github.com/Breadway/breadcrumbs
 cd breadcrumbs
 cargo build --release
 # Copy to somewhere on your PATH:
@@ -95,12 +97,14 @@ breadcrumbs [--profile <name>] <command>
 
 | Command | Description |
 |---------|-------------|
-| `status` | Show current Wi-Fi / Tailscale health (default) |
+| `status [--json]` | Show current Wi-Fi / Tailscale health (default); `--json` for scripts |
 | `init` | Run the full connect sequence for the active profile |
 | `watch [--no-initial]` | Self-healing daemon: monitors and auto-recovers drops |
 | `profile get` | Print the active profile |
 | `profile set <name>` | Switch profile (and apply it, unless `--no-apply`) |
 | `profile list` | List all profiles |
+| `profile add <name> [--detect <ssid>]…` | Create a new (empty) profile, optionally with detection markers |
+| `profile remove <name>` | Delete a profile (core `home`/`work`/`away` are protected) |
 | `detect [--apply]` | Guess profile from visible networks; optionally apply it |
 | `add <ssid> [password]` | Add or update a saved network |
 | `forget <ssid>` | Remove a network from config and NetworkManager |

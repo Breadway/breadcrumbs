@@ -29,6 +29,7 @@ impl State {
     pub fn save(&self) -> Result<(), String> {
         fs::create_dir_all(state_dir()).map_err(|e| format!("creating state dir: {e}"))?;
         let text = toml::to_string_pretty(self).map_err(|e| format!("serializing state: {e}"))?;
-        fs::write(state_path(), text).map_err(|e| format!("writing state: {e}"))
+        crate::util::write_atomic(&state_path(), &text, 0o644)
+            .map_err(|e| format!("writing state: {e}"))
     }
 }

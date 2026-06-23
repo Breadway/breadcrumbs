@@ -314,12 +314,67 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn ts_health_is_ok_only_for_ok_variant() {
+        assert!(TsHealth::Ok.is_ok());
+        assert!(!TsHealth::NotInstalled.is_ok());
+        assert!(!TsHealth::NeedsLogin.is_ok());
+        assert!(!TsHealth::Stopped.is_ok());
+        assert!(!TsHealth::ExitNodeMissing.is_ok());
+        assert!(!TsHealth::ExitNodeOffline.is_ok());
+        assert!(!TsHealth::Error("x".into()).is_ok());
+    }
+
+    #[test]
+    fn ts_health_describe_covers_all_variants() {
+        assert_eq!(TsHealth::Ok.describe(), "ok");
+        assert!(TsHealth::NotInstalled.describe().contains("not installed"));
+        assert!(TsHealth::NeedsLogin.describe().contains("not logged in"));
+        assert!(TsHealth::Stopped.describe().contains("stopped"));
+        assert!(TsHealth::ExitNodeMissing.describe().contains("not found"));
+        assert!(TsHealth::ExitNodeOffline.describe().contains("offline"));
+        let msg = TsHealth::Error("boom".into()).describe();
+        assert!(msg.contains("boom"));
+    }
+
+    #[test]
+    fn extract_url_finds_https_url() {
+        assert_eq!(
+            extract_url("To authenticate, visit https://login.tailscale.com/a/xxx"),
+            Some("https://login.tailscale.com/a/xxx".into())
+        );
+    }
+
+    #[test]
+    fn extract_url_returns_none_when_no_url() {
+        assert_eq!(extract_url("Waiting for login..."), None);
+        assert_eq!(extract_url(""), None);
+    }
+
+    #[test]
+    fn extract_url_picks_first_https_token() {
+        let line = "Try https://first.example.com https://second.example.com";
+        assert_eq!(extract_url(line), Some("https://first.example.com".into()));
+    }
+
+    #[test]
+    fn extract_url_does_not_match_plain_http() {
+        assert_eq!(extract_url("see http://example.com for info"), None);
+    }
+
+    #[test]
     fn backend_state_extraction() {
         assert_eq!(
             backend_state(&json!({"BackendState": "Running"})),
             "Running"
         );
         assert_eq!(backend_state(&json!({})), "");
+    }
+
+    #[test]
+    fn backend_state_all_known_values() {
+        for state in ["Running", "NeedsLogin", "NoState", "Stopped"] {
+            assert_eq!(backend_state(&json!({"BackendState": state})), state);
+        }
     }
 
     #[test]
@@ -380,5 +435,60 @@ mod tests {
             }
         });
         assert_eq!(exit_node_state(&v, "exitnode"), (true, true, false));
+    }
+
+    #[test]
+    fn exit_node_state_empty_peer_map() {
+        let v = json!({ "BackendState": "Running", "Peer": {} });
+        assert_eq!(exit_node_state(&v, "anynode"), (false, false, false));
+    }
+
+    #[test]
+    fn exit_node_state_no_peer_field() {
+        let v = json!({ "BackendState": "Running" });
+        assert_eq!(exit_node_state(&v, "anynode"), (false, false, false));
+    }
+
+    #[test]
+    fn exit_node_state_case_insensitive_hostname() {
+        let v = json!({
+            "Peer": {
+                "k1": { "HostName": "MYNODE", "DNSName": "mynode.ts.net.",
+                        "Online": true, "ExitNode": true, "ExitNodeOption": true }
+            }
+        });
+        let (exists, online, selected) = exit_node_state(&v, "mynode");
+        assert!(exists && online && selected);
+    }
+
+    #[test]
+    fn exit_node_status_overrides_peer_online_when_selected() {
+        // ExitNodeStatus.Online=false should override the peer's Online=true
+        // when the peer is the currently-selected exit node.
+        let v = json!({
+            "ExitNodeStatus": { "Online": false },
+            "Peer": {
+                "k1": { "HostName": "exitnode", "DNSName": "exitnode.ts.net.",
+                        "Online": true, "ExitNode": true, "ExitNodeOption": true }
+            }
+        });
+        let (exists, online, selected) = exit_node_state(&v, "exitnode");
+        assert!(exists);
+        assert!(
+            !online,
+            "ExitNodeStatus.Online=false should override peer Online"
+        );
+        assert!(selected);
+    }
+
+    #[test]
+    fn exit_node_state_wrong_node_name_not_matched() {
+        let v = json!({
+            "Peer": {
+                "k1": { "HostName": "othernode", "DNSName": "othernode.ts.net.",
+                        "Online": true, "ExitNode": true, "ExitNodeOption": true }
+            }
+        });
+        assert_eq!(exit_node_state(&v, "exitnode"), (false, false, false));
     }
 }

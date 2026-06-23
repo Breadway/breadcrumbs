@@ -4,6 +4,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::backend::{Backend, System};
 use crate::config::Config;
 use crate::flow;
 use crate::notify::{log, notify, Urgency};
@@ -15,32 +16,34 @@ use crate::tailscale::TsHealth;
 enum Health {
     Up,
     DownNoNet,
+    /// Associated, but a captive portal is intercepting traffic (manual login).
+    CaptivePortal,
     DownTailscaleManual,
     DownTailscaleOther,
     NoAdapter,
 }
 
-fn classify(cfg: &Config, profile: &str) -> (Health, Option<String>) {
-    let s = status::gather(cfg, profile);
-    if s.iface.is_none() {
-        return (Health::NoAdapter, None);
-    }
-    let ssid = s.ssid.clone();
-    if !s.internet {
-        return (Health::DownNoNet, ssid);
-    }
-    if s.tailscale_required {
+fn classify(be: &dyn Backend, cfg: &Config, profile: &str) -> (Health, status::Status) {
+    let s = status::gather(be, cfg, profile);
+    let health = if s.iface.is_none() {
+        Health::NoAdapter
+    } else if s.portal.is_some() {
+        Health::CaptivePortal
+    } else if !s.internet {
+        Health::DownNoNet
+    } else if s.tailscale_required {
         match s.tailscale {
-            Some(TsHealth::Ok) => (Health::Up, ssid),
+            Some(TsHealth::Ok) => Health::Up,
             Some(TsHealth::NeedsLogin) | Some(TsHealth::NotInstalled) => {
-                (Health::DownTailscaleManual, ssid)
+                Health::DownTailscaleManual
             }
-            Some(_) => (Health::DownTailscaleOther, ssid),
-            None => (Health::DownTailscaleManual, ssid),
+            Some(_) => Health::DownTailscaleOther,
+            None => Health::DownTailscaleManual,
         }
     } else {
-        (Health::Up, ssid)
-    }
+        Health::Up
+    };
+    (health, s)
 }
 
 /// Tail `nmcli monitor` and ping the channel on link-state churn so we react
@@ -105,17 +108,18 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
     let (tx, rx) = mpsc::channel::<()>();
     spawn_nm_monitor(tx);
 
+    let be = System;
     let mut profile = State::load(&cfg.settings.default_profile).profile;
     if run_initial {
         // Don't churn an already-working connection on (re)start.
-        let (h, _) = classify(&cfg, &profile);
+        let (h, _) = classify(&be, &cfg, &profile);
         if h == Health::Up {
             log(&format!(
                 "watch: already healthy on start (profile={profile}); skipping initial flow"
             ));
         } else {
             log(&format!("watch: initial flow for profile={profile}"));
-            let _ = flow::run(&cfg, &profile);
+            let _ = flow::run(&be, &cfg, &profile);
         }
     }
 
@@ -147,7 +151,8 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
             last_flow_at = None; // allow immediate recovery on profile change
         }
 
-        let (health, ssid) = classify(&cfg, &profile);
+        let (health, s) = classify(&be, &cfg, &profile);
+        let ssid = s.ssid.clone();
         let transition = prev_health.as_ref() != Some(&health);
 
         match &health {
@@ -161,6 +166,18 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
                         ),
                         Urgency::Low,
                     );
+                }
+                fail_streak = 0;
+            }
+            Health::CaptivePortal => {
+                // Associated but gated behind a sign-in page we can't automate;
+                // notify once and don't hammer flow (reconnecting won't help).
+                if transition {
+                    let body = match s.portal.as_deref().filter(|u| !u.is_empty()) {
+                        Some(url) => format!("Sign in to continue: {url}"),
+                        None => format!("Sign in to continue ({profile})."),
+                    };
+                    notify("breadcrumbs: captive portal", &body, Urgency::Normal);
                 }
                 fail_streak = 0;
             }
@@ -186,7 +203,8 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
                 }
                 // Re-run flow only on transition so we land on the bootstrap net.
                 if transition || profile_changed {
-                    let _ = flow::run(&cfg, &profile);
+                    let _ = flow::run(&be, &cfg, &profile);
+                    last_flow_at = Some(Instant::now());
                 }
                 fail_streak = fail_streak.saturating_add(1);
             }
@@ -206,7 +224,7 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
                         "watch: down ({:?}) profile={profile} ssid={:?} — running flow",
                         health, ssid
                     ));
-                    let outcome = flow::run(&cfg, &profile);
+                    let outcome = flow::run(&be, &cfg, &profile);
                     log(&format!("watch: recovery outcome = {:?}", outcome));
                     last_flow_at = Some(Instant::now());
                     fail_streak = if outcome.ok() {
