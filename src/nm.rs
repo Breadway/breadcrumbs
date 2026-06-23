@@ -1,8 +1,9 @@
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::config::NetworkDef;
-use crate::util::{run, run_ok};
+use crate::config::{state_dir, NetworkDef};
+use crate::util::{run, run_ok, run_with_stdin};
 
 /// nmcli `-t` escapes `:` and `\` in field values; undo that.
 fn unescape(s: &str) -> String {
@@ -240,6 +241,19 @@ fn enforce_dns(uuid: &str, iface: &str, dns: &str) {
     }
 }
 
+/// Return true if `name` is NetworkManager's numbered-duplicate convention for
+/// `ssid`: exactly `ssid` followed by a space and one or more decimal digits
+/// (e.g. "MyNet 1", "MyNet 2"). A name like "MyNet1" (no space) is a distinct
+/// SSID and must not match.
+fn is_numbered_nm_duplicate(name: &str, ssid: &str) -> bool {
+    if let Some(suffix) = name.strip_prefix(ssid) {
+        if let Some(digits) = suffix.strip_prefix(' ') {
+            return !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit());
+        }
+    }
+    false
+}
+
 /// Return the name of the first saved NM connection profile whose name is
 /// either exactly `ssid` or `ssid N` (NM's numbered-duplicate convention).
 /// Returns `None` if no such profile exists.
@@ -254,24 +268,56 @@ fn first_profile_for_ssid(ssid: &str) -> Option<String> {
     }
     let mut fallback: Option<String> = None;
     for line in o.stdout.lines() {
-        let parts: Vec<&str> = line.splitn(2, ':').collect();
-        if parts.len() < 2 || !parts[1].contains("wireless") {
+        // NAME may itself contain an (escaped) ':', so a plain splitn would
+        // mis-split it — parse the line the same way nmcli escapes it.
+        let fields = parse_scan_line(line);
+        if fields.len() < 2 || !fields[1].contains("wireless") {
             continue;
         }
-        let name = unescape(parts[0]);
+        let name = fields[0].clone();
         if name == ssid {
             return Some(name);
         }
-        if fallback.is_none() {
-            if let Some(suffix) = name.strip_prefix(ssid) {
-                let s = suffix.trim();
-                if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) {
-                    fallback = Some(name);
-                }
-            }
+        if fallback.is_none() && is_numbered_nm_duplicate(&name, ssid) {
+            fallback = Some(name);
         }
     }
     fallback
+}
+
+/// Write the PSK to a 0600 file in the `setting.property:value` format nmcli's
+/// `passwd-file` expects, so the secret reaches NetworkManager without ever
+/// appearing in argv (where any local user could read it via `ps`). Returns the
+/// path; the caller is responsible for removing it.
+fn write_psk_file(password: &str) -> Option<PathBuf> {
+    use std::io::Write;
+    // Prefer $XDG_RUNTIME_DIR (per-user tmpfs, mode 0700, wiped on logout) for a
+    // transient secret; fall back to the on-disk state dir only if it's unset.
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(state_dir);
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(format!("breadcrumbs.psk.{}", std::process::id()));
+    let mut f = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)
+                .ok()?
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::File::create(&path).ok()?
+        }
+    };
+    f.write_all(format!("802-11-wireless-security.psk:{password}\n").as_bytes())
+        .ok()?;
+    Some(path)
 }
 
 /// Connect to a network and pin DNS. Returns true only if associated.
@@ -290,20 +336,8 @@ pub fn connect_verbose(iface: &str, net: &NetworkDef, wait: u32, dns: &str) -> R
     let wait_s = wait.to_string();
 
     if let Some(profile) = first_profile_for_ssid(&net.ssid) {
-        // Update the saved PSK and, for hidden networks, ensure the flag is set.
-        if !net.password.is_empty() {
-            let _ = run(
-                "nmcli",
-                &[
-                    "connection",
-                    "modify",
-                    &profile,
-                    "802-11-wireless-security.psk",
-                    net.password.as_str(),
-                ],
-                Duration::from_secs(6),
-            );
-        }
+        // Ensure the hidden flag is set — this carries no secret, so passing it
+        // in argv is safe.
         if net.hidden {
             let _ = run(
                 "nmcli",
@@ -317,50 +351,64 @@ pub fn connect_verbose(iface: &str, net: &NetworkDef, wait: u32, dns: &str) -> R
                 Duration::from_secs(6),
             );
         }
-        let o = run(
-            "nmcli",
-            &[
-                "--wait",
-                &wait_s,
-                "connection",
-                "up",
-                &profile,
-                "ifname",
-                iface,
-            ],
-            Duration::from_secs(wait as u64 + 15),
-        );
-        if !o.success {
-            let detail = o.stderr.trim().to_string();
-            return Err(if detail.is_empty() {
-                o.stdout.trim().to_string()
-            } else {
-                detail
-            });
+        // Supply the PSK to the activation via a 0600 passwd-file rather than
+        // argv. Harmless if NM already has a matching secret stored.
+        let psk_file = if net.password.is_empty() {
+            None
+        } else {
+            write_psk_file(&net.password)
+        };
+        let psk_path = psk_file.as_ref().map(|p| p.display().to_string());
+        let mut args: Vec<&str> = vec![
+            "--wait",
+            &wait_s,
+            "connection",
+            "up",
+            &profile,
+            "ifname",
+            iface,
+        ];
+        if let Some(ref p) = psk_path {
+            args.push("passwd-file");
+            args.push(p.as_str());
         }
-        if let Some(uuid) = active_uuid(iface) {
-            enforce_dns(&uuid, iface, dns);
+        let o = run("nmcli", &args, Duration::from_secs(wait as u64 + 15));
+        if let Some(p) = psk_file {
+            let _ = std::fs::remove_file(p);
         }
-        return Ok(());
+        if o.success {
+            if let Some(uuid) = active_uuid(iface) {
+                enforce_dns(&uuid, iface, dns);
+            }
+            return Ok(());
+        }
+        // Activation failed (e.g. the saved secret is stale). Fall through to a
+        // fresh connect below, which re-supplies the PSK over stdin.
     }
 
-    // No saved profile — create one via device wifi connect.
+    // No saved profile (or reuse failed) — create/refresh via device wifi
+    // connect. `--ask` makes nmcli read the PSK from stdin instead of argv.
     let hidden = if net.hidden { "yes" } else { "no" };
     let args = [
+        "--ask",
         "--wait",
         &wait_s,
         "device",
         "wifi",
         "connect",
         net.ssid.as_str(),
-        "password",
-        net.password.as_str(),
         "hidden",
         hidden,
         "ifname",
         iface,
     ];
-    let o = run("nmcli", &args, Duration::from_secs(wait as u64 + 15));
+    let stdin = format!("{}\n", net.password);
+    let o = run_with_stdin(
+        "nmcli",
+        &args,
+        Some(&stdin),
+        Duration::from_secs(wait as u64 + 15),
+    );
     if !o.success {
         let detail = o.stderr.trim().to_string();
         return Err(if detail.is_empty() {
@@ -388,15 +436,12 @@ pub fn delete_connections_for_ssid(ssid: &str) -> bool {
     }
     let mut removed = false;
     for line in list.stdout.lines() {
-        let parts: Vec<&str> = line.splitn(2, ':').collect();
-        if parts.len() < 2 {
+        // NAME may contain an escaped ':' — parse rather than naive-split.
+        let fields = parse_scan_line(line);
+        if fields.len() < 2 || !fields[1].contains("wireless") {
             continue;
         }
-        let name = unescape(parts[0]);
-        let typ = parts[1];
-        if !typ.contains("wireless") {
-            continue;
-        }
+        let name = fields[0].clone();
         let conn_ssid = run(
             "nmcli",
             &["-g", "802-11-wireless.ssid", "connection", "show", &name],
@@ -429,6 +474,21 @@ mod tests {
     }
 
     #[test]
+    fn unescape_empty_string() {
+        assert_eq!(unescape(""), "");
+    }
+
+    #[test]
+    fn unescape_multiple_consecutive_escapes() {
+        assert_eq!(unescape(r"a\:b\:c"), "a:b:c");
+    }
+
+    #[test]
+    fn unescape_double_backslash_produces_single() {
+        assert_eq!(unescape(r"a\\b"), r"a\b");
+    }
+
+    #[test]
     fn parse_scan_line_splits_and_unescapes() {
         // SSID:SIGNAL:SECURITY with an escaped ':' inside the SSID.
         let f = parse_scan_line(r"My\:Net:72:WPA2");
@@ -441,5 +501,72 @@ mod tests {
         // Empty SSID (hidden) keeps the empty leading field.
         let f = parse_scan_line(":40:WPA3");
         assert_eq!(f, vec!["", "40", "WPA3"]);
+    }
+
+    #[test]
+    fn parse_scan_line_single_field_no_separators() {
+        let f = parse_scan_line("OnlySSID");
+        assert_eq!(f, vec!["OnlySSID"]);
+    }
+
+    #[test]
+    fn parse_scan_line_empty_input_yields_one_empty_field() {
+        let f = parse_scan_line("");
+        assert_eq!(f, vec![""]);
+    }
+
+    #[test]
+    fn parse_scan_line_all_empty_fields() {
+        // Three colons → four empty fields.
+        let f = parse_scan_line(":::");
+        assert_eq!(f, vec!["", "", "", ""]);
+    }
+
+    #[test]
+    fn parse_scan_line_multiple_escaped_colons_in_ssid() {
+        let f = parse_scan_line(r"a\:b\:c:80:WPA3");
+        assert_eq!(f, vec!["a:b:c", "80", "WPA3"]);
+    }
+
+    #[test]
+    fn parse_scan_line_backslash_escape_then_colon_separator() {
+        // "abc\:60:WPA2" — \: is an escaped colon inside the SSID, not a separator.
+        let f = parse_scan_line(r"abc\:60:WPA2");
+        assert_eq!(f, vec!["abc:60", "WPA2"]);
+    }
+
+    #[test]
+    fn is_numbered_nm_duplicate_exact_match_is_not_duplicate() {
+        assert!(!is_numbered_nm_duplicate("Net", "Net"));
+    }
+
+    #[test]
+    fn is_numbered_nm_duplicate_space_digits_matches() {
+        assert!(is_numbered_nm_duplicate("Net 1", "Net"));
+        assert!(is_numbered_nm_duplicate("My Network 12", "My Network"));
+    }
+
+    #[test]
+    fn is_numbered_nm_duplicate_no_space_does_not_match() {
+        // "Net1" is a distinct SSID, not a numbered duplicate of "Net".
+        assert!(!is_numbered_nm_duplicate("Net1", "Net"));
+        assert!(!is_numbered_nm_duplicate("HomeWifi2", "HomeWifi"));
+    }
+
+    #[test]
+    fn is_numbered_nm_duplicate_non_numeric_suffix_does_not_match() {
+        assert!(!is_numbered_nm_duplicate("Net foo", "Net"));
+        assert!(!is_numbered_nm_duplicate("Net 1x", "Net"));
+    }
+
+    #[test]
+    fn is_numbered_nm_duplicate_empty_digits_does_not_match() {
+        // "Net " (trailing space only, no digits) must not match.
+        assert!(!is_numbered_nm_duplicate("Net ", "Net"));
+    }
+
+    #[test]
+    fn is_numbered_nm_duplicate_unrelated_name_does_not_match() {
+        assert!(!is_numbered_nm_duplicate("OtherNet 1", "Net"));
     }
 }

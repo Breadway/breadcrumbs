@@ -1,3 +1,4 @@
+mod backend;
 mod config;
 mod flow;
 mod nm;
@@ -14,6 +15,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
+use backend::Backend;
 use config::{Config, NetworkDef};
 use state::State;
 use util::{command_exists, home_dir, run};
@@ -44,7 +46,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Show current Wi-Fi / profile / Tailscale status (default)
-    Status,
+    Status {
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
     /// Run the full connect sequence for the active profile
     #[command(visible_aliases = ["up", "connect", "i"])]
     Init,
@@ -126,6 +132,15 @@ enum ProfileCmd {
     },
     /// List available profiles
     List,
+    /// Create a new (empty) profile
+    Add {
+        name: String,
+        /// SSID whose presence marks this location (repeatable, for `detect`)
+        #[arg(long = "detect")]
+        detect: Vec<String>,
+    },
+    /// Delete a profile (core profiles home/work/away cannot be removed)
+    Remove { name: String },
 }
 
 fn main() {
@@ -148,7 +163,7 @@ fn active_profile(cfg: &Config, override_p: &Option<String>) -> String {
 }
 
 fn real_main(cli: Cli) -> Result<i32, String> {
-    let cmd = cli.cmd.unwrap_or(Cmd::Status);
+    let cmd = cli.cmd.unwrap_or(Cmd::Status { json: false });
 
     // `cd` and `install-service` don't need a parsed config first.
     if let Cmd::Cd { shell } = &cmd {
@@ -156,18 +171,19 @@ fn real_main(cli: Cli) -> Result<i32, String> {
     }
 
     let mut cfg = Config::load()?;
+    let be = backend::System;
 
     match cmd {
-        Cmd::Status => cmd_status(&cfg, &cli.profile),
+        Cmd::Status { json } => cmd_status(&be, &cfg, &cli.profile, json),
         Cmd::Init => {
             let p = active_profile(&cfg, &cli.profile);
-            let outcome = flow::run(&cfg, &p);
+            let outcome = flow::run(&be, &cfg, &p);
             print_outcome(&p, &outcome);
             Ok(if outcome.ok() { 0 } else { 1 })
         }
         Cmd::Watch { no_initial } => Ok(watch::run(cfg, !no_initial)),
-        Cmd::Profile { action } => cmd_profile(&cfg, action),
-        Cmd::Detect { apply } => cmd_detect(&cfg, apply),
+        Cmd::Profile { action } => cmd_profile(&be, &mut cfg, action),
+        Cmd::Detect { apply } => cmd_detect(&be, &cfg, apply),
         Cmd::Add {
             ssid,
             password,
@@ -179,7 +195,7 @@ fn real_main(cli: Cli) -> Result<i32, String> {
         Cmd::Scan { to } => cmd_scan(&mut cfg, to),
         Cmd::List { show_passwords } => cmd_list(&cfg, show_passwords),
         Cmd::Edit => cmd_edit(),
-        Cmd::Doctor { full } => cmd_doctor(&cfg, &cli.profile, full),
+        Cmd::Doctor { full } => cmd_doctor(&be, &cfg, &cli.profile, full),
         Cmd::InstallService { no_enable } => cmd_install_service(!no_enable),
         Cmd::Cd { .. } => unreachable!(),
     }
@@ -213,9 +229,45 @@ fn print_outcome(profile: &str, o: &flow::Outcome) {
     }
 }
 
-fn cmd_status(cfg: &Config, override_p: &Option<String>) -> Result<i32, String> {
+fn status_healthy(s: &status::Status) -> bool {
+    s.internet
+        && s.iface.is_some()
+        && (!s.tailscale_required || s.tailscale.as_ref().map(|h| h.is_ok()).unwrap_or(false))
+}
+
+fn cmd_status(
+    be: &dyn Backend,
+    cfg: &Config,
+    override_p: &Option<String>,
+    json: bool,
+) -> Result<i32, String> {
     let p = active_profile(cfg, override_p);
-    let s = status::gather(cfg, &p);
+    let s = status::gather(be, cfg, &p);
+    let healthy = status_healthy(&s);
+
+    if json {
+        let v = serde_json::json!({
+            "profile": p,
+            "adapter": s.iface,
+            "ssid": s.ssid,
+            "ip": s.ip,
+            "internet": s.internet,
+            "captive_portal": s.portal,
+            "tailscale": {
+                "required": s.tailscale_required,
+                "installed": s.tailscale.is_some(),
+                "ok": s.tailscale.as_ref().map(|h| h.is_ok()),
+                "health": s.tailscale.as_ref().map(|h| h.describe()),
+                "exit_node": s.exit_node,
+            },
+            "healthy": healthy,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".into())
+        );
+        return Ok(if healthy { 0 } else { 1 });
+    }
 
     let dot = |ok: bool| {
         if ok {
@@ -248,6 +300,14 @@ fn cmd_status(cfg: &Config, override_p: &Option<String>) -> Result<i32, String> 
         dot(s.internet),
         if s.internet { "ok" } else { "down" }
     );
+    if let Some(portal) = &s.portal {
+        let detail = if portal.is_empty() {
+            "sign-in required".to_string()
+        } else {
+            portal.clone()
+        };
+        println!("  portal      {C_YELLOW}captive portal{C_RESET} {C_DIM}{detail}{C_RESET}");
+    }
 
     match (&s.tailscale, s.tailscale_required) {
         (Some(h), req) => {
@@ -263,9 +323,6 @@ fn cmd_status(cfg: &Config, override_p: &Option<String>) -> Result<i32, String> 
         (None, _) => println!("  tailscale   {C_DIM}not installed{C_RESET}"),
     }
 
-    let healthy = s.internet
-        && s.iface.is_some()
-        && (!s.tailscale_required || s.tailscale.as_ref().map(|h| h.is_ok()).unwrap_or(false));
     println!(
         "  state       {}",
         if healthy {
@@ -277,7 +334,13 @@ fn cmd_status(cfg: &Config, override_p: &Option<String>) -> Result<i32, String> 
     Ok(if healthy { 0 } else { 1 })
 }
 
-fn cmd_profile(cfg: &Config, action: Option<ProfileCmd>) -> Result<i32, String> {
+const CORE_PROFILES: [&str; 3] = ["home", "work", "away"];
+
+fn cmd_profile(
+    be: &dyn Backend,
+    cfg: &mut Config,
+    action: Option<ProfileCmd>,
+) -> Result<i32, String> {
     match action.unwrap_or(ProfileCmd::Get) {
         ProfileCmd::Get => {
             println!("{}", State::load(&cfg.settings.default_profile).profile);
@@ -289,6 +352,34 @@ fn cmd_profile(cfg: &Config, action: Option<ProfileCmd>) -> Result<i32, String> 
                 let mark = if *name == cur { "*" } else { " " };
                 println!("{mark} {name}");
             }
+            Ok(0)
+        }
+        ProfileCmd::Add { name, detect } => {
+            if cfg.profiles.contains_key(&name) {
+                return Err(format!("profile '{name}' already exists"));
+            }
+            cfg.profiles.insert(
+                name.clone(),
+                config::Profile {
+                    detect_ssids: detect,
+                    ..Default::default()
+                },
+            );
+            cfg.save()?;
+            println!("{C_GREEN}added{C_RESET} profile {name}");
+            Ok(0)
+        }
+        ProfileCmd::Remove { name } => {
+            if CORE_PROFILES.contains(&name.as_str()) {
+                return Err(format!(
+                    "'{name}' is a core profile and is always recreated; clear its networks instead"
+                ));
+            }
+            if cfg.profiles.remove(&name).is_none() {
+                return Err(format!("unknown profile '{name}'"));
+            }
+            cfg.save()?;
+            println!("{C_GREEN}removed{C_RESET} profile {name}");
             Ok(0)
         }
         ProfileCmd::Set { name, no_apply } => {
@@ -306,40 +397,46 @@ fn cmd_profile(cfg: &Config, action: Option<ProfileCmd>) -> Result<i32, String> 
             if no_apply {
                 return Ok(0);
             }
-            let outcome = flow::run(cfg, &name);
+            let outcome = flow::run(be, cfg, &name);
             print_outcome(&name, &outcome);
             Ok(if outcome.ok() { 0 } else { 1 })
         }
     }
 }
 
-fn detect_profile(cfg: &Config) -> Option<String> {
-    let iface = nm::wifi_interface()?;
-    nm::radio_on();
-    nm::rescan(&iface, &[]);
-    let visible = nm::visible_ssids(&iface);
+fn detect_profile(be: &dyn Backend, cfg: &Config) -> Option<String> {
+    let iface = be.wifi_interface()?;
+    be.radio_on();
+    be.rescan(&iface, &[]);
+    let visible = be.visible_ssids(&iface);
 
-    // Profiles are stored in a BTreeMap so iteration order is deterministic
-    // (alphabetical). The caller can rely on that for tie-breaking.
+    // Pick the profile with the most marker SSIDs in range, so overlapping
+    // locations disambiguate by strength of evidence. Profiles iterate in
+    // BTreeMap (alphabetical) order, which deterministically breaks ties.
+    let mut best: Option<(usize, String)> = None;
     for (name, profile) in &cfg.profiles {
-        if profile.detect_ssids.is_empty() {
-            continue;
-        }
-        if profile
+        let score = profile
             .detect_ssids
             .iter()
-            .any(|s| visible.contains(s.as_str()))
-        {
-            return Some(name.clone());
+            .filter(|s| visible.contains(s.as_str()))
+            .count();
+        if score == 0 {
+            continue;
+        }
+        if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
+            best = Some((score, name.clone()));
         }
     }
 
     // Fall back to the default profile if no markers matched.
-    Some(cfg.settings.default_profile.clone())
+    Some(
+        best.map(|(_, name)| name)
+            .unwrap_or_else(|| cfg.settings.default_profile.clone()),
+    )
 }
 
-fn cmd_detect(cfg: &Config, apply: bool) -> Result<i32, String> {
-    match detect_profile(cfg) {
+fn cmd_detect(be: &dyn Backend, cfg: &Config, apply: bool) -> Result<i32, String> {
+    match detect_profile(be, cfg) {
         Some(p) => {
             println!("{p}");
             if apply {
@@ -348,7 +445,7 @@ fn cmd_detect(cfg: &Config, apply: bool) -> Result<i32, String> {
                     updated: util::timestamp(),
                 }
                 .save()?;
-                let outcome = flow::run(cfg, &p);
+                let outcome = flow::run(be, cfg, &p);
                 print_outcome(&p, &outcome);
                 return Ok(if outcome.ok() { 0 } else { 1 });
             }
@@ -497,10 +594,14 @@ fn cmd_scan(cfg: &mut Config, to: Option<String>) -> Result<i32, String> {
 }
 
 fn mask(p: &str) -> String {
-    if p.len() <= 2 {
+    // Count by characters, not bytes: slicing &p[..1] would panic on a
+    // multi-byte first character (valid in WPA passphrases).
+    let count = p.chars().count();
+    if count <= 2 {
         "••".into()
     } else {
-        format!("{}{}", &p[..1], "•".repeat(p.len().saturating_sub(1)))
+        let first: String = p.chars().take(1).collect();
+        format!("{}{}", first, "•".repeat(count - 1))
     }
 }
 
@@ -573,7 +674,12 @@ fn cmd_edit() -> Result<i32, String> {
     }
 }
 
-fn cmd_doctor(cfg: &Config, override_p: &Option<String>, full: bool) -> Result<i32, String> {
+fn cmd_doctor(
+    be: &dyn Backend,
+    cfg: &Config,
+    override_p: &Option<String>,
+    full: bool,
+) -> Result<i32, String> {
     if full {
         let script = config::config_dir().join("diag.sh");
         if !script.exists() {
@@ -590,7 +696,7 @@ fn cmd_doctor(cfg: &Config, override_p: &Option<String>, full: bool) -> Result<i
     }
 
     let p = active_profile(cfg, override_p);
-    let s = status::gather(cfg, &p);
+    let s = status::gather(be, cfg, &p);
     println!("{C_BOLD}breadcrumbs doctor{C_RESET}  (profile {p})");
     println!(
         "  nmcli       {}",

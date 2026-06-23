@@ -1,7 +1,7 @@
 # Maintainer: Breadway <rileyhorsham@gmail.com>
 
 pkgname=breadcrumbs
-pkgver=0.1.0
+pkgver=2.1.0
 pkgrel=1
 pkgdesc="Profile-aware Wi-Fi state machine with Tailscale integration"
 arch=('x86_64')

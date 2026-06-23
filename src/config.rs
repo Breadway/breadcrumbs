@@ -158,13 +158,10 @@ impl Config {
         fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
         let text = toml::to_string_pretty(self).map_err(|e| format!("serializing config: {e}"))?;
         let path = config_path();
-        fs::write(&path, text).map_err(|e| format!("writing {}: {e}", path.display()))?;
-        // Plaintext Wi-Fi passwords live here — keep it owner-only.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
-        }
+        // Plaintext Wi-Fi passwords live here: write atomically and owner-only,
+        // so there's no torn read and no world-readable window.
+        crate::util::write_atomic(&path, &text, 0o600)
+            .map_err(|e| format!("writing {}: {e}", path.display()))?;
         Ok(())
     }
 }
@@ -273,5 +270,125 @@ mod tests {
         assert!(cfg.profile("home").is_some());
         assert!(cfg.profile("work").is_some());
         assert!(cfg.profile("away").is_some());
+    }
+
+    #[test]
+    fn ensure_core_profiles_does_not_overwrite_existing() {
+        let mut cfg = Config {
+            settings: Settings::default(),
+            networks: vec![],
+            profiles: BTreeMap::new(),
+        };
+        cfg.profiles.insert(
+            "home".to_string(),
+            Profile {
+                tailscale: true,
+                exit_node: Some("mynode".into()),
+                ..Default::default()
+            },
+        );
+        ensure_core_profiles(&mut cfg);
+        let home = cfg.profile("home").unwrap();
+        assert!(home.tailscale, "existing field should be preserved");
+        assert_eq!(home.exit_node.as_deref(), Some("mynode"));
+    }
+
+    #[test]
+    fn network_lookup_found_and_not_found() {
+        let mut cfg = build_initial_config();
+        cfg.networks.push(NetworkDef {
+            ssid: "TestNet".into(),
+            password: "secret".into(),
+            hidden: false,
+        });
+        let found = cfg.network("TestNet");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().password, "secret");
+        assert!(cfg.network("NoSuchSSID").is_none());
+    }
+
+    #[test]
+    fn profile_lookup_found_and_not_found() {
+        let cfg = build_initial_config();
+        assert!(cfg.profile("home").is_some());
+        assert!(cfg.profile("nonexistent").is_none());
+    }
+
+    #[test]
+    fn settings_default_values() {
+        let s = Settings::default();
+        assert_eq!(s.dns, "1.1.1.1");
+        assert_eq!(s.nmcli_wait, 8);
+        assert!(s.exit_node.is_empty());
+        assert_eq!(s.default_profile, "away");
+        assert_eq!(s.watch_interval, 12);
+        assert!(!s.connectivity_url.is_empty());
+        assert!(!s.ping_host.is_empty());
+    }
+
+    #[test]
+    fn config_toml_roundtrip_with_hidden_network() {
+        let mut cfg = build_initial_config();
+        cfg.networks.push(NetworkDef {
+            ssid: "HiddenNet".into(),
+            password: "pw".into(),
+            hidden: true,
+        });
+        cfg.networks.push(NetworkDef {
+            ssid: "VisibleNet".into(),
+            password: "pw2".into(),
+            hidden: false,
+        });
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.networks.len(), 2);
+        let hidden = back.network("HiddenNet").unwrap();
+        assert!(hidden.hidden);
+        let visible = back.network("VisibleNet").unwrap();
+        assert!(!visible.hidden);
+    }
+
+    #[test]
+    fn config_toml_roundtrip_with_full_profile_fields() {
+        let mut cfg = build_initial_config();
+        let work = cfg.profiles.get_mut("work").unwrap();
+        work.tailscale = true;
+        work.exit_node = Some("myexit".into());
+        work.bootstrap = Some("BootstrapSSID".into());
+        work.detect_ssids = vec!["WorkWifi".into(), "CorpGuest".into()];
+        work.networks = vec!["WorkWifi".into()];
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        let w = back.profile("work").unwrap();
+        assert!(w.tailscale);
+        assert_eq!(w.exit_node.as_deref(), Some("myexit"));
+        assert_eq!(w.bootstrap.as_deref(), Some("BootstrapSSID"));
+        assert_eq!(w.detect_ssids, vec!["WorkWifi", "CorpGuest"]);
+        assert_eq!(w.networks, vec!["WorkWifi"]);
+    }
+
+    #[test]
+    fn config_deserialization_applies_settings_defaults_for_missing_fields() {
+        let toml_str = r#"
+[settings]
+dns = "8.8.8.8"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.settings.dns, "8.8.8.8");
+        // Fields not specified should get their defaults.
+        assert_eq!(cfg.settings.nmcli_wait, 8);
+        assert_eq!(cfg.settings.default_profile, "away");
+        assert_eq!(cfg.settings.watch_interval, 12);
+    }
+
+    #[test]
+    fn network_def_hidden_defaults_to_false() {
+        let toml_str = r#"
+[[networks]]
+ssid = "MyNet"
+password = "pass"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(!cfg.networks[0].hidden);
     }
 }
