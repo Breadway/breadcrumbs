@@ -1,11 +1,12 @@
 [Unit]
 Description=breadcrumbs Wi-Fi state machine watcher
 Documentation=https://git.breadway.dev/Breadway/breadcrumbs
-After=network.target NetworkManager.service graphical-session.target
-Wants=network.target graphical-session.target
+After=network.target NetworkManager.service
+Wants=network.target
 
 [Service]
 Type=simple
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # ExecStart is rewritten at install time by bakery to point at the real
 # bin_dir (patch_exec_start in bakery's install.rs) — this path is only a
 # placeholder for local testing.
@@ -19,4 +20,11 @@ StandardOutput=journal
 StandardError=journal
 
 [Install]
-WantedBy=graphical-session.target
+# default.target, not graphical-session.target: breadcrumbs is a headless
+# network daemon with no Wayland/GUI dependency, and graphical-session.target
+# ships with RefuseManualStart=yes (only a session manager like uwsm can
+# activate it — BOS doesn't use one, which is why breadclipd needs a manual
+# `systemctl --user start` in hyprland.lua's exec-once instead of relying on
+# WantedBy). default.target activates normally with the user session, no
+# workaround needed.
+WantedBy=default.target
