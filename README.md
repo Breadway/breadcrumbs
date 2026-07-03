@@ -108,7 +108,10 @@ breadcrumbs [--profile <name>] <command>
 | `detect [--apply]` | Guess profile from visible networks; optionally apply it |
 | `add <ssid> [password]` | Add or update a saved network |
 | `forget <ssid>` | Remove a network from config and NetworkManager |
+| `join <ssid>` | Connect to a specific saved network by SSID, bypassing profile routing |
+| `networks [--json]` | List saved network SSIDs |
 | `scan [--to <profile>]` | Interactive scan, pick, connect and save |
+| `scan-list [--json]` | Scan for visible networks and list them with signal strength |
 | `list [--show-passwords]` | Show config: settings, networks, profiles |
 | `edit` | Open config in `$EDITOR`, validate on exit |
 | `doctor [--full]` | Quick connectivity and Tailscale diagnostics |
