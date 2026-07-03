@@ -33,6 +33,7 @@ jobs:
             > "${PKG_DIR}/breadcrumbs-x86_64.sha256"
           cp src/breadcrumbs.example.toml "${PKG_DIR}/"
           cp src/bakery.toml "${PKG_DIR}/bakery.toml"
+          cp src/contrib/breadcrumbs.service "${PKG_DIR}/"
           ln -sfn "${VERSION}" "/srv/breadway-dl/breadcrumbs/latest"
 
       - name: regenerate index.json

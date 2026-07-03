@@ -9,5 +9,11 @@ bread_deps = []
 dir = "~/.config/breadcrumbs"
 example = "breadcrumbs.example.toml"
 
+[[service]]
+unit = "breadcrumbs.service"
+enable = true
+
 [install]
-post_install = []
+post_install = [
+    "systemctl --user is-active --quiet breadcrumbs || systemctl --user start breadcrumbs",
+]

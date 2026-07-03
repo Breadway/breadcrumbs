@@ -1,0 +1,22 @@
+[Unit]
+Description=breadcrumbs Wi-Fi state machine watcher
+Documentation=https://git.breadway.dev/Breadway/breadcrumbs
+After=network.target NetworkManager.service graphical-session.target
+Wants=network.target graphical-session.target
+
+[Service]
+Type=simple
+# ExecStart is rewritten at install time by bakery to point at the real
+# bin_dir (patch_exec_start in bakery's install.rs) — this path is only a
+# placeholder for local testing.
+ExecStart=%h/.local/bin/breadcrumbs watch
+Restart=always
+RestartSec=5
+Nice=5
+
+# Forward stdout/stderr to the journal so `journalctl --user -u breadcrumbs` works
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical-session.target
