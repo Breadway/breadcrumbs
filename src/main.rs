@@ -330,10 +330,10 @@ fn cmd_status(
         (Some(h), req) => {
             let ok = h.is_ok();
             println!(
-                "  tailscale   {} {} {C_DIM}(exit: {}{}){C_RESET}",
+                "  tailscale   {} {} {C_DIM}(exit node: {}{}){C_RESET}",
                 dot(ok || !req),
                 h.describe(),
-                s.exit_node,
+                if s.exit_node.is_empty() { "none" } else { &s.exit_node },
                 if req { "" } else { ", optional" }
             );
         }
@@ -715,11 +715,13 @@ fn cmd_list(cfg: &Config, show_pw: bool) -> Result<i32, String> {
             println!("    bootstrap   {b}");
         }
         if p.tailscale {
+            let exit_node = p
+                .exit_node
+                .clone()
+                .unwrap_or_else(|| cfg.settings.exit_node.clone());
             println!(
-                "    tailscale   required (exit: {})",
-                p.exit_node
-                    .clone()
-                    .unwrap_or_else(|| cfg.settings.exit_node.clone())
+                "    tailscale   required (exit node: {})",
+                if exit_node.is_empty() { "none".to_string() } else { exit_node }
             );
         }
         let mut order: Vec<String> = p.networks.clone();
@@ -804,7 +806,11 @@ fn cmd_doctor(
     );
     println!("  internet    {}", if s.internet { "ok" } else { "DOWN" });
     if let Some(h) = &s.tailscale {
-        println!("  tailscale   {} (exit {})", h.describe(), s.exit_node);
+        println!(
+            "  tailscale   {} (exit node: {})",
+            h.describe(),
+            if s.exit_node.is_empty() { "none" } else { &s.exit_node }
+        );
     }
 
     if let Some(iface) = &s.iface {
