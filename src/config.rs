@@ -218,8 +218,15 @@ fn core_profiles() -> BTreeMap<String, Profile> {
 }
 
 fn ensure_core_profiles(cfg: &mut Config) {
+    // Only self-heal a genuinely empty/corrupted profile set. A user who has
+    // defined their own profiles (any names, any case) should never have
+    // unused core-profile stubs ("home"/"work"/"away") silently padded in
+    // alongside them.
+    if !cfg.profiles.is_empty() {
+        return;
+    }
     for (name, prof) in core_profiles() {
-        cfg.profiles.entry(name).or_insert(prof);
+        cfg.profiles.insert(name, prof);
     }
 }
 
@@ -291,6 +298,25 @@ mod tests {
         let home = cfg.profile("home").unwrap();
         assert!(home.tailscale, "existing field should be preserved");
         assert_eq!(home.exit_node.as_deref(), Some("mynode"));
+    }
+
+    #[test]
+    fn ensure_core_profiles_does_not_pad_a_customized_profile_set() {
+        let mut cfg = Config {
+            settings: Settings::default(),
+            networks: vec![],
+            profiles: BTreeMap::new(),
+        };
+        cfg.profiles.insert("Home".to_string(), Profile::default());
+        cfg.profiles.insert("Away".to_string(), Profile::default());
+        cfg.profiles.insert("School".to_string(), Profile::default());
+        ensure_core_profiles(&mut cfg);
+        // The user's own profile names are untouched, and no unused
+        // core-profile stubs (home/work/away) get injected alongside them.
+        assert_eq!(cfg.profiles.len(), 3);
+        assert!(cfg.profile("home").is_none());
+        assert!(cfg.profile("work").is_none());
+        assert!(cfg.profile("away").is_none());
     }
 
     #[test]
