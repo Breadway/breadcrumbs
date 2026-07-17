@@ -14,6 +14,8 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 serde_json = "1"
+# TODO(owner): switch to tag-pinned git dependency once bread-utils is merged and tagged, matching the bread-theme pattern
+bread-utils = { path = "../bread-ecosystem-fix-worktree/bread-utils" }
 
 [profile.release]
 opt-level = "s"
