@@ -1,6 +1,6 @@
 [package]
 name = "breadcrumbs"
-version = "2.1.5"
+version = "2.1.6"
 edition = "2021"
 description = "Profile-aware Wi-Fi state machine with Tailscale handling and self-healing watch daemon"
 license = "MIT"
@@ -15,7 +15,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 serde_json = "1"
 # TODO(owner): switch to tag-pinned git dependency once bread-utils is merged and tagged, matching the bread-theme pattern
-bread-utils = { path = "../bread-ecosystem-fix-worktree/bread-utils" }
+bread-utils = { git = "https://git.breadway.dev/Breadway/bread-ecosystem", tag = "v0.3.0" }
 
 [profile.release]
 opt-level = "s"

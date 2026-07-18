@@ -27,7 +27,7 @@ breadcrumbs sits on top of NetworkManager (`nmcli`) and manages your Wi-Fi based
 ## Installation
 
 ```bash
-git clone https://github.com/Breadway/breadcrumbs
+git clone https://git.breadway.dev/Breadway/breadcrumbs
 cd breadcrumbs
 cargo build --release
 # Copy to somewhere on your PATH:
