@@ -4,6 +4,12 @@
 # just run breadcrumbs once (it generates a skeleton) and then use
 # `breadcrumbs add` / `breadcrumbs edit` to fill in your networks.
 # The real breadcrumbs.toml is gitignored and never committed.
+#
+# Saved networks (SSID + optional local password) live in a separate file,
+# networks.toml, in the same directory — not here. See
+# networks.example.toml for its format; in practice you never hand-edit it,
+# `breadcrumbs add` / `scan` / `forget` manage it for you. This file is just
+# settings + the location profiles built from those saved networks.
 
 [settings]
 dns = "1.1.1.1"
@@ -13,21 +19,6 @@ default_profile = "away"
 watch_interval = 12
 connectivity_url = "http://connectivitycheck.gstatic.com/generate_204"
 ping_host = "1.1.1.1"
-
-[[networks]]
-ssid = "HomeWifi"
-password = "REPLACE_ME"
-hidden = false
-
-[[networks]]
-ssid = "WorkGuest"
-password = "REPLACE_ME"
-hidden = false
-
-[[networks]]
-ssid = "CorpWifi"
-password = "REPLACE_ME"
-hidden = false
 
 # Location state machine. Switch with: breadcrumbs profile set <name>
 #

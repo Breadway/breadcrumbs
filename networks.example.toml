@@ -1,0 +1,29 @@
+# breadcrumbs saved-networks file.
+#
+# Lives alongside breadcrumbs.toml at ~/.config/breadcrumbs/networks.toml,
+# 0600 permissions. Shown here purely for reference — you normally never
+# hand-edit this file; use `breadcrumbs add` / `scan` / `forget` instead.
+#
+# `password` is optional and only needed the first time breadcrumbs connects
+# to a network. Once NetworkManager has durably saved the credential (either
+# a brand-new connection profile, or an updated PSK on an existing one),
+# breadcrumbs clears its own local copy and omits the `password` key
+# entirely on the next save — both the plaintext-on-disk copy and the
+# argv exposure on every subsequent connect go away for that network from
+# then on. Omit `password` altogether for a genuinely open (no-security)
+# network, or for one NetworkManager already knows about.
+
+[[networks]]
+ssid = "HomeWifi"
+password = "REPLACE_ME"
+hidden = false
+
+[[networks]]
+ssid = "WorkGuest"
+password = "REPLACE_ME"
+hidden = false
+
+[[networks]]
+ssid = "CorpWifi"
+password = "REPLACE_ME"
+hidden = false

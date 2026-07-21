@@ -27,23 +27,52 @@ impl Outcome {
     }
 }
 
-fn resolve_candidates<'a>(cfg: &'a Config, p: &crate::config::Profile) -> Vec<&'a NetworkDef> {
-    let mut out: Vec<&NetworkDef> = Vec::new();
+/// Resolve a profile's priority list to concrete network definitions.
+///
+/// Returns owned clones rather than borrows of `cfg` — small structs, and it
+/// decouples the result's lifetime from `cfg` so callers (namely [`run`]) can
+/// still mutate `cfg` (to clear a used password and persist it) while a
+/// candidate from this list is being acted on.
+fn resolve_candidates(cfg: &Config, p: &crate::config::Profile) -> Vec<NetworkDef> {
+    let mut out: Vec<NetworkDef> = Vec::new();
     for ssid in &p.networks {
         if let Some(def) = cfg.network(ssid) {
             if !out.iter().any(|d| d.ssid == def.ssid) {
-                out.push(def);
+                out.push(def.clone());
             }
         }
     }
     if p.include_all_known {
         for def in &cfg.networks {
             if !out.iter().any(|d| d.ssid == def.ssid) {
-                out.push(def);
+                out.push(def.clone());
             }
         }
     }
     out
+}
+
+/// A network was just connected to using a local password, and NetworkManager
+/// now durably holds that secret — either in a freshly created connection
+/// profile (`device wifi connect`) or an existing one whose PSK we just
+/// updated (`connection modify`). Either way breadcrumbs no longer needs its
+/// own plaintext copy: clear it and persist immediately, so it can't be
+/// re-sent as an argv argument on the next connect and doesn't sit on disk
+/// any longer than necessary. A no-op (no save) if the network has no local
+/// password to begin with.
+fn clear_password_if_used(cfg: &mut Config, ssid: &str) {
+    let Some(def) = cfg.networks.iter_mut().find(|n| n.ssid == ssid) else {
+        return;
+    };
+    if def.password.is_none() {
+        return;
+    }
+    def.password = None;
+    if let Err(e) = cfg.save() {
+        log(&format!(
+            "failed to persist cleared password for {ssid}: {e}"
+        ));
+    }
 }
 
 /// Try to connect + confirm it actually carries traffic.
@@ -57,7 +86,13 @@ fn connect_and_verify(iface: &str, def: &NetworkDef, cfg: &Config) -> Result<(),
 }
 
 /// Run the connection state machine for `profile_name`.
-pub fn run(cfg: &Config, profile_name: &str) -> Outcome {
+///
+/// Takes `cfg` mutably: a successful connect that used a local password
+/// clears that network's `password` field and persists the config
+/// immediately (see [`clear_password_if_used`]) — this is the only way that
+/// clearing happens for the `init` / `profile set --apply` / `detect --apply`
+/// commands and the watch loop, all of which route through here.
+pub fn run(cfg: &mut Config, profile_name: &str) -> Outcome {
     let profile = match cfg.profile(profile_name) {
         Some(p) => p.clone(),
         None => {
@@ -111,13 +146,16 @@ pub fn run(cfg: &Config, profile_name: &str) -> Outcome {
     let mut on_bootstrap = false;
     if profile.tailscale {
         if let Some(bs_ssid) = profile.bootstrap.clone() {
-            match cfg.network(&bs_ssid) {
+            // Owned clone (not a borrow of `cfg`) so we're free to mutate
+            // `cfg` below on a successful connect.
+            match cfg.network(&bs_ssid).cloned() {
                 Some(bdef) => {
                     if visible.contains(&bdef.ssid) || bdef.hidden {
-                        match connect_and_verify(&iface, bdef, cfg) {
+                        match connect_and_verify(&iface, &bdef, cfg) {
                             Ok(()) => {
                                 on_bootstrap = true;
                                 log(&format!("bootstrap connected: {}", bdef.ssid));
+                                clear_password_if_used(cfg, &bdef.ssid);
                             }
                             Err(e) => log(&format!("bootstrap connect failed: {} — {e}", bdef.ssid)),
                         }
@@ -160,6 +198,7 @@ pub fn run(cfg: &Config, profile_name: &str) -> Outcome {
             any_attempted = true;
             match connect_and_verify(&iface, def, cfg) {
                 Ok(()) => {
+                    clear_password_if_used(cfg, &def.ssid);
                     let note = if internet_ok(cfg) {
                         None
                     } else {
@@ -181,6 +220,7 @@ pub fn run(cfg: &Config, profile_name: &str) -> Outcome {
             any_attempted = true;
             match connect_and_verify(&iface, def, cfg) {
                 Ok(()) => {
+                    clear_password_if_used(cfg, &def.ssid);
                     let note = if internet_ok(cfg) {
                         None
                     } else {
@@ -206,9 +246,15 @@ pub fn run(cfg: &Config, profile_name: &str) -> Outcome {
             .clone()
             .unwrap_or_else(|| "bootstrap".into());
         if !nm::device_connected(&iface) {
-            if let Some(bdef) = profile.bootstrap.as_deref().and_then(|s| cfg.network(s)) {
-                match connect_and_verify(&iface, bdef, cfg) {
-                    Ok(()) => log(&format!("bootstrap reconnected: {}", bdef.ssid)),
+            // Owned clone (not a borrow of `cfg`) so a successful reconnect
+            // is free to mutate `cfg` to clear the used password.
+            if let Some(bdef) = profile.bootstrap.as_deref().and_then(|s| cfg.network(s).cloned())
+            {
+                match connect_and_verify(&iface, &bdef, cfg) {
+                    Ok(()) => {
+                        log(&format!("bootstrap reconnected: {}", bdef.ssid));
+                        clear_password_if_used(cfg, &bdef.ssid);
+                    }
                     Err(e) => {
                         log(&format!("bootstrap reconnect failed: {} — {e}", bdef.ssid));
                         on_bootstrap = false;
@@ -279,7 +325,7 @@ mod tests {
     fn net(ssid: &str) -> NetworkDef {
         NetworkDef {
             ssid: ssid.into(),
-            password: "x".into(),
+            password: Some("x".into()),
             hidden: false,
         }
     }
@@ -304,10 +350,8 @@ mod tests {
             networks: vec!["FallbackNet".into(), "HomeWifi".into()],
             ..Default::default()
         };
-        let got: Vec<&str> = resolve_candidates(&c, &p)
-            .iter()
-            .map(|n| n.ssid.as_str())
-            .collect();
+        let candidates = resolve_candidates(&c, &p);
+        let got: Vec<&str> = candidates.iter().map(|n| n.ssid.as_str()).collect();
         assert_eq!(got, vec!["FallbackNet", "HomeWifi"]);
     }
 
@@ -319,10 +363,8 @@ mod tests {
             include_all_known: true,
             ..Default::default()
         };
-        let got: Vec<&str> = resolve_candidates(&c, &p)
-            .iter()
-            .map(|n| n.ssid.as_str())
-            .collect();
+        let candidates = resolve_candidates(&c, &p);
+        let got: Vec<&str> = candidates.iter().map(|n| n.ssid.as_str()).collect();
         assert_eq!(got[0], "HomeWifi");
         assert_eq!(got.len(), 4);
         assert!(got.contains(&"WorkNet"));
@@ -337,10 +379,71 @@ mod tests {
             networks: vec!["Ghost".into(), "WorkNet".into()],
             ..Default::default()
         };
-        let got: Vec<&str> = resolve_candidates(&c, &p)
-            .iter()
-            .map(|n| n.ssid.as_str())
-            .collect();
+        let candidates = resolve_candidates(&c, &p);
+        let got: Vec<&str> = candidates.iter().map(|n| n.ssid.as_str()).collect();
         assert_eq!(got, vec!["WorkNet"]);
+    }
+
+    #[test]
+    fn empty_profile_network_list_yields_no_candidates() {
+        let c = cfg();
+        let p = Profile::default();
+        assert!(resolve_candidates(&c, &p).is_empty());
+    }
+
+    #[test]
+    fn duplicate_ssids_within_profile_list_are_deduped() {
+        let c = cfg();
+        let p = Profile {
+            networks: vec!["HomeWifi".into(), "HomeWifi".into(), "WorkNet".into()],
+            ..Default::default()
+        };
+        let candidates = resolve_candidates(&c, &p);
+        let got: Vec<&str> = candidates.iter().map(|n| n.ssid.as_str()).collect();
+        assert_eq!(got, vec!["HomeWifi", "WorkNet"]);
+    }
+
+    #[test]
+    fn include_all_known_with_full_priority_list_appends_nothing_new() {
+        let c = cfg();
+        let p = Profile {
+            networks: vec![
+                "HomeWifi".into(),
+                "WorkNet".into(),
+                "CafeWifi".into(),
+                "FallbackNet".into(),
+            ],
+            include_all_known: true,
+            ..Default::default()
+        };
+        let got = resolve_candidates(&c, &p);
+        assert_eq!(got.len(), 4);
+    }
+
+    #[test]
+    fn include_all_known_on_empty_priority_list_returns_all_networks() {
+        let c = cfg();
+        let p = Profile {
+            include_all_known: true,
+            ..Default::default()
+        };
+        assert_eq!(resolve_candidates(&c, &p).len(), 4);
+    }
+
+    #[test]
+    fn outcome_ok_is_true_only_for_connected() {
+        assert!(Outcome::Connected {
+            ssid: "x".into(),
+            note: None
+        }
+        .ok());
+        assert!(!Outcome::NoInterface.ok());
+        assert!(!Outcome::NoNetworks.ok());
+        assert!(!Outcome::UnknownProfile("ghost".into()).ok());
+        assert!(!Outcome::TailscaleError {
+            ssid: None,
+            health: crate::tailscale::TsHealth::NotInstalled
+        }
+        .ok());
     }
 }

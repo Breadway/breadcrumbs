@@ -381,4 +381,77 @@ mod tests {
         });
         assert_eq!(exit_node_state(&v, "exitnode"), (true, true, false));
     }
+
+    #[test]
+    fn exit_node_lookup_is_case_insensitive() {
+        let v = json!({
+            "Peer": {
+                "k1": { "HostName": "ExitNode", "DNSName": "ExitNode.ts.net.",
+                        "Online": true, "ExitNode": true, "ExitNodeOption": true }
+            }
+        });
+        assert_eq!(exit_node_state(&v, "EXITNODE"), (true, true, true));
+    }
+
+    #[test]
+    fn exit_node_state_with_no_peers_is_all_false() {
+        let v = json!({ "BackendState": "Running" });
+        assert_eq!(exit_node_state(&v, "exitnode"), (false, false, false));
+    }
+
+    #[test]
+    fn exit_node_state_empty_node_name_matches_nothing() {
+        let v = json!({
+            "Peer": {
+                "k1": { "HostName": "exitnode", "DNSName": "exitnode.ts.net.",
+                        "Online": true, "ExitNode": true, "ExitNodeOption": true }
+            }
+        });
+        assert_eq!(exit_node_state(&v, ""), (false, false, false));
+    }
+
+    #[test]
+    fn exit_node_status_online_only_applies_when_selected() {
+        // ExitNodeStatus.Online reflects the currently *active* exit node —
+        // it must not leak into the reported state of a peer that merely
+        // matches by name but isn't the one actually selected.
+        let v = json!({
+            "ExitNodeStatus": { "Online": true },
+            "Peer": {
+                "k1": { "HostName": "other", "DNSName": "other.ts.net.",
+                        "Online": false, "ExitNode": false, "ExitNodeOption": true }
+            }
+        });
+        assert_eq!(exit_node_state(&v, "other"), (true, false, false));
+    }
+
+    #[test]
+    fn ts_health_is_ok_only_for_ok_variant() {
+        assert!(TsHealth::Ok.is_ok());
+        assert!(!TsHealth::NotInstalled.is_ok());
+        assert!(!TsHealth::NeedsLogin.is_ok());
+        assert!(!TsHealth::Stopped.is_ok());
+        assert!(!TsHealth::ExitNodeMissing.is_ok());
+        assert!(!TsHealth::ExitNodeOffline.is_ok());
+        assert!(!TsHealth::Error("x".into()).is_ok());
+    }
+
+    #[test]
+    fn ts_health_describe_is_human_readable() {
+        assert_eq!(TsHealth::Ok.describe(), "ok");
+        assert_eq!(
+            TsHealth::NeedsLogin.describe(),
+            "not logged in (run: tailscale up)"
+        );
+        assert_eq!(TsHealth::Error("boom".into()).describe(), "error: boom");
+    }
+
+    #[test]
+    fn extract_url_finds_https_token_among_others() {
+        assert_eq!(
+            extract_url("To authenticate, visit: https://login.tailscale.com/abc"),
+            Some("https://login.tailscale.com/abc".to_string())
+        );
+        assert_eq!(extract_url("no url on this line"), None);
+    }
 }

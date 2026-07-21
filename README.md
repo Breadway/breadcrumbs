@@ -10,7 +10,7 @@ breadcrumbs sits on top of NetworkManager (`nmcli`) and manages your Wi-Fi based
 - **Bootstrap + Tailscale gating** — connect to an interim network first, bring up Tailscale, then move to the target network
 - **Self-healing watch daemon** — monitors for drops, auto-recovers, reacts within seconds via `nmcli monitor`
 - **Auto-detection** — scans visible SSIDs and guesses your location from config-defined markers
-- **Secure credential handling** — passwords fed to `nmcli` via stdin (never in argv/`ps`), config stored at 0600
+- **Credential handling** — a saved network's password is only needed the *first* time breadcrumbs connects to it. Once that connect succeeds, NetworkManager durably owns the credential (a new connection profile, or an updated PSK on an existing one), so breadcrumbs clears its own local copy and stops writing it to disk. Both config files are `0600` (owner-only); saved networks live in a separate `networks.toml` from settings/profiles (see [Configuration](#configuration)). Note: on that first connect, the PSK is still passed to `nmcli` as a command argument, so it's briefly visible to other local users via `/proc/<pid>/cmdline` for the lifetime of that `nmcli` child — a known limitation (see the note in `src/nm.rs`); a `nmcli --ask`/D-Bus secret-agent path that avoids argv exposure entirely is not yet wired up. In practice this window now only exists once per network, not on every connect.
 - **Desktop notifications** via `notify-send` (optional)
 - **systemd user service** generation via `breadcrumbs install-service`
 
@@ -34,16 +34,20 @@ cp target/release/breadcrumbs ~/.local/bin/
 
 ## Configuration
 
-On first run, breadcrumbs creates `~/.config/breadcrumbs/breadcrumbs.toml` with default profiles. Copy `breadcrumbs.example.toml` as a starting point and fill in your real network credentials:
+On first run, breadcrumbs creates `~/.config/breadcrumbs/breadcrumbs.toml` (settings + profiles) and `~/.config/breadcrumbs/networks.toml` (saved networks) with default profiles. Copy `breadcrumbs.example.toml` as a starting point for the former:
 
 ```bash
 cp breadcrumbs.example.toml ~/.config/breadcrumbs/breadcrumbs.toml
-breadcrumbs edit   # opens in $EDITOR
+breadcrumbs edit   # opens breadcrumbs.toml in $EDITOR
 ```
+
+...then add your real networks with `breadcrumbs add`/`scan` rather than hand-editing `networks.toml` (see `networks.example.toml` if you want to see its shape or write it by hand anyway).
 
 Config paths respect `$XDG_CONFIG_HOME` and `$XDG_STATE_HOME`.
 
 ### Config structure
+
+Settings and location profiles live in `breadcrumbs.toml` — the file people actually hand-edit or dotfile:
 
 ```toml
 [settings]
@@ -54,11 +58,6 @@ default_profile = "away"
 watch_interval = 12      # seconds between health checks (minimum 4)
 connectivity_url = "http://connectivitycheck.gstatic.com/generate_204"
 ping_host = "1.1.1.1"
-
-[[networks]]
-ssid = "MyHomeNetwork"
-password = "hunter2"
-hidden = false
 
 [profiles.home]
 networks = ["MyHomeNetwork"]  # priority-ordered SSIDs
@@ -73,6 +72,17 @@ tailscale = true
 exit_node = "jump-host"   # per-profile override
 detect_ssids = ["CorpWifi", "Corp-5G"]
 ```
+
+Saved networks (SSID + optional local password) live separately, in `networks.toml`, managed via `add`/`scan`/`forget`:
+
+```toml
+[[networks]]
+ssid = "MyHomeNetwork"
+password = "hunter2"  # optional — see "Credential handling" below
+hidden = false
+```
+
+`password` is only needed the first time breadcrumbs connects to a network. Once NetworkManager durably saves the credential, breadcrumbs clears its local copy and omits the key on the next save — an existing config with `password = "..."` still loads fine either way, no migration step needed. A config with `[[networks]]` still written inline in `breadcrumbs.toml` (from before this split) also still loads: it's read once, then migrated into `networks.toml` automatically on the next save.
 
 ### Profiles
 

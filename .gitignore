@@ -1,9 +1,12 @@
 # Build output
 /target/
 
-# Secrets: live config holds plaintext Wi-Fi passwords.
-# Keep local only; see breadcrumbs.example.toml for the schema.
+# Secrets: live config holds plaintext Wi-Fi passwords (until NetworkManager
+# takes over each one on first connect — see README's "Credential handling").
+# Keep local only; see breadcrumbs.example.toml / networks.example.toml for
+# the schemas.
 /breadcrumbs.toml
+/networks.toml
 
 # Legacy plaintext credential store (migrated into breadcrumbs.toml on first run)
 /Networks/
@@ -34,3 +37,6 @@ desktop.ini
 
 # Claude Code local state
 .claude/
+
+# Local hygiene notes (not for commit)
+CLAUDE.md

@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -8,17 +9,6 @@ pub fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/root"))
-}
-
-pub fn command_exists(name: &str) -> bool {
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            if dir.join(name).is_file() {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +28,65 @@ impl Output {
     }
 }
 
+/// Everything breadcrumbs does to touch the outside world *other than* its
+/// own file I/O and env var reads: spawning an external program, and
+/// checking whether one is available at all. Every call site in this crate
+/// (`nm.rs`, `tailscale.rs`, `status.rs`, `notify.rs`, `app.rs`) goes through
+/// the free functions below (`run`/`run_with_stdin`/`run_ok`/
+/// `command_exists`), which are thin wrappers dispatching to whatever
+/// `Runner` is currently installed in the thread-local slot — `RealRunner` by
+/// default.
+///
+/// Tests swap in a fake implementation via [`with_runner`] so real call
+/// chains (`flow::run`, `watch::classify`, …) can be driven in-process
+/// against canned output, with no subprocess ever spawned and full
+/// visibility into exactly what *would* have been executed — the natural
+/// mechanism for asserting things like "no password ever reaches nmcli's
+/// argv on a repeat connect" (see the credential tests under `tests/`).
+///
+/// A thread-local (rather than an explicit parameter threaded through every
+/// function) was chosen so the large existing call surface in `nm.rs` et al.
+/// didn't need every signature rewritten to carry a `&dyn Runner` — call
+/// sites are unchanged, only `util`'s internals dispatch differently. It's
+/// safe across `cargo test`'s parallel test threads because each thread gets
+/// its own independent slot, defaulting to `RealRunner`, so tests that don't
+/// install a fake are unaffected by ones that do.
+pub trait Runner {
+    fn run(&self, prog: &str, args: &[&str], stdin: Option<&str>, timeout: Duration) -> Output;
+    fn command_exists(&self, name: &str) -> bool;
+}
+
+struct RealRunner;
+
+impl Runner for RealRunner {
+    fn run(&self, prog: &str, args: &[&str], stdin: Option<&str>, timeout: Duration) -> Output {
+        spawn_run(prog, args, stdin, timeout)
+    }
+
+    fn command_exists(&self, name: &str) -> bool {
+        path_lookup_exists(name)
+    }
+}
+
+fn path_lookup_exists(name: &str) -> bool {
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            if dir.join(name).is_file() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+thread_local! {
+    static RUNNER: RefCell<Box<dyn Runner>> = RefCell::new(Box::new(RealRunner));
+}
+
+pub fn command_exists(name: &str) -> bool {
+    RUNNER.with(|r| r.borrow().command_exists(name))
+}
+
 /// Run a command with a hard timeout. The child is killed if it overruns so a
 /// hung nmcli/tailscale can never wedge the daemon.
 pub fn run(prog: &str, args: &[&str], timeout: Duration) -> Output {
@@ -48,6 +97,32 @@ pub fn run(prog: &str, args: &[&str], timeout: Duration) -> Output {
 /// secrets (e.g. Wi-Fi PSKs) to `nmcli --ask` without exposing them in argv,
 /// where any local user could read them via `ps`.
 pub fn run_with_stdin(prog: &str, args: &[&str], stdin: Option<&str>, timeout: Duration) -> Output {
+    RUNNER.with(|r| r.borrow().run(prog, args, stdin, timeout))
+}
+
+pub fn run_ok(prog: &str, args: &[&str], timeout: Duration) -> bool {
+    run(prog, args, timeout).success
+}
+
+/// Swap the thread-local [`Runner`] for `runner` for the duration of `f`,
+/// restoring whatever was previously installed afterward — even if `f`
+/// panics, so a failing assertion inside a test can't leak a fake runner
+/// into whatever test happens to run next on this thread. This is the seam
+/// integration tests use to drive real logic without spawning subprocesses.
+pub fn with_runner<R, T>(runner: R, f: impl FnOnce() -> T) -> T
+where
+    R: Runner + 'static,
+{
+    let prev = RUNNER.with(|r| std::mem::replace(&mut *r.borrow_mut(), Box::new(runner)));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    RUNNER.with(|r| *r.borrow_mut() = prev);
+    match result {
+        Ok(v) => v,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+fn spawn_run(prog: &str, args: &[&str], stdin: Option<&str>, timeout: Duration) -> Output {
     let stdin_cfg = if stdin.is_some() {
         Stdio::piped()
     } else {
@@ -115,10 +190,6 @@ pub fn run_with_stdin(prog: &str, args: &[&str], stdin: Option<&str>, timeout: D
     }
 }
 
-pub fn run_ok(prog: &str, args: &[&str], timeout: Duration) -> bool {
-    run(prog, args, timeout).success
-}
-
 /// Local "YYYY-MM-DD HH:MM:SS". Uses `date` for correct local time, falling
 /// back to a dependency-free UTC computation if it is unavailable.
 pub fn timestamp() -> String {
@@ -175,5 +246,42 @@ mod tests {
         assert_eq!(fmt_epoch(1_609_459_200), "2021-01-01 00:00:00");
         // Leap day 2024-02-29 12:00:00 UTC
         assert_eq!(fmt_epoch(1_709_208_000), "2024-02-29 12:00:00");
+    }
+
+    #[test]
+    fn fmt_epoch_pre_1970_is_handled() {
+        // The div_euclid/rem_euclid split must stay correct for negative
+        // epoch seconds (dates before 1970), not just the common positive case.
+        assert_eq!(fmt_epoch(-86_400), "1969-12-31 00:00:00");
+    }
+
+    #[test]
+    fn fmt_epoch_year_and_month_boundaries() {
+        assert_eq!(fmt_epoch(1_704_067_199), "2023-12-31 23:59:59");
+        assert_eq!(fmt_epoch(1_735_689_600), "2025-01-01 00:00:00");
+        // Last second of October (non-leap-day month boundary).
+        assert_eq!(fmt_epoch(1_730_419_199), "2024-10-31 23:59:59");
+    }
+
+    #[test]
+    fn command_exists_false_for_bogus_binary() {
+        assert!(!command_exists("definitely-not-a-real-binary-xyz123"));
+    }
+
+    #[test]
+    fn command_exists_true_for_a_real_binary() {
+        // `sh` is guaranteed present on any POSIX system this runs on.
+        assert!(command_exists("sh"));
+    }
+
+    #[test]
+    fn run_on_missing_binary_fails_cleanly_instead_of_panicking() {
+        let o = run(
+            "definitely-not-a-real-binary-xyz123",
+            &[],
+            Duration::from_secs(1),
+        );
+        assert!(!o.success);
+        assert_eq!(o.stdout, "");
     }
 }
