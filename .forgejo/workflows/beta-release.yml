@@ -1,12 +1,12 @@
 name: beta release
 
-# Publishes a beta-track build when a `beta-v*` tag is pushed —
-# separate from release.yml's tag-triggered stable releases. See
-# bread-ecosystem's docs/release-channels.md for the three-track policy
-# this is part of.
+# Publishes a beta-track build on every push to `beta` — a frozen
+# stabilization branch cut from `dev` when ready to stabilize; only
+# fix/<issue> branches merged into `beta` should land here afterward.
+# See bread-ecosystem's docs/release-channels.md for the three-track policy.
 on:
   push:
-    tags: ['beta-v*']
+    branches: ['beta']
 
 jobs:
   build:
@@ -16,16 +16,37 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf src && mkdir src
-          git clone --branch "${GITHUB_REF_NAME}" --depth 1 \
+          git clone --branch beta --depth 1 \
             "https://git.breadway.dev/${GITHUB_REPOSITORY}.git" src
 
       - name: build
         run: cd src && cargo build --release --locked
 
+      - name: compute beta version
+        run: |
+          set -euo pipefail
+          cd src
+          # Base the beta version off the latest published stable tag,
+          # not Cargo.toml — Cargo.toml can go stale relative to the last
+          # real release (seen in practice: breadbox/breadpad/breadcrumbs/
+          # breadpaper), which would make a beta build sort as OLDER than
+          # what's already installed and bakery would correctly refuse it.
+          LATEST_TAG="$(git ls-remote --tags --refs \
+            "https://git.breadway.dev/${GITHUB_REPOSITORY}.git" 'v*' \
+            | awk -F/ '{print $NF}' | sed 's/^v//' | sort -V | tail -1)"
+          if [ -n "${LATEST_TAG}" ]; then
+            CUR="${LATEST_TAG}"
+          else
+            CUR="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          fi
+          IFS='.' read -r MA MI PA <<< "${CUR}"
+          SHA="$(git rev-parse --short HEAD)"
+          TS="$(date -u +%Y%m%d%H%M%S)"
+          echo "VERSION=${MA}.${MI}.$((PA + 1))-beta.${TS}+${SHA}" >> "$GITHUB_ENV"
+
       - name: prepare artifacts
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#beta-v}"
           PKG_DIR="/srv/breadway-dl/beta/breadcrumbs/${VERSION}"
           mkdir -p "${PKG_DIR}"
           cp "src/target/release/breadcrumbs" "${PKG_DIR}/breadcrumbs-x86_64"
@@ -36,8 +57,8 @@ jobs:
           cp src/bakery.toml "${PKG_DIR}/bakery.toml"
           ln -sfn "${VERSION}" "/srv/breadway-dl/beta/breadcrumbs/latest"
 
-      # No GitHub Release upload — beta, like the other non-stable track,
-      # is only distributed via dl.breadway.dev/beta/.
+      # No GitHub Release upload — beta, like dev, is only distributed via
+      # dl.breadway.dev/beta/.
       - name: regenerate beta index.json
         env:
           MINISIGN_SEC_KEY: ${{ secrets.BAKERY_MINISIGN_SEC_KEY_PATH }}
@@ -51,6 +72,6 @@ jobs:
           # mktemp: a fixed clone path races when multiple repos' dev/beta
           # workflows run close together on the same self-hosted runner.
           ECOSYSTEM_CI_DIR="$(mktemp -d /tmp/bread-ecosystem-ci-XXXXXX)"
-          git clone --branch dev https://git.breadway.dev/Breadway/bread-ecosystem.git "${ECOSYSTEM_CI_DIR}"
+          git clone https://git.breadway.dev/Breadway/bread-ecosystem.git "${ECOSYSTEM_CI_DIR}"
           TRACK=beta bash "${ECOSYSTEM_CI_DIR}/scripts/gen-index.sh"
           rm -rf "${ECOSYSTEM_CI_DIR}"
