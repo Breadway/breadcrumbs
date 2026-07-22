@@ -26,7 +26,19 @@ jobs:
         run: |
           set -euo pipefail
           cd src
-          CUR="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          # Base the dev version off the latest published stable tag,
+          # not Cargo.toml — Cargo.toml can go stale relative to the last
+          # real release (seen in practice: breadbox/breadpad/breadcrumbs/
+          # breadpaper), which would make a dev build sort as OLDER than
+          # what's already installed and bakery would correctly refuse it.
+          LATEST_TAG="$(git ls-remote --tags --refs \
+            "https://git.breadway.dev/${GITHUB_REPOSITORY}.git" 'v*' \
+            | awk -F/ '{print $NF}' | sed 's/^v//' | sort -V | tail -1)"
+          if [ -n "${LATEST_TAG}" ]; then
+            CUR="${LATEST_TAG}"
+          else
+            CUR="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+          fi
           IFS='.' read -r MA MI PA <<< "${CUR}"
           SHA="$(git rev-parse --short HEAD)"
           TS="$(date -u +%Y%m%d%H%M%S)"
