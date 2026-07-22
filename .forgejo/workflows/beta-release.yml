@@ -47,8 +47,10 @@ jobs:
             echo "::error::BAKERY_MINISIGN_SEC_KEY_PATH secret not set — refusing to regenerate beta index.json unsigned (would leave a stale signature mismatched against fresh content and break bakery for everyone on the beta track)"
             exit 1
           fi
-          rm -rf /tmp/bread-ecosystem-ci
-          # --branch dev: the TRACK-aware gen-index.sh isn't merged to
-          # bread-ecosystem's main yet.
-          git clone --branch dev https://git.breadway.dev/Breadway/bread-ecosystem.git /tmp/bread-ecosystem-ci
-          TRACK=beta bash /tmp/bread-ecosystem-ci/scripts/gen-index.sh
+          rm -rf /tmp/bread-ecosystem-ci-* 2>/dev/null || true
+          # mktemp: a fixed clone path races when multiple repos' dev/beta
+          # workflows run close together on the same self-hosted runner.
+          ECOSYSTEM_CI_DIR="$(mktemp -d /tmp/bread-ecosystem-ci-XXXXXX)"
+          git clone --branch dev https://git.breadway.dev/Breadway/bread-ecosystem.git "${ECOSYSTEM_CI_DIR}"
+          TRACK=beta bash "${ECOSYSTEM_CI_DIR}/scripts/gen-index.sh"
+          rm -rf "${ECOSYSTEM_CI_DIR}"
