@@ -1,0 +1,54 @@
+name: beta release
+
+# Publishes a beta-track build when a `beta-v*` tag is pushed —
+# separate from release.yml's tag-triggered stable releases. See
+# bread-ecosystem's docs/release-channels.md for the three-track policy
+# this is part of.
+on:
+  push:
+    tags: ['beta-v*']
+
+jobs:
+  build:
+    runs-on: [self-hosted, hestia]
+    steps:
+      - name: checkout
+        run: |
+          set -euo pipefail
+          rm -rf src && mkdir src
+          git clone --branch "${GITHUB_REF_NAME}" --depth 1 \
+            "https://git.breadway.dev/${GITHUB_REPOSITORY}.git" src
+
+      - name: build
+        run: cd src && cargo build --release --locked
+
+      - name: prepare artifacts
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#beta-v}"
+          PKG_DIR="/srv/breadway-dl/beta/breadcrumbs/${VERSION}"
+          mkdir -p "${PKG_DIR}"
+          cp "src/target/release/breadcrumbs" "${PKG_DIR}/breadcrumbs-x86_64"
+          strip "${PKG_DIR}/breadcrumbs-x86_64"
+          sha256sum "${PKG_DIR}/breadcrumbs-x86_64" | awk '{print $1}' \
+            > "${PKG_DIR}/breadcrumbs-x86_64.sha256"
+          cp src/breadcrumbs.example.toml "${PKG_DIR}/"
+          cp src/bakery.toml "${PKG_DIR}/bakery.toml"
+          ln -sfn "${VERSION}" "/srv/breadway-dl/beta/breadcrumbs/latest"
+
+      # No GitHub Release upload — beta, like the other non-stable track,
+      # is only distributed via dl.breadway.dev/beta/.
+      - name: regenerate beta index.json
+        env:
+          MINISIGN_SEC_KEY: ${{ secrets.BAKERY_MINISIGN_SEC_KEY_PATH }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MINISIGN_SEC_KEY:-}" ]; then
+            echo "::error::BAKERY_MINISIGN_SEC_KEY_PATH secret not set — refusing to regenerate beta index.json unsigned (would leave a stale signature mismatched against fresh content and break bakery for everyone on the beta track)"
+            exit 1
+          fi
+          rm -rf /tmp/bread-ecosystem-ci
+          # --branch dev: the TRACK-aware gen-index.sh isn't merged to
+          # bread-ecosystem's main yet.
+          git clone --branch dev https://git.breadway.dev/Breadway/bread-ecosystem.git /tmp/bread-ecosystem-ci
+          TRACK=beta bash /tmp/bread-ecosystem-ci/scripts/gen-index.sh
