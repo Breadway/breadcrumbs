@@ -4,6 +4,7 @@ binaries = ["breadcrumbs"]
 system_deps = ["networkmanager"]
 optional_system_deps = ["tailscale", "sudo", "xdg-utils"]
 bread_deps = []
+license_file = "LICENSE"
 
 [config]
 dir = "~/.config/breadcrumbs"
