@@ -1,12 +1,11 @@
 name: dev release
 
-# Publishes a dev-track build on every push to `dev` —
-# separate from release.yml's tag-triggered stable releases. See
-# bread-ecosystem's docs/release-channels.md for the three-track policy
-# this is part of.
+# Publishes a dev-track build on every push to `main` (the trunk
+# branch — there is no separate `dev` branch). See bread-ecosystem's
+# docs/release-channels.md for the release-track policy this is part of.
 on:
   push:
-    branches: ['dev']
+    branches: ['main']
 
 jobs:
   build:
@@ -16,7 +15,7 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf src && mkdir src
-          git clone --branch dev --depth 1 \
+          git clone --branch main --depth 1 \
             "https://git.breadway.dev/${GITHUB_REPOSITORY}.git" src
 
       - name: build
@@ -33,7 +32,7 @@ jobs:
           # what's already installed and bakery would correctly refuse it.
           LATEST_TAG="$(git ls-remote --tags --refs \
             "https://git.breadway.dev/${GITHUB_REPOSITORY}.git" 'v*' \
-            | awk -F/ '{print $NF}' | sed 's/^v//' | sort -V | tail -1)"
+            | awk -F/ '{print $NF}' | sed 's/^v//' | (grep -v -- '-' || true) | sort -V | tail -1)"
           if [ -n "${LATEST_TAG}" ]; then
             CUR="${LATEST_TAG}"
           else
@@ -73,6 +72,6 @@ jobs:
           # mktemp: a fixed clone path races when multiple repos' dev/beta
           # workflows run close together on the same self-hosted runner.
           ECOSYSTEM_CI_DIR="$(mktemp -d /tmp/bread-ecosystem-ci-XXXXXX)"
-          git clone --branch dev https://git.breadway.dev/Breadway/bread-ecosystem.git "${ECOSYSTEM_CI_DIR}"
+          git clone --branch main https://git.breadway.dev/Breadway/bread-ecosystem.git "${ECOSYSTEM_CI_DIR}"
           TRACK=dev bash "${ECOSYSTEM_CI_DIR}/scripts/gen-index.sh"
           rm -rf "${ECOSYSTEM_CI_DIR}"

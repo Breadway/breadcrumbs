@@ -1,52 +1,32 @@
-name: beta release
+name: beta (rc) release
 
-# Publishes a beta-track build on every push to `beta` — a frozen
-# stabilization branch cut from `dev` when ready to stabilize; only
-# fix/<issue> branches merged into `beta` should land here afterward.
-# See bread-ecosystem's docs/release-channels.md for the three-track policy.
+# Publishes a beta-track build for any `vX.Y.Z-rc.N` prerelease tag
+# pushed to `main` — there is no separate `beta` branch; "freezing" is
+# just pausing pushes to main while an RC gets tested. See
+# bread-ecosystem's docs/release-channels.md for the release-track policy.
 on:
   push:
-    branches: ['beta']
+    tags: ['v*']
 
 jobs:
   build:
+    if: ${{ contains(github.ref_name, '-rc.') }}
     runs-on: [self-hosted, hestia]
     steps:
       - name: checkout
         run: |
           set -euo pipefail
           rm -rf src && mkdir src
-          git clone --branch beta --depth 1 \
+          git clone --branch "${GITHUB_REF_NAME}" --depth 1 \
             "https://git.breadway.dev/${GITHUB_REPOSITORY}.git" src
 
       - name: build
         run: cd src && cargo build --release --locked
 
-      - name: compute beta version
-        run: |
-          set -euo pipefail
-          cd src
-          # Base the beta version off the latest published stable tag,
-          # not Cargo.toml — Cargo.toml can go stale relative to the last
-          # real release (seen in practice: breadbox/breadpad/breadcrumbs/
-          # breadpaper), which would make a beta build sort as OLDER than
-          # what's already installed and bakery would correctly refuse it.
-          LATEST_TAG="$(git ls-remote --tags --refs \
-            "https://git.breadway.dev/${GITHUB_REPOSITORY}.git" 'v*' \
-            | awk -F/ '{print $NF}' | sed 's/^v//' | sort -V | tail -1)"
-          if [ -n "${LATEST_TAG}" ]; then
-            CUR="${LATEST_TAG}"
-          else
-            CUR="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
-          fi
-          IFS='.' read -r MA MI PA <<< "${CUR}"
-          SHA="$(git rev-parse --short HEAD)"
-          TS="$(date -u +%Y%m%d%H%M%S)"
-          echo "VERSION=${MA}.${MI}.$((PA + 1))-beta.${TS}+${SHA}" >> "$GITHUB_ENV"
-
       - name: prepare artifacts
         run: |
           set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
           PKG_DIR="/srv/breadway-dl/beta/breadcrumbs/${VERSION}"
           mkdir -p "${PKG_DIR}"
           cp "src/target/release/breadcrumbs" "${PKG_DIR}/breadcrumbs-x86_64"

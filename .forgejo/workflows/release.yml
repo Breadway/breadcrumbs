@@ -6,6 +6,7 @@ on:
 
 jobs:
   build:
+    if: ${{ !contains(github.ref_name, '-rc.') }}
     runs-on: [self-hosted, hestia]
     steps:
       - name: checkout
