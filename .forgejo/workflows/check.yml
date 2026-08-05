@@ -1,0 +1,24 @@
+name: check
+
+# Fast-fail lint/test on short-lived work branches, before it ever reaches
+# main and triggers a dev-track release build.
+on:
+  push:
+    branches: ['feature/**', 'fix/**']
+
+jobs:
+  check:
+    runs-on: [self-hosted, hestia]
+    steps:
+      - name: checkout
+        run: |
+          set -euo pipefail
+          rm -rf src && mkdir src
+          git clone --branch "${GITHUB_REF_NAME}" --depth 1 \
+            "https://git.breadway.dev/${GITHUB_REPOSITORY}.git" src
+
+      - name: clippy
+        run: cd src && bash ci/build.sh cargo clippy --all-targets --locked -- -D warnings
+
+      - name: test
+        run: cd src && bash ci/build.sh cargo test --release --locked
