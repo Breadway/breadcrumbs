@@ -21,7 +21,7 @@ jobs:
             "https://git.breadway.dev/${GITHUB_REPOSITORY}.git" src
 
       - name: build
-        run: cd src && cargo build --release --locked
+        run: cd src && bash ci/build.sh cargo build --release --locked
 
       - name: prepare artifacts
         run: |
