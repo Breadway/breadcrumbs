@@ -17,7 +17,16 @@ jobs:
             "https://git.breadway.dev/${GITHUB_REPOSITORY}.git" src
 
       - name: build
-        run: cd src && bash ci/build.sh cargo build --release --locked
+        run: |
+          set -euo pipefail
+          if [ ! -f src/ci/build.sh ]; then
+            echo "::error::ci/build.sh is missing — bakery release builds must go through the shared CI wrapper"
+            exit 1
+          fi
+          cd src && bash ci/build.sh cargo build --release --locked || {
+            echo "::error::cargo build --release --locked failed. If Cargo.lock drifted, update and commit it; do not drop --locked."
+            exit 1
+          }
 
       - name: test
         run: cd src && bash ci/build.sh cargo test --release --locked
@@ -35,12 +44,17 @@ jobs:
           cp src/breadcrumbs.example.toml "${PKG_DIR}/"
           cp src/LICENSE "${PKG_DIR}/"
           cp src/bakery.toml "${PKG_DIR}/bakery.toml"
-          cp src/contrib/breadcrumbs.service "${PKG_DIR}/"
           ln -sfn "${VERSION}" "/srv/breadway-dl/breadcrumbs/latest"
 
       - name: regenerate index.json
+        env:
+          MINISIGN_SEC_KEY: ${{ secrets.BAKERY_MINISIGN_SEC_KEY_PATH }}
         run: |
           set -euo pipefail
+          if [ -z "${MINISIGN_SEC_KEY:-}" ]; then
+            echo "::error::BAKERY_MINISIGN_SEC_KEY_PATH secret not set — refusing to regenerate index.json unsigned (would leave a stale signature mismatched against fresh content and break bakery for everyone)"
+            exit 1
+          fi
           rm -rf /tmp/bread-ecosystem-ci
           git clone https://git.breadway.dev/Breadway/bread-ecosystem.git /tmp/bread-ecosystem-ci
           bash /tmp/bread-ecosystem-ci/scripts/gen-index.sh
