@@ -1,6 +1,6 @@
 [package]
 name = "breadcrumbs"
-version = "2.0.1"
+version = "2.1.7"
 edition = "2021"
 description = "Profile-aware Wi-Fi state machine with Tailscale handling and self-healing watch daemon"
 license = "MIT"
