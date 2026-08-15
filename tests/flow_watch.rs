@@ -10,8 +10,11 @@ mod common;
 
 use std::collections::BTreeMap;
 
+use bread_utils::bread_client::BreadEvent;
+use breadcrumbs::bread_events;
 use breadcrumbs::config::{Config, NetworkDef, Profile, Settings};
 use breadcrumbs::flow;
+use breadcrumbs::state::{self, State};
 use breadcrumbs::util::with_runner;
 use breadcrumbs::watch::{classify, Health};
 
@@ -469,4 +472,104 @@ fn classify_reports_up_when_tailscale_healthy() {
     let (health, _) = with_runner(runner, || classify(&cfg, "work"));
 
     assert_eq!(health, Health::Up);
+}
+
+// ---------------------------------------------------------------------
+// bread.command.crumbs.set_profile — persists via the same path as the
+// CLI, and must not depend on breadd being reachable (`emit` is
+// fire-and-forget).
+// ---------------------------------------------------------------------
+
+fn command_event(event: &str, data: serde_json::Value) -> BreadEvent {
+    BreadEvent {
+        event: event.to_string(),
+        timestamp: 0,
+        data,
+    }
+}
+
+#[test]
+fn set_profile_command_persists_even_with_no_daemon_reachable() {
+    let _env = EnvSandbox::new();
+    let cfg = Config::load().expect("fresh config");
+    state::set_profile(&cfg, "away").unwrap();
+    assert_eq!(State::load("away").profile, "away");
+
+    let acted = bread_events::handle_command(&command_event(
+        "bread.command.crumbs.set_profile",
+        serde_json::json!({ "profile": "home" }),
+    ));
+
+    assert!(acted, "known profile must persist");
+    assert_eq!(State::load("away").profile, "home");
+}
+
+#[test]
+fn set_profile_command_rejects_unknown_profile() {
+    let _env = EnvSandbox::new();
+    let cfg = Config::load().expect("fresh config");
+    state::set_profile(&cfg, "away").unwrap();
+
+    let acted = bread_events::handle_command(&command_event(
+        "bread.command.crumbs.set_profile",
+        serde_json::json!({ "profile": "bogus" }),
+    ));
+
+    assert!(!acted);
+    assert_eq!(
+        State::load("away").profile,
+        "away",
+        "a rejected set_profile must not touch state"
+    );
+}
+
+#[test]
+fn set_profile_command_rejects_missing_profile_field() {
+    let _env = EnvSandbox::new();
+    let cfg = Config::load().expect("fresh config");
+    state::set_profile(&cfg, "away").unwrap();
+
+    let acted = bread_events::handle_command(&command_event(
+        "bread.command.crumbs.set_profile",
+        serde_json::json!({}),
+    ));
+
+    assert!(!acted);
+    assert_eq!(State::load("away").profile, "away");
+}
+
+#[test]
+fn handle_command_ignores_unrecognized_verb() {
+    let _env = EnvSandbox::new();
+    let cfg = Config::load().expect("fresh config");
+    state::set_profile(&cfg, "away").unwrap();
+
+    let acted = bread_events::handle_command(&command_event(
+        "bread.command.crumbs.pin",
+        serde_json::json!({}),
+    ));
+
+    assert!(!acted);
+    assert_eq!(
+        State::load("away").profile,
+        "away",
+        "an unrecognized verb must not touch state"
+    );
+}
+
+#[test]
+fn handle_command_ignores_events_outside_its_own_command_namespace() {
+    let _env = EnvSandbox::new();
+    let cfg = Config::load().expect("fresh config");
+    state::set_profile(&cfg, "away").unwrap();
+
+    assert!(!bread_events::handle_command(&command_event(
+        "bread.command.clip.clear",
+        serde_json::json!({}),
+    )));
+    assert!(!bread_events::handle_command(&command_event(
+        "bread.crumbs.profile.changed",
+        serde_json::json!({ "from": "away", "to": "home" }),
+    )));
+    assert_eq!(State::load("away").profile, "away");
 }

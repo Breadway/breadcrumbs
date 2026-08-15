@@ -8,6 +8,7 @@
 //! compiled binary.
 
 pub mod app;
+pub mod bread_events;
 pub mod config;
 pub mod flow;
 pub mod nm;

@@ -37,6 +37,3 @@ desktop.ini
 
 # Claude Code local state
 .claude/
-
-# Local hygiene notes (not for commit)
-CLAUDE.md

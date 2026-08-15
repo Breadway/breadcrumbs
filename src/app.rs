@@ -10,9 +10,9 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 
 use crate::config::{Config, NetworkDef};
-use crate::state::State;
+use crate::state::{self, State};
 use crate::util::{self, command_exists, home_dir};
-use crate::{config, flow, nm, notify, watch};
+use crate::{config, flow, nm, watch};
 
 const C_RESET: &str = "\x1b[0m";
 const C_BOLD: &str = "\x1b[1m";
@@ -288,16 +288,7 @@ fn cmd_profile(cfg: &mut Config, action: Option<ProfileCmd>) -> Result<i32, Stri
             Ok(0)
         }
         ProfileCmd::Set { name, no_apply } => {
-            if !cfg.profiles.contains_key(&name) {
-                let avail: Vec<&String> = cfg.profiles.keys().collect();
-                return Err(format!("unknown profile '{name}'. Available: {avail:?}"));
-            }
-            let st = State {
-                profile: name.clone(),
-                updated: crate::util::timestamp(),
-            };
-            st.save()?;
-            notify::log(&format!("profile set -> {name}"));
+            state::set_profile(cfg, &name)?;
             println!("profile = {C_BOLD}{name}{C_RESET}");
             if no_apply {
                 return Ok(0);

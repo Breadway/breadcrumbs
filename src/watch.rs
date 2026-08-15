@@ -4,6 +4,9 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use bread_utils::bread_client::BreadClient;
+
+use crate::bread_events;
 use crate::config::Config;
 use crate::flow;
 use crate::notify::{log, notify, Urgency};
@@ -26,6 +29,21 @@ pub enum Health {
     /// `profile` isn't defined in the config (e.g. state still points at a
     /// custom profile the user deleted from breadcrumbs.toml).
     UnknownProfile,
+}
+
+impl Health {
+    /// Wire name used in `bread.crumbs.health.changed` — the Rust variant
+    /// as a string, not a prettier label.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Health::Up => "Up",
+            Health::DownNoNet => "DownNoNet",
+            Health::DownTailscaleManual => "DownTailscaleManual",
+            Health::DownTailscaleOther => "DownTailscaleOther",
+            Health::NoAdapter => "NoAdapter",
+            Health::UnknownProfile => "UnknownProfile",
+        }
+    }
 }
 
 pub fn classify(cfg: &Config, profile: &str) -> (Health, Option<String>) {
@@ -134,7 +152,22 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
     log("watch: started");
 
     let (tx, rx) = mpsc::channel::<()>();
-    spawn_nm_monitor(tx);
+    spawn_nm_monitor(tx.clone());
+
+    // Long-lived, so this uses BreadClient::subscribe (a persistent
+    // background thread with its own reconnect/backoff loop). breadd being
+    // absent or restarting is transparent: the subscription just quietly
+    // stops delivering commands until it reconnects. A successful
+    // `set_profile` wakes this loop the same way `nmcli monitor` does, so
+    // the new profile is applied on the next tick instead of waiting out
+    // the current poll interval.
+    let bread = BreadClient::connect(bread_events::APP_ID);
+    let wake = tx;
+    let _commands = bread.subscribe("bread.command.crumbs.**", move |event| {
+        if bread_events::handle_command(&event) {
+            let _ = wake.send(());
+        }
+    });
 
     let mut profile = State::load(&cfg.settings.default_profile).profile;
     if run_initial {
@@ -179,6 +212,7 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
                 &format!("{prev_profile} -> {profile}"),
                 Urgency::Low,
             );
+            bread_events::emit_profile_changed(&bread, &prev_profile, &profile);
             prev_profile = profile.clone();
             prev_health = None; // force re-evaluation/recovery for new profile
             last_flow_at = None; // allow immediate recovery on profile change
@@ -186,6 +220,9 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
 
         let (health, ssid) = classify(&cfg, &profile);
         let transition = prev_health.as_ref() != Some(&health);
+        if transition {
+            bread_events::emit_health_changed(&bread, &profile, health.as_str(), ssid.as_deref());
+        }
 
         match &health {
             Health::Up => {
@@ -299,5 +336,15 @@ mod tests {
         // A zero gap is always already-elapsed, so a prior fire doesn't block.
         let earlier = Instant::now();
         assert!(debounce_ready(Some(earlier), Duration::from_millis(0)));
+    }
+
+    #[test]
+    fn health_as_str_is_the_variant_name() {
+        assert_eq!(Health::Up.as_str(), "Up");
+        assert_eq!(Health::DownNoNet.as_str(), "DownNoNet");
+        assert_eq!(Health::DownTailscaleManual.as_str(), "DownTailscaleManual");
+        assert_eq!(Health::DownTailscaleOther.as_str(), "DownTailscaleOther");
+        assert_eq!(Health::NoAdapter.as_str(), "NoAdapter");
+        assert_eq!(Health::UnknownProfile.as_str(), "UnknownProfile");
     }
 }
