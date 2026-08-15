@@ -65,8 +65,8 @@ dependencies = [
 
 [[package]]
 name = "bread-utils"
-version = "0.3.1"
-source = "git+https://git.breadway.dev/Breadway/bread-ecosystem?tag=v0.7.1#db2fa3c4b4c1e6933bc5cf62a236d05972fdc886"
+version = "0.7.2"
+source = "git+https://git.breadway.dev/Breadway/bread-ecosystem?tag=v0.7.2#30517f161724132cdeb658c04cf5e490be07ee73"
 dependencies = [
  "bread-shared",
  "dirs",

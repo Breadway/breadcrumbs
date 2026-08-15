@@ -14,7 +14,7 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 serde_json = "1"
-bread-utils = { git = "https://git.breadway.dev/Breadway/bread-ecosystem", tag = "v0.7.1", features = ["bread-client"] }
+bread-utils = { git = "https://git.breadway.dev/Breadway/bread-ecosystem", tag = "v0.7.2", features = ["bread-client"] }
 
 [profile.release]
 opt-level = "s"
