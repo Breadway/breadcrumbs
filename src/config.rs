@@ -70,7 +70,8 @@ pub struct NetworkDef {
     /// rather than writing a plaintext copy that's no longer needed. `None`
     /// means either "NetworkManager already owns this secret" or "this is
     /// an open (unsecured) network" — both cases behave the same way on
-    /// connect: no password argument is ever sent.
+    /// connect: no PSK is sent to nmcli at all. When `Some`, the PSK is
+    /// fed to `nmcli --ask` on stdin, never as an argv element.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
     #[serde(default)]

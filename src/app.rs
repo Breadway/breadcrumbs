@@ -357,9 +357,8 @@ fn prompt_line(msg: &str) -> String {
 /// response) means "this network has no password" (open Wi-Fi) — normalize
 /// it to `None` right at the point of entry so it flows the same way a
 /// genuinely absent/cleared password does. Without this, `Some("")` would
-/// make `nm::connect_verbose` send an empty PSK argument, which nmcli treats
-/// as "secured with a blank password" rather than "open", and the connect
-/// fails against a real open SSID.
+/// make `nm::connect_verbose` treat it as a (blank) secret rather than an
+/// open network, and the connect fails against a real open SSID.
 fn non_empty(s: String) -> Option<String> {
     if s.is_empty() {
         None

@@ -194,7 +194,9 @@ fn profile_list_marks_exactly_the_current_profile() {
     let out = stdout(&o);
     assert!(out.contains("* home"), "out: {out}");
     assert_eq!(
-        out.lines().filter(|l| l.trim_start().starts_with('*')).count(),
+        out.lines()
+            .filter(|l| l.trim_start().starts_with('*'))
+            .count(),
         1,
         "expected exactly one marked profile, got: {out}"
     );
@@ -262,7 +264,10 @@ fn forget_removes_network_from_config() {
     );
     // ...and it should never have been in breadcrumbs.toml to begin with.
     let text = fs::read_to_string(sb.config_file()).unwrap();
-    assert!(!text.contains("CafeWifi"), "network leaked into config: {text}");
+    assert!(
+        !text.contains("CafeWifi"),
+        "network leaked into config: {text}"
+    );
 }
 
 #[test]
@@ -270,7 +275,11 @@ fn detect_without_wifi_adapter_errors() {
     let sb = Sandbox::new();
     let o = sb.cmd(&["detect"]);
     assert!(!o.status.success());
-    assert!(stderr(&o).contains("could not detect"), "stderr: {}", stderr(&o));
+    assert!(
+        stderr(&o).contains("could not detect"),
+        "stderr: {}",
+        stderr(&o)
+    );
 }
 
 #[test]
@@ -364,7 +373,11 @@ fn networks_are_stored_separately_from_settings_and_profiles() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(sb.networks_file()).unwrap().permissions().mode() & 0o777;
+        let mode = fs::metadata(sb.networks_file())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o600, "networks.toml should be owner-only");
     }
 }
@@ -374,8 +387,8 @@ fn add_with_empty_password_is_stored_as_no_password() {
     // An explicitly empty password (e.g. `add SSID ""`, or a blank response
     // at the interactive prompt) means "this is an open network" — it must
     // round-trip as an absent `password` key, the same as a cleared one,
-    // not as `password = ""` (which `nm::connect_verbose` would send as a
-    // literal empty PSK and fail against a real open SSID).
+    // not as `password = ""` (which `nm::connect_verbose` would treat as a
+    // blank secret rather than an open network).
     let sb = Sandbox::new();
     let o = sb.cmd(&["add", "OpenCafe", ""]);
     assert!(o.status.success(), "stderr: {}", stderr(&o));
@@ -446,14 +459,19 @@ fn password_is_cleared_after_first_connect_and_never_sent_again() {
     let record = sb.root.join(".nmcli-calls");
 
     // First connect: no saved NM profile yet, so breadcrumbs creates one via
-    // `device wifi connect ... password hunter2 ...`.
+    // `nmcli --ask device wifi connect ...` with the PSK on stdin, not argv.
     let first = sb.cmd(&["init"]);
     assert!(first.status.success(), "stderr: {}", stderr(&first));
     let first_calls = fs::read_to_string(&record).unwrap_or_default();
     assert!(
-        first_calls.contains("device wifi connect TestNet") && first_calls.contains("hunter2"),
-        "first connect should create a new NM profile with the password: {first_calls}"
+        first_calls.contains("device wifi connect TestNet") && first_calls.contains("--ask"),
+        "first connect should create a new NM profile via --ask: {first_calls}"
     );
+    assert!(
+        !first_calls.contains("hunter2"),
+        "PSK must not appear on nmcli argv: {first_calls}"
+    );
+    // stdin payload is asserted in-process via FakeRunner (see flow_watch).
 
     // The local copy is gone from disk immediately after.
     let networks = fs::read_to_string(sb.networks_file()).unwrap();
@@ -461,7 +479,10 @@ fn password_is_cleared_after_first_connect_and_never_sent_again() {
         !networks.contains("hunter2"),
         "password should have been cleared from networks.toml: {networks}"
     );
-    assert!(networks.contains("TestNet"), "network entry itself should remain");
+    assert!(
+        networks.contains("TestNet"),
+        "network entry itself should remain"
+    );
 
     // Reset the recording so the second run's argv can be checked in isolation.
     fs::write(&record, "").unwrap();
@@ -524,7 +545,10 @@ fn doctor_reports_present_when_nmcli_and_tailscale_are_on_path() {
     let o = sb.cmd(&["doctor"]);
     assert!(o.status.success(), "stderr: {}", stderr(&o));
     let out = stdout(&o);
-    assert!(out.contains("nmcli") && out.contains("present"), "out: {out}");
+    assert!(
+        out.contains("nmcli") && out.contains("present"),
+        "out: {out}"
+    );
     assert!(!out.contains("MISSING"), "out: {out}");
 }
 

@@ -54,12 +54,11 @@ fn resolve_candidates(cfg: &Config, p: &crate::config::Profile) -> Vec<NetworkDe
 
 /// A network was just connected to using a local password, and NetworkManager
 /// now durably holds that secret — either in a freshly created connection
-/// profile (`device wifi connect`) or an existing one whose PSK we just
-/// updated (`connection modify`). Either way breadcrumbs no longer needs its
-/// own plaintext copy: clear it and persist immediately, so it can't be
-/// re-sent as an argv argument on the next connect and doesn't sit on disk
-/// any longer than necessary. A no-op (no save) if the network has no local
-/// password to begin with.
+/// profile (`device wifi connect --ask`) or an existing one whose PSK we just
+/// supplied via `--ask connection up`. Either way breadcrumbs no longer needs
+/// its own plaintext copy: clear it and persist immediately so it doesn't sit
+/// on disk any longer than necessary. A no-op (no save) if the network has no
+/// local password to begin with.
 fn clear_password_if_used(cfg: &mut Config, ssid: &str) {
     let Some(def) = cfg.networks.iter_mut().find(|n| n.ssid == ssid) else {
         return;
@@ -157,7 +156,9 @@ pub fn run(cfg: &mut Config, profile_name: &str) -> Outcome {
                                 log(&format!("bootstrap connected: {}", bdef.ssid));
                                 clear_password_if_used(cfg, &bdef.ssid);
                             }
-                            Err(e) => log(&format!("bootstrap connect failed: {} — {e}", bdef.ssid)),
+                            Err(e) => {
+                                log(&format!("bootstrap connect failed: {} — {e}", bdef.ssid))
+                            }
                         }
                     } else {
                         log(&format!("bootstrap not in range: {}", bdef.ssid));
@@ -248,7 +249,10 @@ pub fn run(cfg: &mut Config, profile_name: &str) -> Outcome {
         if !nm::device_connected(&iface) {
             // Owned clone (not a borrow of `cfg`) so a successful reconnect
             // is free to mutate `cfg` to clear the used password.
-            if let Some(bdef) = profile.bootstrap.as_deref().and_then(|s| cfg.network(s).cloned())
+            if let Some(bdef) = profile
+                .bootstrap
+                .as_deref()
+                .and_then(|s| cfg.network(s).cloned())
             {
                 match connect_and_verify(&iface, &bdef, cfg) {
                     Ok(()) => {

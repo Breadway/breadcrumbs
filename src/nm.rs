@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::config::NetworkDef;
-use crate::util::{run, run_ok};
+use crate::util::{run, run_ok, run_with_stdin};
 
 /// nmcli `-t` escapes `:` and `\` in field values; undo that.
 fn unescape(s: &str) -> String {
@@ -284,8 +284,8 @@ pub fn connect(iface: &str, net: &NetworkDef, wait: u32, dns: &str) -> bool {
 
 /// Connect to a network and pin DNS. Returns the nmcli error on failure.
 ///
-/// Reuses an existing saved profile for the SSID when one exists (updating its
-/// PSK) so that repeated connections do not accumulate numbered duplicates in
+/// Reuses an existing saved profile for the SSID when one exists so that
+/// repeated connections do not accumulate numbered duplicates in
 /// NetworkManager ("NCC", "NCC 1", "NCC 2", …). Falls back to
 /// `nmcli device wifi connect` — which creates a new profile — only when no
 /// saved profile is found.
@@ -293,41 +293,18 @@ pub fn connect(iface: &str, net: &NetworkDef, wait: u32, dns: &str) -> bool {
 /// `net.password` is only sent when `Some`: on the reuse path, `None` means
 /// "leave the saved PSK alone" (either NetworkManager already durably owns
 /// it, or the network is open); on the create path it means "no password
-/// argument at all", which is also how a genuinely open (no-security) SSID
-/// is connected. See the field doc on [`NetworkDef::password`] for how a
-/// local secret transitions to `None` after its first successful use.
+/// at all", which is also how a genuinely open (no-security) SSID is
+/// connected. See the field doc on [`NetworkDef::password`] for how a local
+/// secret transitions to `None` after its first successful use.
 ///
-/// KNOWN LIMITATION (credential exposure): when a password *is* sent, it's
-/// passed to `nmcli` as a plain command-line argument
-/// (`802-11-wireless-security.psk <pw>` on the reuse path, `password <pw>`
-/// on the create path). For the lifetime of that `nmcli` child, the secret
-/// is readable by other local users via `/proc/<pid>/cmdline`.
-/// `util::run_with_stdin` exists to feed secrets on stdin instead, but
-/// wiring it up correctly needs either verified `nmcli --ask` piped-stdin
-/// behavior or NetworkManager's D-Bus secret-agent API — neither of which
-/// can be validated without a live NetworkManager connection — so this is
-/// left as documented tech debt rather than a guess. In practice this
-/// exposure window now only exists on a network's *first* connect: once
-/// NetworkManager has the credential, breadcrumbs clears its local copy, so
-/// there's nothing left to pass on argv for every subsequent connect.
+/// When a password *is* sent it goes to `nmcli --ask` on stdin, never on
+/// argv — `/proc/<pid>/cmdline` is world-readable. After the first success
+/// breadcrumbs clears its local copy, so subsequent connects pass nothing.
 pub fn connect_verbose(iface: &str, net: &NetworkDef, wait: u32, dns: &str) -> Result<(), String> {
     let wait_s = wait.to_string();
+    let timeout = Duration::from_secs(wait as u64 + 15);
 
     if let Some(profile) = first_profile_for_ssid(&net.ssid) {
-        // Update the saved PSK and, for hidden networks, ensure the flag is set.
-        if let Some(pw) = &net.password {
-            let _ = run(
-                "nmcli",
-                &[
-                    "connection",
-                    "modify",
-                    &profile,
-                    "802-11-wireless-security.psk",
-                    pw.as_str(),
-                ],
-                Duration::from_secs(6),
-            );
-        }
         if net.hidden {
             let _ = run(
                 "nmcli",
@@ -341,11 +318,52 @@ pub fn connect_verbose(iface: &str, net: &NetworkDef, wait: u32, dns: &str) -> R
                 Duration::from_secs(6),
             );
         }
-        let o = run(
-            "nmcli",
-            &["--wait", &wait_s, "connection", "up", &profile, "ifname", iface],
-            Duration::from_secs(wait as u64 + 15),
-        );
+        let o = if let Some(pw) = &net.password {
+            // WHY: a stored PSK makes NM skip the secret agent, so --ask
+            // would never read stdin. Resetting the property (empty value,
+            // not a secret) forces a request; the new PSK arrives on stdin.
+            let _ = run(
+                "nmcli",
+                &[
+                    "connection",
+                    "modify",
+                    &profile,
+                    "802-11-wireless-security.psk",
+                    "",
+                ],
+                Duration::from_secs(6),
+            );
+            let stdin = format!("{pw}\n");
+            run_with_stdin(
+                "nmcli",
+                &[
+                    "--ask",
+                    "--wait",
+                    &wait_s,
+                    "connection",
+                    "up",
+                    &profile,
+                    "ifname",
+                    iface,
+                ],
+                Some(&stdin),
+                timeout,
+            )
+        } else {
+            run(
+                "nmcli",
+                &[
+                    "--wait",
+                    &wait_s,
+                    "connection",
+                    "up",
+                    &profile,
+                    "ifname",
+                    iface,
+                ],
+                timeout,
+            )
+        };
         if !o.success {
             let detail = o.stderr.trim().to_string();
             return Err(if detail.is_empty() {
@@ -362,29 +380,51 @@ pub fn connect_verbose(iface: &str, net: &NetworkDef, wait: u32, dns: &str) -> R
 
     // No saved profile — create one via device wifi connect.
     let hidden = if net.hidden { "yes" } else { "no" };
-    let mut args: Vec<&str> = vec![
-        "--wait",
-        &wait_s,
-        "device",
-        "wifi",
-        "connect",
-        net.ssid.as_str(),
-    ];
-    // Only pass `password` when we actually have one. An empty/missing PSK
-    // argument makes nmcli treat the network as open (no security), which is
-    // what we want both for genuinely open SSIDs and for a network whose
-    // secret NetworkManager should already hold — though the latter case
-    // only succeeds if a saved profile in fact exists, which is why we only
-    // reach this branch (no saved profile found) when that assumption held.
-    if let Some(pw) = &net.password {
-        args.push("password");
-        args.push(pw.as_str());
-    }
-    args.push("hidden");
-    args.push(hidden);
-    args.push("ifname");
-    args.push(iface);
-    let o = run("nmcli", &args, Duration::from_secs(wait as u64 + 15));
+    let o = if let Some(pw) = &net.password {
+        // WHY: never put the PSK on argv — /proc/<pid>/cmdline is
+        // world-readable. `nmcli --ask` registers as a secret agent and
+        // nmc_readline reads the PSK from stdin (one line). Open networks
+        // stay on the no-ask path so we don't hang on a prompt.
+        let stdin = format!("{pw}\n");
+        run_with_stdin(
+            "nmcli",
+            &[
+                "--ask",
+                "--wait",
+                &wait_s,
+                "device",
+                "wifi",
+                "connect",
+                net.ssid.as_str(),
+                "hidden",
+                hidden,
+                "ifname",
+                iface,
+            ],
+            Some(&stdin),
+            timeout,
+        )
+    } else {
+        // No local PSK: either the SSID is open, or NM should already hold
+        // the secret — the latter only succeeds if a saved profile exists,
+        // which is why we only reach this branch when that assumption held.
+        run(
+            "nmcli",
+            &[
+                "--wait",
+                &wait_s,
+                "device",
+                "wifi",
+                "connect",
+                net.ssid.as_str(),
+                "hidden",
+                hidden,
+                "ifname",
+                iface,
+            ],
+            timeout,
+        )
+    };
     if !o.success {
         let detail = o.stderr.trim().to_string();
         return Err(if detail.is_empty() {

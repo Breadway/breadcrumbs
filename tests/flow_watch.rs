@@ -14,6 +14,7 @@ use bread_utils::bread_client::BreadEvent;
 use breadcrumbs::bread_events;
 use breadcrumbs::config::{Config, NetworkDef, Profile, Settings};
 use breadcrumbs::flow;
+use breadcrumbs::nm;
 use breadcrumbs::state::{self, State};
 use breadcrumbs::util::with_runner;
 use breadcrumbs::watch::{classify, Health};
@@ -83,10 +84,7 @@ fn flow_run_connects_to_first_visible_candidate_in_priority_order() {
     let _env = EnvSandbox::new();
 
     let mut cfg = base_config();
-    cfg.networks = vec![
-        net("First", Some("pw1")),
-        net("Second", Some("pw2")),
-    ];
+    cfg.networks = vec![net("First", Some("pw1")), net("Second", Some("pw2"))];
     cfg.profiles.insert(
         "home".into(),
         Profile {
@@ -112,10 +110,11 @@ fn flow_run_connects_to_first_visible_candidate_in_priority_order() {
 
     // Priority order actually mattered: "Second" was never dialed even
     // though it was visible and would have succeeded too.
-    let dialed_second = calls
-        .borrow()
-        .iter()
-        .any(|c| c.prog == "nmcli" && c.args.contains(&"connect".to_string()) && c.args.iter().any(|a| a == "Second"));
+    let dialed_second = calls.borrow().iter().any(|c| {
+        c.prog == "nmcli"
+            && c.args.contains(&"connect".to_string())
+            && c.args.iter().any(|a| a == "Second")
+    });
     assert!(!dialed_second, "connected to Second when First should win");
 
     // The password used for the winning connect is now NM's problem, not
@@ -572,4 +571,85 @@ fn handle_command_ignores_events_outside_its_own_command_namespace() {
         serde_json::json!({ "from": "away", "to": "home" }),
     )));
     assert_eq!(State::load("away").profile, "away");
+}
+
+// ---------------------------------------------------------------------
+// PSK never on argv (first connect feeds nmcli --ask on stdin)
+// ---------------------------------------------------------------------
+
+fn assert_psk_not_on_argv(calls: &[common::RecordedCall], psk: &str) {
+    for c in calls {
+        if c.prog != "nmcli" {
+            continue;
+        }
+        assert!(
+            !c.args.iter().any(|a| a == psk),
+            "PSK leaked onto nmcli argv: {:?}",
+            c.args
+        );
+    }
+}
+
+#[test]
+fn connect_verbose_create_feeds_psk_on_stdin_never_argv() {
+    let runner = FakeRunner::new()
+        .on_contains("nmcli", "NAME,TYPE", ok(""))
+        .on_contains("nmcli", "connect", ok(""))
+        .on_contains("nmcli", "GENERAL.CON-UUID", ok("uuid-1"))
+        .on_contains("nmcli", "ipv4.ignore-auto-dns", ok(""))
+        .on_contains("nmcli", "device reapply", ok(""));
+    let calls = runner.calls_handle();
+
+    let net = net("Cafe", Some("super-secret-psk"));
+    let result = with_runner(runner, || nm::connect_verbose("wlan0", &net, 8, "1.1.1.1"));
+    assert!(result.is_ok(), "{result:?}");
+
+    let calls = calls.borrow();
+    assert_psk_not_on_argv(&calls, "super-secret-psk");
+    let connect = calls
+        .iter()
+        .find(|c| c.prog == "nmcli" && c.args.iter().any(|a| a == "connect"))
+        .expect("expected device wifi connect");
+    assert!(
+        connect.args.iter().any(|a| a == "--ask"),
+        "create path must use --ask: {:?}",
+        connect.args
+    );
+    assert_eq!(connect.stdin.as_deref(), Some("super-secret-psk\n"));
+}
+
+#[test]
+fn connect_verbose_reuse_feeds_psk_on_stdin_never_argv() {
+    let runner = FakeRunner::new()
+        .on_contains("nmcli", "NAME,TYPE", ok("Cafe:802-11-wireless"))
+        .on_contains("nmcli", "connection modify", ok(""))
+        .on_contains("nmcli", "connection up", ok(""))
+        .on_contains("nmcli", "GENERAL.CON-UUID", ok("uuid-1"))
+        .on_contains("nmcli", "ipv4.ignore-auto-dns", ok(""))
+        .on_contains("nmcli", "device reapply", ok(""));
+    let calls = runner.calls_handle();
+
+    let net = net("Cafe", Some("super-secret-psk"));
+    let result = with_runner(runner, || nm::connect_verbose("wlan0", &net, 8, "1.1.1.1"));
+    assert!(result.is_ok(), "{result:?}");
+
+    let calls = calls.borrow();
+    assert_psk_not_on_argv(&calls, "super-secret-psk");
+    let up = calls
+        .iter()
+        .find(|c| c.prog == "nmcli" && c.args.iter().any(|a| a == "up"))
+        .expect("expected connection up");
+    assert!(
+        up.args.iter().any(|a| a == "--ask"),
+        "reuse path must use --ask: {:?}",
+        up.args
+    );
+    assert_eq!(up.stdin.as_deref(), Some("super-secret-psk\n"));
+    // Clearing the stored PSK uses an empty argv value, never the secret.
+    let cleared = calls.iter().any(|c| {
+        c.prog == "nmcli"
+            && c.args.iter().any(|a| a == "802-11-wireless-security.psk")
+            && c.args.last().is_some_and(|a| a.is_empty())
+    });
+    assert!(cleared, "reuse+password should reset stored PSK: {calls:?}");
 }
