@@ -77,10 +77,27 @@ fn clear_password_if_used(cfg: &mut Config, ssid: &str) {
     }
 }
 
+/// Opt-in learning (`profiles.<name>.learn = true`): remember the SSIDs a
+/// profile successfully connects to so `breadcrumbs detect` improves without
+/// hand-editing. Bounded to keep the list sane; never touches an existing
+/// marker.
+fn learn_ssid(cfg: &mut Config, profile: &str, ssid: &str) {
+    let Some(p) = cfg.profiles.get_mut(profile) else {
+        return;
+    };
+    if !p.learn || p.detect_ssids.len() >= 8 || p.detect_ssids.iter().any(|s| s == ssid) {
+        return;
+    }
+    p.detect_ssids.push(ssid.to_string());
+    if let Err(e) = cfg.save() {
+        log(&format!("failed to persist learned SSID {ssid} for {profile}: {e}"));
+    }
+}
+
 /// Try to connect + confirm the device actually landed on the *requested*
 /// SSID. Returns Ok(()) on success, Err(reason) on failure.
 fn connect_and_verify(iface: &str, def: &NetworkDef, cfg: &Config) -> Result<(), String> {
-    nm::connect_verbose(iface, def, cfg.settings.nmcli_wait, &cfg.settings.dns)?;
+    nm::connect_verbose(iface, def, cfg.settings.nmcli_wait, def.effective_dns(&cfg.settings.dns))?;
     // Confirm the SSID, not just "device connected": NM autoconnect can win
     // a race and leave the device on a different network, and the wifi list
     // can lag activation by a moment — so poll briefly before giving up.
@@ -140,7 +157,7 @@ fn run_inner(cfg: &mut Config, profile_name: &str, notify_user: bool) -> Outcome
         }
     };
 
-    let iface = match nm::wifi_interface() {
+    let iface = match nm::wifi_interface_preferred(cfg.settings.interface.as_deref()) {
         Some(i) => i,
         None => {
             if notify_user {
@@ -155,10 +172,8 @@ fn run_inner(cfg: &mut Config, profile_name: &str, notify_user: bool) -> Outcome
     };
     nm::radio_on();
 
-    let exit_node = profile
-        .exit_node
-        .clone()
-        .unwrap_or_else(|| cfg.settings.exit_node.clone());
+    let exit_nodes = cfg.exit_nodes_for(profile_name);
+    let exit_node = exit_nodes.first().cloned().unwrap_or_default();
     let candidates = resolve_candidates(cfg, &profile);
 
     log(&format!(
@@ -208,7 +223,7 @@ fn run_inner(cfg: &mut Config, profile_name: &str, notify_user: bool) -> Outcome
             }
         }
 
-        let ts = tailscale::ensure_exit_node(&exit_node);
+        let ts = tailscale::ensure_exit_node(&exit_nodes);
         if !ts.is_ok() {
             let ssid = nm::active_ssid(&iface).or_else(|| profile.bootstrap.clone());
             if notify_user {
@@ -229,30 +244,41 @@ fn run_inner(cfg: &mut Config, profile_name: &str, notify_user: bool) -> Outcome
         nm::rescan(&iface, &scan_targets);
     }
 
-    let visible = nm::visible_ssids(&iface);
+    // Signals are re-read after the Tailscale gate so pass 1 can prefer the
+    // strongest AP among a profile's visible networks.
+    let visible_sig = nm::visible_signals(&iface);
 
     // ---- Connect to the priority list ----------------------------------
-    // Pass 1: visible networks in priority order.
+    // Pass 1: visible networks, strongest signal first (priority order is
+    // the stable tiebreaker for equal signals).
+    let mut visible_candidates: Vec<&NetworkDef> = candidates
+        .iter()
+        .filter(|d| visible_sig.contains_key(&d.ssid))
+        .collect();
+    visible_candidates.sort_by(|a, b| {
+        visible_sig
+            .get(&b.ssid)
+            .cmp(&visible_sig.get(&a.ssid))
+    });
     let mut any_attempted = false;
-    for def in &candidates {
-        if visible.contains(&def.ssid) {
-            any_attempted = true;
-            match connect_and_verify(&iface, def, cfg) {
-                Ok(()) => {
-                    clear_password_if_used(cfg, &def.ssid);
-                    let note = if internet_ok(cfg) {
-                        None
-                    } else {
-                        Some("associated but no internet yet".to_string())
-                    };
-                    finish_connected(&def.ssid, profile_name, &note, notify_user);
-                    return Outcome::Connected {
-                        ssid: def.ssid.clone(),
-                        note,
-                    };
-                }
-                Err(e) => log(&format!("connect failed (visible): {} — {e}", def.ssid)),
+    for def in &visible_candidates {
+        any_attempted = true;
+        match connect_and_verify(&iface, def, cfg) {
+            Ok(()) => {
+                clear_password_if_used(cfg, &def.ssid);
+                learn_ssid(cfg, profile_name, &def.ssid);
+                let note = if internet_ok(cfg) {
+                    None
+                } else {
+                    Some("associated but no internet yet".to_string())
+                };
+                finish_connected(&def.ssid, profile_name, &note, notify_user);
+                return Outcome::Connected {
+                    ssid: def.ssid.clone(),
+                    note,
+                };
             }
+            Err(e) => log(&format!("connect failed (visible): {} — {e}", def.ssid)),
         }
     }
     // Pass 2: hidden networks we couldn't see in the scan.
@@ -262,6 +288,7 @@ fn run_inner(cfg: &mut Config, profile_name: &str, notify_user: bool) -> Outcome
             match connect_and_verify(&iface, def, cfg) {
                 Ok(()) => {
                     clear_password_if_used(cfg, &def.ssid);
+                    learn_ssid(cfg, profile_name, &def.ssid);
                     let note = if internet_ok(cfg) {
                         None
                     } else {
@@ -379,6 +406,10 @@ mod tests {
         NetworkDef {
             ssid: ssid.into(),
             password: Some("x".into()),
+            dns: None,
+            eap: None,
+            identity: None,
+            ca_cert: None,
             hidden: false,
         }
     }

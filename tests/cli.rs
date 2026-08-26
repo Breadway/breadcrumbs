@@ -426,6 +426,8 @@ case "$args" in
   "device wifi rescan"*) ;;
   "-t -f SSID device wifi list ifname wlan0")
     echo "TestNet" ;;
+  "-t -f SSID,SIGNAL device wifi list ifname wlan0")
+    echo "TestNet:80" ;;
   "-t -f ACTIVE,SSID device wifi list ifname wlan0")
     echo "yes:TestNet" ;;
   "-t -f NAME,TYPE connection show")
@@ -566,6 +568,8 @@ case "$args" in
   "device wifi rescan"*) ;;
   "-t -f SSID device wifi list ifname wlan0")
     echo "CorpWifi" ;;
+  "-t -f SSID,SIGNAL device wifi list ifname wlan0")
+    echo "CorpWifi:80" ;;
   *) ;;
 esac
 exit 0
@@ -589,4 +593,351 @@ fn detect_picks_profile_whose_detect_ssids_are_visible() {
     let o = sb.cmd(&["detect"]);
     assert!(o.status.success(), "stderr: {}", stderr(&o));
     assert_eq!(stdout(&o).trim(), "work");
+}
+
+// -----------------------------------------------------------------------
+// Regression tests for the audit fixes (XDG paths, EDITOR args, config
+// merging/clamping, core-profile ownership, scan validation).
+// -----------------------------------------------------------------------
+
+#[test]
+fn edit_splits_editor_arguments() {
+    // EDITOR="code -w" style values must be split into program + args
+    // instead of being treated as one (nonexistent) binary path.
+    let sb = Sandbox::new();
+    sb.write_fake_bin(
+        "fake-editor",
+        "#!/bin/sh\necho \"$@\" > \"$HOME/editor-args\"\nexit 0\n",
+    );
+
+    let o = sb.cmd_env(&["edit"], &[("EDITOR", "fake-editor --wait")]);
+    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    assert!(stdout(&o).contains("config OK"));
+    let args = fs::read_to_string(sb.root.join("editor-args")).unwrap();
+    assert!(args.contains("--wait"), "editor args must be split off: {args}");
+    assert!(
+        args.contains("breadcrumbs.toml"),
+        "config path must be appended as its own argument: {args}"
+    );
+}
+
+#[test]
+fn scan_to_unknown_profile_errors_like_add() {
+    // `scan --to bogus` must fail up front, matching `add --to`, instead of
+    // silently saving a network that never gets attached.
+    let sb = Sandbox::new();
+    sb.cmd(&["list"]); // bootstrap the config
+    let o = sb.cmd(&["scan", "--to", "bogus"]);
+    assert!(!o.status.success());
+    assert!(
+        stderr(&o).contains("unknown profile 'bogus'"),
+        "stderr: {}",
+        stderr(&o)
+    );
+}
+
+#[test]
+fn watch_interval_below_minimum_is_clamped_to_four() {
+    // `list` and the watch loop must agree on the poll interval: a value
+    // below the documented minimum of 4 is clamped at load, not just
+    // silently clamped inside the watch loop.
+    let sb = Sandbox::new();
+    fs::create_dir_all(sb.root.join("config/breadcrumbs")).unwrap();
+    fs::write(sb.config_file(), "[settings]\nwatch_interval = 1\n").unwrap();
+
+    let o = sb.cmd(&["list"]);
+    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    assert!(
+        stdout(&o).contains("watch every 4s"),
+        "watch interval must clamp to the minimum: {}",
+        stdout(&o)
+    );
+}
+
+#[test]
+fn legacy_inline_networks_merge_with_networks_toml_instead_of_dropping() {
+    // A breadcrumbs.toml still carrying a legacy inline `[[networks]]` block
+    // must keep those networks even when networks.toml already exists — the
+    // merge is completed (and the inline block dropped) on the next save.
+    let sb = Sandbox::new();
+    fs::create_dir_all(sb.root.join("config/breadcrumbs")).unwrap();
+    fs::write(
+        sb.config_file(),
+        "[settings]\ndefault_profile = \"away\"\n\n[[networks]]\nssid = \"InlineNet\"\npassword = \"pw-inline\"\n",
+    )
+    .unwrap();
+    fs::write(
+        sb.networks_file(),
+        "[[networks]]\nssid = \"FileNet\"\npassword = \"pw-file\"\n",
+    )
+    .unwrap();
+
+    let o = sb.cmd(&["list"]);
+    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("InlineNet"), "inline network must survive the merge: {out}");
+    assert!(out.contains("FileNet"), "networks.toml network must be present: {out}");
+
+    // A later save migrates the merged set into networks.toml and drops the
+    // inline block from breadcrumbs.toml.
+    let o2 = sb.cmd(&["add", "OtherNet", "pw3"]);
+    assert!(o2.status.success(), "stderr: {}", stderr(&o2));
+    let networks = fs::read_to_string(sb.networks_file()).unwrap();
+    assert!(
+        networks.contains("InlineNet")
+            && networks.contains("FileNet")
+            && networks.contains("OtherNet"),
+        "save must persist the merged set: {networks}"
+    );
+    let config_text = fs::read_to_string(sb.config_file()).unwrap();
+    assert!(
+        !config_text.contains("[[networks]]"),
+        "inline block should be gone after migration: {config_text}"
+    );
+}
+
+#[test]
+fn core_profiles_are_not_resurrected_once_config_is_user_owned() {
+    // After the first save the config is user-owned: a deliberately deleted
+    // core profile must stay deleted.
+    let sb = Sandbox::new();
+    fs::create_dir_all(sb.root.join("config/breadcrumbs")).unwrap();
+    fs::write(
+        sb.config_file(),
+        "[settings]\ncore_profiles_initialized = true\n",
+    )
+    .unwrap();
+
+    let o = sb.cmd(&["profile", "list"]);
+    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    let out = stdout(&o);
+    assert!(
+        !out.contains("home") && !out.contains("work") && !out.contains("away"),
+        "deleted core profiles must stay deleted: {out}"
+    );
+}
+
+#[test]
+fn legacy_config_without_profiles_gets_core_profiles_backfilled() {
+    // Pre-ownership configs (no flag yet) still get the core profiles
+    // backfilled once — the self-heal that makes bare `[settings]` configs
+    // usable.
+    let sb = Sandbox::new();
+    fs::create_dir_all(sb.root.join("config/breadcrumbs")).unwrap();
+    fs::write(sb.config_file(), "[settings]\n").unwrap();
+
+    let o = sb.cmd(&["profile", "list"]);
+    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    let out = stdout(&o);
+    assert!(
+        out.contains("home") && out.contains("work") && out.contains("away"),
+        "legacy configs get the core profiles backfilled once: {out}"
+    );
+}
+
+// -----------------------------------------------------------------------
+// New features: per-network DNS, enterprise (802.1x) networks, --json
+// output, prune, scored detection, and init --wait retry.
+// -----------------------------------------------------------------------
+
+#[test]
+fn add_with_dns_persists_per_network_override() {
+    let sb = Sandbox::new();
+    let o = sb.cmd(&["add", "CafeWifi", "pw", "--dns", "9.9.9.9"]);
+    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    let networks = fs::read_to_string(sb.networks_file()).unwrap();
+    assert!(
+        networks.contains("dns = \"9.9.9.9\""),
+        "per-network DNS override must be persisted: {networks}"
+    );
+}
+
+#[test]
+fn add_enterprise_fields_persist() {
+    let sb = Sandbox::new();
+    let o = sb.cmd(&[
+        "add",
+        "CorpWifi",
+        "pw",
+        "--eap",
+        "peap",
+        "--identity",
+        "user@corp",
+        "--ca-cert",
+        "/etc/ca.pem",
+    ]);
+    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    let networks = fs::read_to_string(sb.networks_file()).unwrap();
+    assert!(networks.contains("eap = \"peap\""), "networks: {networks}");
+    assert!(networks.contains("identity = \"user@corp\""));
+    assert!(networks.contains("ca_cert = \"/etc/ca.pem\""));
+}
+
+#[test]
+fn status_json_emits_machine_readable_output() {
+    let sb = Sandbox::new();
+    let o = sb.cmd(&["status", "--json"]);
+    // No adapter in the sandbox → unhealthy (exit 1), but still valid JSON.
+    assert_eq!(o.status.code(), Some(1));
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout(&o)).expect("status --json must emit valid JSON");
+    assert_eq!(v["profile"].as_str(), Some("away"));
+    assert_eq!(v["healthy"].as_bool(), Some(false));
+    assert_eq!(v["internet"].as_bool(), Some(false));
+}
+
+#[test]
+fn detect_json_emits_machine_readable_output() {
+    let sb = Sandbox::new();
+    sb.write_fake_bin("nmcli", FAKE_NMCLI_DETECT);
+    sb.cmd(&["list"]); // bootstrap the default config
+
+    let text = fs::read_to_string(sb.config_file()).unwrap();
+    let patched = text.replace(
+        "[profiles.work]",
+        "[profiles.work]\ndetect_ssids = [\"CorpWifi\"]",
+    );
+    fs::write(sb.config_file(), patched).unwrap();
+
+    let o = sb.cmd(&["detect", "--json"]);
+    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout(&o)).expect("detect --json must emit valid JSON");
+    assert_eq!(v["profile"].as_str(), Some("work"));
+}
+
+const FAKE_NMCLI_DETECT_TWO: &str = r#"#!/bin/sh
+args="$*"
+case "$args" in
+  "-t -f DEVICE,TYPE device status")
+    echo "wlan0:wifi" ;;
+  "radio wifi on") ;;
+  "device wifi rescan"*) ;;
+  "-t -f SSID,SIGNAL device wifi list ifname wlan0")
+    echo "CorpWifi:80"
+    echo "CafeWifi:70" ;;
+  *) ;;
+esac
+exit 0
+"#;
+
+#[test]
+fn detect_prefers_profile_with_more_matching_markers() {
+    let sb = Sandbox::new();
+    sb.write_fake_bin("nmcli", FAKE_NMCLI_DETECT_TWO);
+    sb.cmd(&["list"]); // bootstrap
+
+    // home matches 1 marker (CorpWifi); work matches 2 (CorpWifi + CafeWifi).
+    let text = fs::read_to_string(sb.config_file()).unwrap();
+    let patched = text
+        .replace(
+            "[profiles.home]",
+            "[profiles.home]\ndetect_ssids = [\"CorpWifi\"]",
+        )
+        .replace(
+            "[profiles.work]",
+            "[profiles.work]\ndetect_ssids = [\"CorpWifi\", \"CafeWifi\"]",
+        );
+    fs::write(sb.config_file(), patched).unwrap();
+
+    let o = sb.cmd(&["detect"]);
+    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    assert_eq!(
+        stdout(&o).trim(),
+        "work",
+        "the profile with more matching markers must win"
+    );
+}
+
+const FAKE_NMCLI_PRUNE: &str = r#"#!/bin/sh
+args="$*"
+case "$args" in
+  "-t -f NAME,TYPE connection show")
+    echo "OldCafe:802-11-wireless" ;;
+  "-g 802-11-wireless.ssid connection show OldCafe")
+    echo "OldCafe" ;;
+  "connection delete id OldCafe") ;;
+  *) ;;
+esac
+exit 0
+"#;
+
+#[test]
+fn prune_dry_run_lists_stale_nm_profiles() {
+    let sb = Sandbox::new();
+    sb.write_fake_bin("nmcli", FAKE_NMCLI_PRUNE);
+    sb.cmd(&["list"]); // bootstrap (no saved networks → everything is stale)
+
+    let o = sb.cmd(&["prune", "--dry-run"]);
+    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    let out = stdout(&o);
+    assert!(
+        out.contains("would remove") && out.contains("OldCafe"),
+        "out: {out}"
+    );
+}
+
+#[test]
+fn prune_removes_stale_nm_profiles() {
+    let sb = Sandbox::new();
+    sb.write_fake_bin("nmcli", FAKE_NMCLI_PRUNE);
+    sb.cmd(&["list"]);
+
+    let o = sb.cmd(&["prune"]);
+    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    let out = stdout(&o);
+    assert!(
+        out.contains("removed") && out.contains("OldCafe"),
+        "out: {out}"
+    );
+}
+
+const FAKE_NMCLI_RETRY: &str = r#"#!/bin/sh
+marker="$HOME/.nmcli-connect-ok"
+args="$*"
+case "$args" in
+  "-t -f DEVICE,TYPE device status")
+    echo "wlan0:wifi" ;;
+  "radio wifi on") ;;
+  "device wifi rescan"*) ;;
+  "-t -f SSID device wifi list ifname wlan0")
+    echo "HomeWifi" ;;
+  "-t -f SSID,SIGNAL device wifi list ifname wlan0")
+    echo "HomeWifi:80" ;;
+  "-t -f ACTIVE,SSID device wifi list ifname wlan0")
+    echo "yes:HomeWifi" ;;
+  "-t -f NAME,TYPE connection show") ;;
+  *"device wifi connect HomeWifi"*)
+    if [ -f "$marker" ]; then
+      exit 0
+    else
+      : > "$marker"
+      exit 1
+    fi ;;
+  *"connection up HomeWifi"*)
+    exit 0 ;;
+  "-g GENERAL.CON-UUID device show wlan0")
+    echo "uuid-1" ;;
+  *"ipv4.ignore-auto-dns"*) ;;
+  "device reapply wlan0") ;;
+  "-t -f DEVICE,STATE device status")
+    echo "wlan0:connected" ;;
+  *) ;;
+esac
+exit 0
+"#;
+
+#[test]
+fn init_wait_retries_until_connect_succeeds() {
+    let sb = Sandbox::new();
+    sb.write_fake_bin("nmcli", FAKE_NMCLI_RETRY);
+    // "away" defaults to include_all_known, so HomeWifi is a candidate.
+    let add = sb.cmd(&["add", "HomeWifi", "hunter2"]);
+    assert!(add.status.success(), "stderr: {}", stderr(&add));
+
+    // The fake's first `device wifi connect` fails; the retry succeeds.
+    // `--wait` must keep going past the first failure rather than bailing.
+    let o = sb.cmd(&["init", "--wait", "5"]);
+    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    assert!(stdout(&o).contains("connected"), "out: {}", stdout(&o));
 }

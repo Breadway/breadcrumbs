@@ -26,13 +26,57 @@ pub fn emit_profile_changed(client: &BreadClient, from: &str, to: &str) {
     );
 }
 
-pub fn emit_health_changed(client: &BreadClient, profile: &str, health: &str, ssid: Option<&str>) {
+/// Payload for `bread.crumbs.health.changed`. Constructed by the watch
+/// loop from a classification and passed as a unit so the emit functions
+/// stay small.
+pub struct HealthChanged<'a> {
+    pub profile: &'a str,
+    pub health: &'a str,
+    pub ssid: Option<&'a str>,
+    pub iface: Option<&'a str>,
+    pub ip: Option<&'a str>,
+    pub exit_node: &'a str,
+    pub tailscale: Option<&'a str>,
+}
+
+pub fn emit_health_changed(client: &BreadClient, ev: HealthChanged<'_>) {
     client.emit(
         "bread.crumbs.health.changed",
         serde_json::json!({
+            "profile": ev.profile,
+            "health": ev.health,
+            "ssid": ev.ssid,
+            "iface": ev.iface,
+            "ip": ev.ip,
+            "exit_node": ev.exit_node,
+            "tailscale": ev.tailscale,
+        }),
+    );
+}
+
+/// `bread.crumbs.network.changed` — the watch loop observed the active SSID
+/// transition. `from` is `null` when there was no previous association.
+pub fn emit_network_changed(client: &BreadClient, from: Option<&str>, to: Option<&str>, profile: &str) {
+    client.emit(
+        "bread.crumbs.network.changed",
+        serde_json::json!({ "from": from, "to": to, "profile": profile }),
+    );
+}
+
+/// `bread.crumbs.tailscale.changed` — the Tailscale health state (or its
+/// mere presence) changed between watch-loop ticks.
+pub fn emit_tailscale_changed(
+    client: &BreadClient,
+    profile: &str,
+    state: Option<&str>,
+    exit_node: &str,
+) {
+    client.emit(
+        "bread.crumbs.tailscale.changed",
+        serde_json::json!({
             "profile": profile,
-            "health": health,
-            "ssid": ssid,
+            "state": state,
+            "exit_node": exit_node,
         }),
     );
 }

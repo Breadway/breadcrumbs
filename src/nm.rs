@@ -1,8 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use crate::config::NetworkDef;
-use crate::util::{run, run_ok, run_with_stdin};
+use crate::util::{run, run_ok};
 
 /// nmcli `-t` escapes `:` and `\` in field values; undo that.
 fn unescape(s: &str) -> String {
@@ -49,6 +49,13 @@ fn split_fields(line: &str) -> Vec<String> {
 }
 
 pub fn wifi_interface() -> Option<String> {
+    wifi_interface_preferred(None)
+}
+
+/// Find the Wi-Fi interface. When `pref` is `Some`, that exact device is
+/// used if present; otherwise (or if the preferred device is missing — e.g.
+/// an unplugged USB dongle) the first Wi-Fi device wins.
+pub fn wifi_interface_preferred(pref: Option<&str>) -> Option<String> {
     let o = run(
         "nmcli",
         &["-t", "-f", "DEVICE,TYPE", "device", "status"],
@@ -57,13 +64,19 @@ pub fn wifi_interface() -> Option<String> {
     if !o.success {
         return None;
     }
+    let mut devices: Vec<String> = Vec::new();
     for line in o.stdout.lines() {
         let fields = split_fields(line);
         if fields.len() >= 2 && fields[1] == "wifi" {
-            return Some(fields[0].clone());
+            devices.push(fields[0].clone());
         }
     }
-    None
+    if let Some(p) = pref {
+        if devices.iter().any(|d| d == p) {
+            return Some(p.to_string());
+        }
+    }
+    devices.into_iter().next()
 }
 
 pub fn radio_on() {
@@ -105,6 +118,49 @@ pub fn visible_ssids(iface: &str) -> HashSet<String> {
         }
     }
     set
+}
+
+/// Visible SSIDs with their signal strength (0–100), one entry per SSID
+/// (strongest BSSID wins). Used for signal-aware network selection and
+/// scored detection.
+pub fn visible_signals(iface: &str) -> HashMap<String, i32> {
+    let o = run(
+        "nmcli",
+        &[
+            "-t",
+            "-f",
+            "SSID,SIGNAL",
+            "device",
+            "wifi",
+            "list",
+            "ifname",
+            iface,
+        ],
+        Duration::from_secs(12),
+    );
+    let mut m: HashMap<String, i32> = HashMap::new();
+    if !o.success {
+        return m;
+    }
+    for line in o.stdout.lines() {
+        let f = split_fields(line);
+        if f.len() < 2 {
+            continue;
+        }
+        let ssid = f[0].trim().to_string();
+        if ssid.is_empty() {
+            continue;
+        }
+        let sig = signal_strength(&f[1]);
+        m.entry(ssid)
+            .and_modify(|e| {
+                if sig > *e {
+                    *e = sig;
+                }
+            })
+            .or_insert(sig);
+    }
+    m
 }
 
 #[derive(Debug, Clone)]
@@ -307,8 +363,8 @@ pub fn connect(iface: &str, net: &NetworkDef, wait: u32, dns: &str) -> bool {
 
 /// Connect to a network and pin DNS. Returns the nmcli error on failure.
 ///
-/// Reuses an existing saved profile for the SSID when one exists so that
-/// repeated connections do not accumulate numbered duplicates in
+/// Reuses an existing saved profile for the SSID when one exists (updating its
+/// PSK) so that repeated connections do not accumulate numbered duplicates in
 /// NetworkManager ("NCC", "NCC 1", "NCC 2", …). Falls back to
 /// `nmcli device wifi connect` — which creates a new profile — only when no
 /// saved profile is found.
@@ -316,18 +372,47 @@ pub fn connect(iface: &str, net: &NetworkDef, wait: u32, dns: &str) -> bool {
 /// `net.password` is only sent when `Some`: on the reuse path, `None` means
 /// "leave the saved PSK alone" (either NetworkManager already durably owns
 /// it, or the network is open); on the create path it means "no password
-/// at all", which is also how a genuinely open (no-security) SSID is
-/// connected. See the field doc on [`NetworkDef::password`] for how a local
-/// secret transitions to `None` after its first successful use.
+/// argument at all", which is also how a genuinely open (no-security) SSID
+/// is connected. See the field doc on [`NetworkDef::password`] for how a
+/// local secret transitions to `None` after its first successful use.
 ///
-/// When a password *is* sent it goes to `nmcli --ask` on stdin, never on
-/// argv — `/proc/<pid>/cmdline` is world-readable. After the first success
-/// breadcrumbs clears its local copy, so subsequent connects pass nothing.
+/// KNOWN LIMITATION (credential exposure): when a password *is* sent, it's
+/// passed to `nmcli` as a plain command-line argument
+/// (`802-11-wireless-security.psk <pw>` on the reuse path, `password <pw>`
+/// on the create path). For the lifetime of that `nmcli` child, the secret
+/// is readable by other local users via `/proc/<pid>/cmdline`.
+/// `util::run_with_stdin` exists to feed secrets on stdin instead, but
+/// wiring it up correctly needs either verified `nmcli --ask` piped-stdin
+/// behavior or NetworkManager's D-Bus secret-agent API — neither of which
+/// can be validated without a live NetworkManager connection — so this is
+/// left as documented tech debt rather than a guess. In practice this
+/// exposure window now only exists on a network's *first* connect: once
+/// NetworkManager has the credential, breadcrumbs clears its local copy, so
+/// there's nothing left to pass on argv for every subsequent connect.
 pub fn connect_verbose(iface: &str, net: &NetworkDef, wait: u32, dns: &str) -> Result<(), String> {
     let wait_s = wait.to_string();
-    let timeout = Duration::from_secs(wait as u64 + 15);
 
     if let Some(profile) = first_profile_for_ssid(&net.ssid) {
+        // Update the saved credentials and, for hidden networks, ensure the
+        // flag is set. PSK vs 802.1x (enterprise) profiles are updated with
+        // their own property sets.
+        if let Some(pw) = &net.password {
+            if net.eap.is_some() {
+                enterprise_modify(&profile, net);
+            } else {
+                let _ = run(
+                    "nmcli",
+                    &[
+                        "connection",
+                        "modify",
+                        &profile,
+                        "802-11-wireless-security.psk",
+                        pw.as_str(),
+                    ],
+                    Duration::from_secs(6),
+                );
+            }
+        }
         if net.hidden {
             let _ = run(
                 "nmcli",
@@ -341,52 +426,44 @@ pub fn connect_verbose(iface: &str, net: &NetworkDef, wait: u32, dns: &str) -> R
                 Duration::from_secs(6),
             );
         }
-        let o = if let Some(pw) = &net.password {
-            // WHY: a stored PSK makes NM skip the secret agent, so --ask
-            // would never read stdin. Resetting the property (empty value,
-            // not a secret) forces a request; the new PSK arrives on stdin.
-            let _ = run(
-                "nmcli",
-                &[
-                    "connection",
-                    "modify",
-                    &profile,
-                    "802-11-wireless-security.psk",
-                    "",
-                ],
-                Duration::from_secs(6),
-            );
-            let stdin = format!("{pw}\n");
-            run_with_stdin(
-                "nmcli",
-                &[
-                    "--ask",
-                    "--wait",
-                    &wait_s,
-                    "connection",
-                    "up",
-                    &profile,
-                    "ifname",
-                    iface,
-                ],
-                Some(&stdin),
-                timeout,
-            )
-        } else {
-            run(
-                "nmcli",
-                &[
-                    "--wait",
-                    &wait_s,
-                    "connection",
-                    "up",
-                    &profile,
-                    "ifname",
-                    iface,
-                ],
-                timeout,
-            )
-        };
+        let o = run(
+            "nmcli",
+            &["--wait", &wait_s, "connection", "up", &profile, "ifname", iface],
+            Duration::from_secs(wait as u64 + 15),
+        );
+        if !o.success {
+            let detail = o.stderr.trim().to_string();
+            return Err(if detail.is_empty() {
+                o.stdout.trim().to_string()
+            } else {
+                detail
+            });
+        }
+        if let Some(uuid) = active_uuid(iface) {
+            enforce_dns(&uuid, iface, dns);
+        }
+        return Ok(());
+    }
+
+    if net.eap.is_some() {
+        // Enterprise networks can't be created via `device wifi connect`
+        // (no 802-1x options) — create the profile explicitly, then bring
+        // it up.
+        let args = enterprise_create_args(net, &wait_s, iface);
+        let o = run("nmcli", &args, Duration::from_secs(wait as u64 + 15));
+        if !o.success {
+            let detail = o.stderr.trim().to_string();
+            return Err(if detail.is_empty() {
+                o.stdout.trim().to_string()
+            } else {
+                detail
+            });
+        }
+        let o = run(
+            "nmcli",
+            &["--wait", &wait_s, "connection", "up", &net.ssid, "ifname", iface],
+            Duration::from_secs(wait as u64 + 15),
+        );
         if !o.success {
             let detail = o.stderr.trim().to_string();
             return Err(if detail.is_empty() {
@@ -403,51 +480,29 @@ pub fn connect_verbose(iface: &str, net: &NetworkDef, wait: u32, dns: &str) -> R
 
     // No saved profile — create one via device wifi connect.
     let hidden = if net.hidden { "yes" } else { "no" };
-    let o = if let Some(pw) = &net.password {
-        // WHY: never put the PSK on argv — /proc/<pid>/cmdline is
-        // world-readable. `nmcli --ask` registers as a secret agent and
-        // nmc_readline reads the PSK from stdin (one line). Open networks
-        // stay on the no-ask path so we don't hang on a prompt.
-        let stdin = format!("{pw}\n");
-        run_with_stdin(
-            "nmcli",
-            &[
-                "--ask",
-                "--wait",
-                &wait_s,
-                "device",
-                "wifi",
-                "connect",
-                net.ssid.as_str(),
-                "hidden",
-                hidden,
-                "ifname",
-                iface,
-            ],
-            Some(&stdin),
-            timeout,
-        )
-    } else {
-        // No local PSK: either the SSID is open, or NM should already hold
-        // the secret — the latter only succeeds if a saved profile exists,
-        // which is why we only reach this branch when that assumption held.
-        run(
-            "nmcli",
-            &[
-                "--wait",
-                &wait_s,
-                "device",
-                "wifi",
-                "connect",
-                net.ssid.as_str(),
-                "hidden",
-                hidden,
-                "ifname",
-                iface,
-            ],
-            timeout,
-        )
-    };
+    let mut args: Vec<&str> = vec![
+        "--wait",
+        &wait_s,
+        "device",
+        "wifi",
+        "connect",
+        net.ssid.as_str(),
+    ];
+    // Only pass `password` when we actually have one. An empty/missing PSK
+    // argument makes nmcli treat the network as open (no security), which is
+    // what we want both for genuinely open SSIDs and for a network whose
+    // secret NetworkManager should already hold — though the latter case
+    // only succeeds if a saved profile in fact exists, which is why we only
+    // reach this branch (no saved profile found) when that assumption held.
+    if let Some(pw) = &net.password {
+        args.push("password");
+        args.push(pw.as_str());
+    }
+    args.push("hidden");
+    args.push(hidden);
+    args.push("ifname");
+    args.push(iface);
+    let o = run("nmcli", &args, Duration::from_secs(wait as u64 + 15));
     if !o.success {
         let detail = o.stderr.trim().to_string();
         return Err(if detail.is_empty() {
@@ -460,6 +515,97 @@ pub fn connect_verbose(iface: &str, net: &NetworkDef, wait: u32, dns: &str) -> R
         enforce_dns(&uuid, iface, dns);
     }
     Ok(())
+}
+
+/// `nmcli connection modify` args switching an existing profile to the
+/// network's 802.1x settings (`wifi-sec.key-mgmt wpa-eap` + 802-1x props).
+fn enterprise_modify(profile: &str, net: &NetworkDef) {
+    let mut args: Vec<&str> = vec![
+        "connection",
+        "modify",
+        profile,
+        "wifi-sec.key-mgmt",
+        "wpa-eap",
+    ];
+    enterprise_props(&mut args, net);
+    let _ = run("nmcli", &args, Duration::from_secs(6));
+}
+
+/// Append the 802.1x property pairs for `net` to `args`.
+fn enterprise_props<'a>(args: &mut Vec<&'a str>, net: &'a NetworkDef) {
+    if let Some(eap) = &net.eap {
+        args.push("802-1x.eap");
+        args.push(eap.as_str());
+    }
+    if let Some(id) = &net.identity {
+        args.push("802-1x.identity");
+        args.push(id.as_str());
+    }
+    if let Some(ca) = &net.ca_cert {
+        args.push("802-1x.ca-cert");
+        args.push(ca.as_str());
+    }
+    if let Some(pw) = &net.password {
+        args.push("802-1x.password");
+        args.push(pw.as_str());
+    }
+}
+
+/// `nmcli connection add` args for an enterprise (802.1x) network — the
+/// create path, since `device wifi connect` can't express 802-1x settings.
+fn enterprise_create_args<'a>(net: &'a NetworkDef, wait_s: &'a str, iface: &'a str) -> Vec<&'a str> {
+    let mut args: Vec<&str> = vec![
+        "--wait",
+        wait_s,
+        "connection",
+        "add",
+        "type",
+        "wifi",
+        "con-name",
+        net.ssid.as_str(),
+        "ssid",
+        net.ssid.as_str(),
+        "wifi-sec.key-mgmt",
+        "wpa-eap",
+    ];
+    enterprise_props(&mut args, net);
+    if net.hidden {
+        args.push("802-11-wireless.hidden");
+        args.push("yes");
+    }
+    args.push("ifname");
+    args.push(iface);
+    args
+}
+
+/// List all wireless connection profiles as `(name, ssid)` pairs, using the
+/// profile's `802-11-wireless.ssid` setting when present (falling back to
+/// the profile name). Used by `breadcrumbs prune`.
+pub fn wireless_profiles() -> Vec<(String, String)> {
+    let list = run(
+        "nmcli",
+        &["-t", "-f", "NAME,TYPE", "connection", "show"],
+        Duration::from_secs(8),
+    );
+    let mut out = Vec::new();
+    if !list.success {
+        return out;
+    }
+    for line in list.stdout.lines() {
+        let fields = split_fields(line);
+        if fields.len() < 2 || !fields[1].contains("wireless") {
+            continue;
+        }
+        let name = fields[0].clone();
+        let conn_ssid = run(
+            "nmcli",
+            &["-g", "802-11-wireless.ssid", "connection", "show", &name],
+            Duration::from_secs(6),
+        );
+        let conn_ssid = conn_ssid.stdout.trim().to_string();
+        out.push((name.clone(), if conn_ssid.is_empty() { name } else { conn_ssid }));
+    }
+    out
 }
 
 /// Delete every saved connection profile whose name or 802-11-wireless SSID

@@ -193,6 +193,19 @@ fn spawn_run(prog: &str, args: &[&str], stdin: Option<&str>, timeout: Duration) 
     }
 }
 
+/// Current local "HH:MM" (24h), for the time-of-day schedule. `None` if the
+/// clock can't be read — the schedule is skipped, never guessed.
+pub fn local_hhmm() -> Option<String> {
+    let o = run("date", &["+%H:%M"], Duration::from_secs(2));
+    if o.success {
+        let t = o.stdout.trim().to_string();
+        if t.len() == 5 && t.as_bytes()[2] == b':' {
+            return Some(t);
+        }
+    }
+    None
+}
+
 /// Local "YYYY-MM-DD HH:MM:SS". Uses `date` for correct local time, falling
 /// back to a dependency-free UTC computation if it is unavailable.
 pub fn timestamp() -> String {

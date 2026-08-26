@@ -54,6 +54,13 @@ Settings and location profiles live in `breadcrumbs.toml` — the file people ac
 dns = "1.1.1.1"          # DNS server pinned on every connection
 nmcli_wait = 8           # seconds to wait for nmcli connect
 exit_node = "myhostname" # default Tailscale exit node
+exit_nodes = ["a", "b"] # optional priority list; tried in order (fallback nodes)
+interface = "wlan0"      # optional preferred Wi-Fi interface
+schedule = []            # optional time-of-day profile switches, e.g.
+                         #   [[settings.schedule]]
+                         #   profile = "home"
+                         #   from = "18:00"
+                         #   to = "08:00"   # from >= to = overnight window
 default_profile = "away"
 watch_interval = 12      # seconds between health checks (minimum 4)
 connectivity_url = "http://connectivitycheck.gstatic.com/generate_204"
@@ -80,6 +87,15 @@ Saved networks (SSID + optional local password) live separately, in `networks.to
 ssid = "MyHomeNetwork"
 password = "hunter2"  # optional — see "Credential handling" below
 hidden = false
+dns = "1.1.1.1"       # optional per-network DNS override; "" disables pinning
+
+# WPA-Enterprise (802.1x) networks use these instead of a PSK:
+# [[networks]]
+# ssid = "CorpEAP"
+# eap = "peap"          # or "tls"
+# identity = "user@corp"
+# password = "..."       # 802.1x password
+# ca_cert = "/etc/ssl/certs/corp-ca.pem"   # optional
 ```
 
 `password` is only needed the first time breadcrumbs connects to a network. Once NetworkManager durably saves the credential, breadcrumbs clears its local copy and omits the key on the next save — an existing config with `password = "..."` still loads fine either way, no migration step needed. A config with `[[networks]]` still written inline in `breadcrumbs.toml` (from before this split) also still loads: it's read once, then migrated into `networks.toml` automatically on the next save.
@@ -95,7 +111,8 @@ Each profile defines:
 | `bootstrap` | SSID to connect to first (e.g. guest Wi-Fi that allows Tailscale traffic). |
 | `exit_node` | Tailscale exit node for this profile (overrides `settings.exit_node`). |
 | `include_all_known` | After the priority list, also try every other known network. |
-| `detect_ssids` | Any visible SSID in this list marks this profile as a candidate for `breadcrumbs detect`. |
+| `detect_ssids` | Any visible SSID in this list marks this profile as a candidate for `breadcrumbs detect`. Profiles with more matching markers win. |
+| `learn` | If `true`, SSIDs this profile successfully connects to are appended to `detect_ssids` (bounded), so `detect` improves without hand-editing. Off by default. |
 
 ## Usage
 
@@ -105,15 +122,16 @@ breadcrumbs [--profile <name>] <command>
 
 | Command | Description |
 |---------|-------------|
-| `status` | Show current Wi-Fi / Tailscale health (default) |
-| `init` | Run the full connect sequence for the active profile |
+| `status [--json]` | Show current Wi-Fi / Tailscale health (default) |
+| `init [--wait <s>]` | Run the full connect sequence; `--wait` retries until connected or the timeout elapses |
 | `watch [--no-initial]` | Self-healing daemon: monitors and auto-recovers drops |
 | `profile get` | Print the active profile |
 | `profile set <name>` | Switch profile (and apply it, unless `--no-apply`) |
 | `profile list` | List all profiles |
-| `detect [--apply]` | Guess profile from visible networks; optionally apply it |
-| `add <ssid> [password]` | Add or update a saved network |
+| `detect [--apply] [--json]` | Guess profile from visible networks; optionally apply it |
+| `add <ssid> [password]` | Add or update a saved network (`--dns`, `--eap`, `--identity`, `--ca-cert`, `--hidden`, `--to`, `--at`) |
 | `forget <ssid>` | Remove a network from config and NetworkManager |
+| `prune [--dry-run]` | Remove NetworkManager wireless profiles whose SSID is no longer in the config |
 | `scan [--to <profile>]` | Interactive scan, pick, connect and save |
 | `list [--show-passwords]` | Show config: settings, networks, profiles |
 | `edit` | Open config in `$EDITOR`, validate on exit |
@@ -154,6 +172,17 @@ breadcrumbs install-service
 2. Reacts immediately to link-state changes via `nmcli monitor`
 3. Runs `flow::run` (the connect state machine) on any detected drop
 4. Handles profile changes live — re-reads config and state on every tick
+5. Distinguishes captive portals from plain no-internet (a 200/301/302 instead
+   of the 204 generate_204 returns) and tells you to sign in instead of
+   pointlessly reconnecting
+6. Applies a `[settings.schedule]` time-of-day profile switch, respecting a
+   30-minute grace window after a manual `profile set`
+7. Detects suspend/resume (a large gap between ticks) and forces an immediate
+   recovery check instead of waiting out the poll interval
+
+When a Tailscale profile is connected through a bootstrap network and the
+connectivity check is intercepted, the watcher stays put and notifies once —
+it does not churn reconnects against a portal.
 
 Install as a systemd user service:
 

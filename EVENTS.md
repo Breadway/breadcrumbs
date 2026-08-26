@@ -25,8 +25,10 @@ still switches the profile on disk — there is just nobody listening for
 
 | Event | Data | When |
 |-------|------|------|
-| `bread.crumbs.profile.changed` | `{ "from": "<name>", "to": "<name>" }` | The watch loop observes that the persisted active profile is no longer the one it last acted on (CLI `profile set`, `detect --apply`, or `bread.command.crumbs.set_profile`). Not emitted on watcher start just because a profile is already selected. |
-| `bread.crumbs.health.changed` | `{ "profile": "<name>", "health": "<variant>", "ssid": <string or null> }` | The watch loop's health classification changes — including the first observation after start, and the forced re-evaluation after a profile change. **Not** emitted on every poll tick while the classification stays the same. |
+| `bread.crumbs.profile.changed` | `{ "from": "<name>", "to": "<name>" }` | The watch loop observes that the persisted active profile is no longer the one it last acted on (CLI `profile set`, `detect --apply`, `bread.command.crumbs.set_profile`, or a time-of-day schedule switch). Not emitted on watcher start just because a profile is already selected. |
+| `bread.crumbs.health.changed` | `{ "profile": "<name>", "health": "<variant>", "ssid": <string or null>, "iface": <string or null>, "ip": <string or null>, "exit_node": "<string>", "tailscale": <variant or null> }` | The watch loop's health classification changes — including the first observation after start, and the forced re-evaluation after a profile change. **Not** emitted on every poll tick while the classification stays the same. |
+| `bread.crumbs.network.changed` | `{ "from": <ssid or null>, "to": <ssid or null>, "profile": "<name>" }` | The active SSID changed between watch-loop ticks. `from` is `null` on the first association observed after start (or after a profile switch). |
+| `bread.crumbs.tailscale.changed` | `{ "profile": "<name>", "state": <variant or null>, "exit_node": "<string>" }` | The Tailscale health state (or its mere presence) changed between ticks. `state` is the `TsHealth` variant name or `null` when Tailscale isn't installed. |
 | `bread.crumbs.set_profile.done` | `{ "profile": "<name>" }` | `bread.command.crumbs.set_profile` persisted the new profile. |
 | `bread.crumbs.set_profile.failed` | `{ "error": "<message>" }` | `bread.command.crumbs.set_profile` was received but rejected (unknown profile, missing `profile` field, config unreadable). |
 
@@ -36,6 +38,7 @@ still switches the profile on disk — there is just nobody listening for
 |---------|---------|
 | `Up` | Adapter present, internet reachable, Tailscale healthy if the profile requires it. |
 | `DownNoNet` | No internet. |
+| `CaptivePortal` | No internet and an HTTP response arrived that wasn't the 204 generate_204 returns — traffic is being intercepted (captive/guest portal). Needs a browser sign-in, not a reconnect. |
 | `DownTailscaleManual` | Tailscale required but needs login / isn't installed — cannot auto-fix. |
 | `DownTailscaleOther` | Tailscale required and unhealthy for some other (usually auto-recoverable) reason. |
 | `NoAdapter` | No Wi-Fi interface. |

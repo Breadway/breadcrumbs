@@ -10,7 +10,7 @@ use crate::bread_events;
 use crate::config::Config;
 use crate::flow;
 use crate::notify::{log, notify, Urgency};
-use crate::state::State;
+use crate::state::{self, State};
 use crate::status::{self};
 use crate::tailscale::TsHealth;
 
@@ -23,6 +23,10 @@ use crate::tailscale::TsHealth;
 pub enum Health {
     Up,
     DownNoNet,
+    /// Traffic is being intercepted — a captive/guest portal answered the
+    /// connectivity check with 200/301/302 instead of 204. Not something
+    /// reconnecting fixes; the user must sign in.
+    CaptivePortal,
     DownTailscaleManual,
     DownTailscaleOther,
     NoAdapter,
@@ -38,6 +42,7 @@ impl Health {
         match self {
             Health::Up => "Up",
             Health::DownNoNet => "DownNoNet",
+            Health::CaptivePortal => "CaptivePortal",
             Health::DownTailscaleManual => "DownTailscaleManual",
             Health::DownTailscaleOther => "DownTailscaleOther",
             Health::NoAdapter => "NoAdapter",
@@ -46,34 +51,71 @@ impl Health {
     }
 }
 
-pub fn classify(cfg: &Config, profile: &str) -> (Health, Option<String>) {
+/// Everything the watch loop needs to know about one health observation:
+/// the classification plus the context used for events and notifications.
+#[derive(Debug, Clone)]
+pub struct Classification {
+    pub health: Health,
+    pub ssid: Option<String>,
+    pub iface: Option<String>,
+    pub ip: Option<String>,
+    pub tailscale: Option<TsHealth>,
+    pub exit_node: String,
+}
+
+pub fn classify(cfg: &Config, profile: &str) -> Classification {
     // Checked before gather(): a profile missing from config would otherwise
     // silently fall back to "tailscale not required" and read as healthy off
     // of nothing but a bare internet check, never surfacing the misconfig.
     if cfg.profile(profile).is_none() {
-        return (Health::UnknownProfile, None);
+        return Classification {
+            health: Health::UnknownProfile,
+            ssid: None,
+            iface: None,
+            ip: None,
+            tailscale: None,
+            exit_node: String::new(),
+        };
     }
     let s = status::gather(cfg, profile);
     if s.iface.is_none() {
-        return (Health::NoAdapter, None);
+        return Classification {
+            health: Health::NoAdapter,
+            ssid: None,
+            iface: None,
+            ip: None,
+            tailscale: None,
+            exit_node: s.exit_node,
+        };
     }
     let ssid = s.ssid.clone();
-    if !s.internet {
-        return (Health::DownNoNet, ssid);
-    }
-    if s.tailscale_required {
+    let health = if !s.internet {
+        if s.portal {
+            Health::CaptivePortal
+        } else {
+            Health::DownNoNet
+        }
+    } else if s.tailscale_required {
         match s.tailscale {
-            Some(TsHealth::Ok) => (Health::Up, ssid),
+            Some(TsHealth::Ok) => Health::Up,
             // NeedsLogin / NotInstalled / NoExitNode all need human action:
             // a missing exit-node config can't be auto-fixed either.
             Some(TsHealth::NeedsLogin)
             | Some(TsHealth::NotInstalled)
-            | Some(TsHealth::NoExitNode) => (Health::DownTailscaleManual, ssid),
-            Some(_) => (Health::DownTailscaleOther, ssid),
-            None => (Health::DownTailscaleManual, ssid),
+            | Some(TsHealth::NoExitNode) => Health::DownTailscaleManual,
+            Some(_) => Health::DownTailscaleOther,
+            None => Health::DownTailscaleManual,
         }
     } else {
-        (Health::Up, ssid)
+        Health::Up
+    };
+    Classification {
+        health,
+        ssid,
+        iface: s.iface,
+        ip: s.ip,
+        tailscale: s.tailscale,
+        exit_node: s.exit_node,
     }
 }
 
@@ -84,6 +126,15 @@ pub fn classify(cfg: &Config, profile: &str) -> (Health, Option<String>) {
 /// panic-prone `Instant::now() - gap` seed.
 fn debounce_ready(last: Option<Instant>, gap: Duration) -> bool {
     last.map(|t| t.elapsed() > gap).unwrap_or(true)
+}
+
+/// Whether the flow-recovery cooldown has elapsed since the last `flow::run`
+/// (or one never ran). Pure so the recovery pacing is unit-testable.
+fn recovery_due(last_flow_at: Option<Instant>, now: Instant, cooldown_secs: u64) -> bool {
+    last_flow_at
+        .map(|t| now.duration_since(t).as_secs())
+        .unwrap_or(u64::MAX)
+        >= cooldown_secs
 }
 
 /// A wake signal for the watch loop. `SetProfile` is an *action* (applied on
@@ -208,8 +259,8 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
     let mut profile = State::load(&cfg.settings.default_profile).profile;
     if run_initial {
         // Don't churn an already-working connection on (re)start.
-        let (h, _) = classify(&cfg, &profile);
-        if h == Health::Up {
+        let class = classify(&cfg, &profile);
+        if class.health == Health::Up {
             log(&format!(
                 "watch: already healthy on start (profile={profile}); skipping initial flow"
             ));
@@ -221,9 +272,20 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
 
     let mut prev_health: Option<Health> = None;
     let mut prev_profile = profile.clone();
+    let mut prev_ssid: Option<String> = None;
+    let mut prev_ts: Option<&'static str> = None;
     let mut fail_streak: u32 = 0;
     let mut last_flow_at: Option<Instant> = None;
     const FLOW_COOLDOWN: u64 = 20;
+    const RESUME_SLACK: Duration = Duration::from_secs(60);
+    const SCHEDULE_GRACE: Duration = Duration::from_secs(30 * 60);
+    let mut prev_wait = Duration::from_secs(base);
+    let mut last_tick_at = Instant::now();
+    // Tracks what the *schedule* last applied, so the loop can tell a
+    // manual `profile set` (CLI or bus) apart from its own switch and give
+    // manual changes a grace window before the schedule overrides them.
+    let mut last_schedule_applied: Option<String> = Some(profile.clone());
+    let mut manual_set_at: Option<Instant> = None;
 
     loop {
         // Reload config + state so edits and `profile set` take effect live.
@@ -239,6 +301,45 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
         }
         profile = State::load(&cfg.settings.default_profile).profile;
 
+        // Suspend/resume: `nmcli monitor` sees nothing while the machine
+        // sleeps, so a large wall-clock gap means the network state may have
+        // changed underneath us — allow an immediate recovery run instead of
+        // waiting out any remaining flow cooldown.
+        if last_tick_at.elapsed() > prev_wait + RESUME_SLACK {
+            log("watch: large gap since last tick (suspend/resume?) — forcing recovery check");
+            last_flow_at = None;
+        }
+
+        // Time-of-day schedule: switch to the scheduled profile when its
+        // window is active, unless the user manually set the profile within
+        // the grace window.
+        if last_schedule_applied.as_deref() != Some(profile.as_str()) {
+            // The persisted profile changed and it wasn't our own schedule
+            // switch — a manual set (CLI or bus). Start the grace window.
+            if last_schedule_applied.is_some() {
+                manual_set_at = Some(Instant::now());
+            }
+            last_schedule_applied = Some(profile.clone());
+        }
+        if let Some(sched) = scheduled_profile_now(&cfg) {
+            if sched != profile {
+                let grace_ok = manual_set_at
+                    .map(|t| t.elapsed() >= SCHEDULE_GRACE)
+                    .unwrap_or(true);
+                if grace_ok {
+                    if state::set_profile(&cfg, &sched).is_ok() {
+                        log(&format!("watch: schedule applied profile {sched}"));
+                        last_schedule_applied = Some(sched.clone());
+                        manual_set_at = None;
+                    }
+                } else {
+                    log(&format!(
+                        "watch: schedule would switch to {sched}, but a manual set is still in grace"
+                    ));
+                }
+            }
+        }
+
         let profile_changed = profile != prev_profile;
         if profile_changed {
             log(&format!(
@@ -252,13 +353,42 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
             bread_events::emit_profile_changed(&bread, &prev_profile, &profile);
             prev_profile = profile.clone();
             prev_health = None; // force re-evaluation/recovery for new profile
+            prev_ssid = None; // a profile switch is a fresh network context
+            prev_ts = None;
             last_flow_at = None; // allow immediate recovery on profile change
         }
 
-        let (health, ssid) = classify(&cfg, &profile);
+        let class = classify(&cfg, &profile);
+        let health = class.health.clone();
+        let ssid = class.ssid.clone();
         let transition = prev_health.as_ref() != Some(&health);
         if transition {
-            bread_events::emit_health_changed(&bread, &profile, health.as_str(), ssid.as_deref());
+            bread_events::emit_health_changed(
+                &bread,
+                bread_events::HealthChanged {
+                    profile: &profile,
+                    health: health.as_str(),
+                    ssid: ssid.as_deref(),
+                    iface: class.iface.as_deref(),
+                    ip: class.ip.as_deref(),
+                    exit_node: &class.exit_node,
+                    tailscale: class.tailscale.as_ref().map(|t| t.state_str()),
+                },
+            );
+        }
+        if class.ssid != prev_ssid {
+            bread_events::emit_network_changed(
+                &bread,
+                prev_ssid.as_deref(),
+                class.ssid.as_deref(),
+                &profile,
+            );
+            prev_ssid = class.ssid.clone();
+        }
+        let ts_state = class.tailscale.as_ref().map(|t| t.state_str());
+        if ts_state != prev_ts {
+            bread_events::emit_tailscale_changed(&bread, &profile, ts_state, &class.exit_node);
+            prev_ts = ts_state;
         }
 
         match &health {
@@ -297,6 +427,19 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
                 }
                 fail_streak = fail_streak.saturating_add(1);
             }
+            Health::CaptivePortal => {
+                if transition {
+                    notify(
+                        "breadcrumbs: captive portal detected",
+                        "Traffic is being intercepted — open a browser and sign in.",
+                        Urgency::Normal,
+                    );
+                }
+                // Reconnecting won't fix a portal; keep the poll fast (don't
+                // count it as a failure) so a successful sign-in is noticed
+                // promptly and the state flips back to Up.
+                fail_streak = 0;
+            }
             Health::DownTailscaleManual => {
                 // Can't be auto-fixed (login / install / exit-node config).
                 // Notify once per transition.
@@ -313,8 +456,7 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
                 // state: login may have completed since the last attempt, or
                 // the user may have missed the browser window. Quiet — a
                 // still-broken state must not re-notify on every retry.
-                let elapsed = last_flow_at.map(|t| t.elapsed().as_secs()).unwrap_or(u64::MAX);
-                if elapsed >= FLOW_COOLDOWN {
+                if recovery_due(last_flow_at, Instant::now(), FLOW_COOLDOWN) {
                     let outcome = flow::run_quiet(&mut cfg, &profile);
                     last_flow_at = Some(Instant::now());
                     fail_streak = if outcome.ok() {
@@ -332,10 +474,7 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
                         Urgency::Normal,
                     );
                 }
-                let elapsed = last_flow_at
-                    .map(|t| t.elapsed().as_secs())
-                    .unwrap_or(u64::MAX);
-                if elapsed >= FLOW_COOLDOWN {
+                if recovery_due(last_flow_at, Instant::now(), FLOW_COOLDOWN) {
                     log(&format!(
                         "watch: down ({:?}) profile={profile} ssid={:?} — running flow",
                         health, ssid
@@ -350,7 +489,7 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
                     };
                 } else {
                     log(&format!(
-                        "watch: down ({:?}) — cooldown ({elapsed}s/{FLOW_COOLDOWN}s), skipping flow",
+                        "watch: down ({:?}) — cooldown, skipping flow",
                         health
                     ));
                 }
@@ -362,6 +501,8 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
         // Adaptive backoff: healthy -> base; failing -> grow up to ~6x.
         let mult = 1 + fail_streak.min(5);
         let dur = Duration::from_secs(base * mult as u64);
+        prev_wait = dur;
+        last_tick_at = Instant::now();
         // Apply a queued set_profile on this thread — the single owner of
         // config/state file access — and emit the confirmation. The next
         // iteration's reload sees the new profile and recovers accordingly.
@@ -369,6 +510,14 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
             bread_events::apply_set_profile(&name);
         }
     }
+}
+
+/// The profile a time-of-day schedule wants right now, if any. Returns
+/// `None` when no schedule is configured or the local time can't be read.
+fn scheduled_profile_now(cfg: &Config) -> Option<String> {
+    let hhmm = crate::util::local_hhmm()?;
+    let mins = crate::config::hhmm_to_minutes(&hhmm)?;
+    cfg.settings.scheduled_profile(mins)
 }
 
 #[cfg(test)]
@@ -404,5 +553,49 @@ mod tests {
         assert_eq!(Health::DownTailscaleOther.as_str(), "DownTailscaleOther");
         assert_eq!(Health::NoAdapter.as_str(), "NoAdapter");
         assert_eq!(Health::UnknownProfile.as_str(), "UnknownProfile");
+    }
+
+    #[test]
+    fn wait_for_tick_returns_pending_set_profile_and_drains_churn() {
+        // A queued set_profile is an action, not a signal: it must survive
+        // the churn-burst drain and be returned to the loop.
+        let (tx, rx) = mpsc::channel::<Wake>();
+        let _ = tx.send(Wake::LinkChurn);
+        let _ = tx.send(Wake::SetProfile("home".into()));
+        let _ = tx.send(Wake::LinkChurn);
+
+        let wake = wait_for_tick(&rx, Duration::from_millis(10));
+        assert!(matches!(wake, Some(Wake::SetProfile(n)) if n == "home"));
+        // The burst was fully drained.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn wait_for_tick_drains_churn_burst_without_action() {
+        // A burst of monitor signals collapses to one wake with no action.
+        let (tx, rx) = mpsc::channel::<Wake>();
+        let _ = tx.send(Wake::LinkChurn);
+        let _ = tx.send(Wake::LinkChurn);
+        let _ = tx.send(Wake::LinkChurn);
+
+        assert!(wait_for_tick(&rx, Duration::from_millis(10)).is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn wait_for_tick_times_out_with_no_signal() {
+        let (_tx, rx) = mpsc::channel::<Wake>();
+        assert!(wait_for_tick(&rx, Duration::from_millis(10)).is_none());
+    }
+
+    #[test]
+    fn recovery_due_fires_when_never_run_and_after_cooldown() {
+        // Never run → due immediately (the map() to u64::MAX path).
+        assert!(recovery_due(None, Instant::now(), 20));
+        // Just ran → not due again yet.
+        let now = Instant::now();
+        assert!(!recovery_due(Some(now), now, 20));
+        // A zero cooldown is always already-elapsed.
+        assert!(recovery_due(Some(now), now, 0));
     }
 }

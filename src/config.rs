@@ -28,6 +28,47 @@ fn default_ping_host() -> String {
     "1.1.1.1".to_string()
 }
 
+/// Parse "HH:MM" (24h) into minutes since midnight; `None` if malformed.
+pub fn hhmm_to_minutes(s: &str) -> Option<u32> {
+    let (h, m) = s.trim().split_once(':')?;
+    let h: u32 = h.parse().ok()?;
+    let m: u32 = m.parse().ok()?;
+    if h > 23 || m > 59 {
+        return None;
+    }
+    Some(h * 60 + m)
+}
+
+/// Does the window `[from, to)` (minutes since midnight) contain `now`?
+/// `from >= to` means an overnight window (e.g. 22:00–07:00).
+pub fn window_contains(from: u32, to: u32, now: u32) -> bool {
+    if from < to {
+        now >= from && now < to
+    } else {
+        now >= from || now < to
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScheduleEntry {
+    /// Profile to switch to while the window is active.
+    pub profile: String,
+    /// "HH:MM", inclusive start.
+    pub from: String,
+    /// "HH:MM", exclusive end (`from >= to` means overnight).
+    pub to: String,
+}
+
+impl ScheduleEntry {
+    /// Whether the window contains `now_minutes` (minutes since midnight).
+    pub fn contains(&self, now_minutes: u32) -> bool {
+        match (hhmm_to_minutes(&self.from), hhmm_to_minutes(&self.to)) {
+            (Some(f), Some(t)) => window_contains(f, t, now_minutes),
+            _ => false,
+        }
+    }
+}
+
 fn is_false(b: &bool) -> bool {
     !b
 }
@@ -56,6 +97,21 @@ pub struct Settings {
     /// configs keep parsing exactly as before.
     #[serde(default, skip_serializing_if = "is_false")]
     pub core_profiles_initialized: bool,
+    /// Preferred Wi-Fi interface (e.g. "wlan0"). When set, this exact
+    /// device is used if present; otherwise the first Wi-Fi device wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<String>,
+    /// Priority-ordered fallback exit nodes. Tried in order by the flow;
+    /// the first healthy one is selected. Falls back to `exit_node` when
+    /// empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exit_nodes: Vec<String>,
+    /// Optional time-of-day schedule: at a given time, switch to the listed
+    /// profile automatically (respecting a manual-override grace window;
+    /// see the watch loop). First matching rule wins; outside every window
+    /// nothing is switched.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schedule: Vec<ScheduleEntry>,
 }
 
 impl Default for Settings {
@@ -69,7 +125,21 @@ impl Default for Settings {
             connectivity_url: default_connectivity_url(),
             ping_host: default_ping_host(),
             core_profiles_initialized: false,
+            interface: None,
+            exit_nodes: Vec::new(),
+            schedule: Vec::new(),
         }
+    }
+}
+
+impl Settings {
+    /// The profile a time-of-day schedule picks for `now_minutes` (minutes
+    /// since midnight), if any — first matching rule wins.
+    pub fn scheduled_profile(&self, now_minutes: u32) -> Option<String> {
+        self.schedule
+            .iter()
+            .find(|e| e.contains(now_minutes))
+            .map(|e| e.profile.clone())
     }
 }
 
@@ -87,8 +157,31 @@ pub struct NetworkDef {
     /// fed to `nmcli --ask` on stdin, never as an argv element.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    /// Per-network DNS override. `None` falls back to `settings.dns`;
+    /// an explicitly empty string disables DNS pinning for this network.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<String>,
+    /// WPA-Enterprise (802.1x). When `eap` is set the network is treated as
+    /// enterprise: `identity` + `password` (reused) + optional `ca_cert`
+    /// path. `eap` is e.g. "peap" or "tls".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eap: Option<String>,
+    /// 802.1x identity (e.g. `user@corp`) for enterprise networks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    /// Path to a CA certificate for 802.1x (optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_cert: Option<String>,
     #[serde(default)]
     pub hidden: bool,
+}
+
+impl NetworkDef {
+    /// The DNS to pin for this network: the per-network override if set,
+    /// otherwise the global setting.
+    pub fn effective_dns<'a>(&'a self, fallback: &'a str) -> &'a str {
+        self.dns.as_deref().unwrap_or(fallback)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -112,6 +205,11 @@ pub struct Profile {
     /// Used by `breadcrumbs detect` to guess the active profile.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub detect_ssids: Vec<String>,
+    /// Opt-in learning: on a successful connect, the SSID is appended to
+    /// `detect_ssids` (bounded) so `breadcrumbs detect` improves without
+    /// hand-editing. Off by default to keep detect predictable.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub learn: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,6 +280,24 @@ impl Config {
 
     pub fn network<'a>(&'a self, ssid: &str) -> Option<&'a NetworkDef> {
         self.networks.iter().find(|n| n.ssid == ssid)
+    }
+
+    /// The effective exit-node list for a profile, in priority order:
+    /// per-profile `exit_node`, else `settings.exit_nodes`, else
+    /// `settings.exit_node`. Empty entries are filtered out.
+    pub fn exit_nodes_for(&self, profile: &str) -> Vec<String> {
+        if let Some(p) = self.profiles.get(profile).and_then(|p| p.exit_node.clone()) {
+            return vec![p];
+        }
+        let list = if self.settings.exit_nodes.is_empty() {
+            vec![self.settings.exit_node.clone()]
+        } else {
+            self.settings.exit_nodes.clone()
+        };
+        list.into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
     }
 
     /// Load config, creating a skeleton one on first run.
@@ -303,6 +419,7 @@ fn core_profiles() -> BTreeMap<String, Profile> {
             exit_node: None,
             include_all_known: false,
             detect_ssids: vec![],
+            learn: false,
         },
     );
     p.insert(
@@ -314,6 +431,7 @@ fn core_profiles() -> BTreeMap<String, Profile> {
             exit_node: None,
             include_all_known: false,
             detect_ssids: vec![],
+            learn: false,
         },
     );
     p.insert(
@@ -325,6 +443,7 @@ fn core_profiles() -> BTreeMap<String, Profile> {
             exit_node: None,
             include_all_known: true,
             detect_ssids: vec![],
+            learn: false,
         },
     );
     p
@@ -474,6 +593,10 @@ hidden = false"#;
         let n = NetworkDef {
             ssid: "Cafe".into(),
             password: None,
+            dns: None,
+            eap: None,
+            identity: None,
+            ca_cert: None,
             hidden: false,
         };
         let text = toml::to_string_pretty(&n).unwrap();
@@ -485,6 +608,10 @@ hidden = false"#;
         let n = NetworkDef {
             ssid: "Cafe".into(),
             password: Some("hunter2".into()),
+            dns: None,
+            eap: None,
+            identity: None,
+            ca_cert: None,
             hidden: false,
         };
         let text = toml::to_string_pretty(&n).unwrap();
@@ -528,5 +655,136 @@ dns = "9.9.9.9""#;
         assert_eq!(cfg.settings.dns, "9.9.9.9");
         assert!(cfg.networks.is_empty());
         assert!(cfg.profiles.is_empty());
+    }
+
+    #[test]
+    fn exit_nodes_for_prioritizes_profile_then_list_then_single_node() {
+        let mut cfg = build_initial_config();
+        cfg.settings.exit_node = "global".into();
+        cfg.settings.exit_nodes = vec!["listA".into(), "listB".into()];
+        cfg.profiles.get_mut("home").unwrap().exit_node = Some("profile".into());
+
+        // Per-profile override wins outright.
+        assert_eq!(cfg.exit_nodes_for("home"), vec!["profile".to_string()]);
+
+        // Otherwise the priority list is used verbatim.
+        cfg.profiles.get_mut("home").unwrap().exit_node = None;
+        assert_eq!(
+            cfg.exit_nodes_for("home"),
+            vec!["listA".to_string(), "listB".to_string()]
+        );
+
+        // Without a list, the single setting is the (one-element) fallback.
+        cfg.settings.exit_nodes = vec![];
+        assert_eq!(cfg.exit_nodes_for("home"), vec!["global".to_string()]);
+    }
+
+    #[test]
+    fn exit_nodes_for_filters_empty_and_whitespace_entries() {
+        let mut cfg = build_initial_config();
+        cfg.settings.exit_nodes = vec![
+            "  ".into(),
+            "nodeA".into(),
+            "".into(),
+            " nodeB ".into(),
+        ];
+        assert_eq!(
+            cfg.exit_nodes_for("home"),
+            vec!["nodeA".to_string(), "nodeB".to_string()]
+        );
+    }
+
+    #[test]
+    fn hhmm_to_minutes_parses_and_rejects_malformed() {
+        assert_eq!(hhmm_to_minutes("09:30"), Some(570));
+        assert_eq!(hhmm_to_minutes("00:00"), Some(0));
+        assert_eq!(hhmm_to_minutes("23:59"), Some(1439));
+        assert_eq!(hhmm_to_minutes("9:30"), Some(570)); // lenient about padding
+        assert_eq!(hhmm_to_minutes("24:00"), None); // hour out of range
+        assert_eq!(hhmm_to_minutes("12:60"), None); // minute out of range
+        assert_eq!(hhmm_to_minutes("0930"), None); // no colon
+        assert_eq!(hhmm_to_minutes(""), None);
+    }
+
+    #[test]
+    fn window_contains_handles_same_day_and_overnight() {
+        // Same-day window 09:00–17:00 (end exclusive).
+        assert!(window_contains(540, 1020, 600));
+        assert!(!window_contains(540, 1020, 1020));
+        assert!(!window_contains(540, 1020, 500));
+        // Overnight window 22:00–07:00.
+        assert!(window_contains(1320, 420, 1380)); // 23:00
+        assert!(window_contains(1320, 420, 60)); // 01:00
+        assert!(!window_contains(1320, 420, 720)); // 12:00
+    }
+
+    #[test]
+    fn scheduled_profile_returns_first_matching_rule() {
+        let mut cfg = build_initial_config();
+        cfg.settings.schedule = vec![
+            ScheduleEntry {
+                profile: "work".into(),
+                from: "09:00".into(),
+                to: "17:00".into(),
+            },
+            ScheduleEntry {
+                profile: "home".into(),
+                from: "09:30".into(),
+                to: "18:00".into(),
+            },
+        ];
+        // 10:00 matches both — the first rule (work) wins.
+        assert_eq!(cfg.settings.scheduled_profile(600), Some("work".into()));
+        // Outside every window → no schedule applies.
+        assert_eq!(cfg.settings.scheduled_profile(60), None);
+    }
+
+    #[test]
+    fn effective_dns_uses_per_network_override_then_global_fallback() {
+        let n = NetworkDef {
+            ssid: "x".into(),
+            password: None,
+            dns: Some("9.9.9.9".into()),
+            eap: None,
+            identity: None,
+            ca_cert: None,
+            hidden: false,
+        };
+        assert_eq!(n.effective_dns("1.1.1.1"), "9.9.9.9");
+
+        let n2 = NetworkDef { dns: None, ..n.clone() };
+        assert_eq!(n2.effective_dns("1.1.1.1"), "1.1.1.1");
+
+        // An explicit empty string is a valid per-network opt-out.
+        let n3 = NetworkDef { dns: Some(String::new()), ..n.clone() };
+        assert_eq!(n3.effective_dns("1.1.1.1"), "");
+    }
+
+    #[test]
+    fn enterprise_fields_round_trip_and_omit_when_none() {
+        let n = NetworkDef {
+            ssid: "Corp".into(),
+            password: Some("pw".into()),
+            dns: None,
+            eap: Some("peap".into()),
+            identity: Some("user@corp".into()),
+            ca_cert: Some("/etc/ca.pem".into()),
+            hidden: false,
+        };
+        let text = toml::to_string_pretty(&n).unwrap();
+        assert!(text.contains("eap") && text.contains("identity") && text.contains("ca_cert"));
+        let back: NetworkDef = toml::from_str(&text).unwrap();
+        assert_eq!(back.eap.as_deref(), Some("peap"));
+        assert_eq!(back.identity.as_deref(), Some("user@corp"));
+        assert_eq!(back.ca_cert.as_deref(), Some("/etc/ca.pem"));
+
+        let plain = NetworkDef {
+            eap: None,
+            identity: None,
+            ca_cert: None,
+            ..n
+        };
+        let t2 = toml::to_string_pretty(&plain).unwrap();
+        assert!(!t2.contains("eap") && !t2.contains("identity") && !t2.contains("ca_cert"));
     }
 }
