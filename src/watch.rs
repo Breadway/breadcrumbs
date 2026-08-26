@@ -64,9 +64,11 @@ pub fn classify(cfg: &Config, profile: &str) -> (Health, Option<String>) {
     if s.tailscale_required {
         match s.tailscale {
             Some(TsHealth::Ok) => (Health::Up, ssid),
-            Some(TsHealth::NeedsLogin) | Some(TsHealth::NotInstalled) => {
-                (Health::DownTailscaleManual, ssid)
-            }
+            // NeedsLogin / NotInstalled / NoExitNode all need human action:
+            // a missing exit-node config can't be auto-fixed either.
+            Some(TsHealth::NeedsLogin)
+            | Some(TsHealth::NotInstalled)
+            | Some(TsHealth::NoExitNode) => (Health::DownTailscaleManual, ssid),
             Some(_) => (Health::DownTailscaleOther, ssid),
             None => (Health::DownTailscaleManual, ssid),
         }
@@ -84,9 +86,18 @@ fn debounce_ready(last: Option<Instant>, gap: Duration) -> bool {
     last.map(|t| t.elapsed() > gap).unwrap_or(true)
 }
 
+/// A wake signal for the watch loop. `SetProfile` is an *action* (applied on
+/// the loop thread), `LinkChurn` is just "go look" — the distinction keeps
+/// every config/state file access on the single loop thread, so the bread
+/// subscription thread can never race the loop's own `Config::load`/`save`.
+enum Wake {
+    LinkChurn,
+    SetProfile(String),
+}
+
 /// Tail `nmcli monitor` and ping the channel on link-state churn so we react
 /// to drops within a second instead of waiting out the poll interval.
-fn spawn_nm_monitor(tx: mpsc::Sender<()>) {
+fn spawn_nm_monitor(tx: mpsc::Sender<Wake>) {
     thread::spawn(move || loop {
         let child = Command::new("nmcli")
             .arg("monitor")
@@ -113,11 +124,18 @@ fn spawn_nm_monitor(tx: mpsc::Sender<()>) {
             let mut last: Option<Instant> = None;
             for line in reader.lines().map_while(Result::ok) {
                 let l = line.to_lowercase();
-                let interesting =
-                    l.contains("disconnect") || l.contains("unavailable") || l.contains("failed");
+                // `connectivity` lines catch drops that keep the device
+                // "connected" but lose the internet (captive portal, DHCP
+                // failure); `deactivating` covers teardown. Everything else
+                // waits out the poll interval.
+                let interesting = l.contains("disconnect")
+                    || l.contains("unavailable")
+                    || l.contains("failed")
+                    || l.contains("deactivating")
+                    || l.contains("connectivity");
                 if interesting && debounce_ready(last, Duration::from_millis(1500)) {
                     last = Some(Instant::now());
-                    let _ = tx.send(());
+                    let _ = tx.send(Wake::LinkChurn);
                 }
             }
         }
@@ -127,17 +145,32 @@ fn spawn_nm_monitor(tx: mpsc::Sender<()>) {
     });
 }
 
-/// Sleep up to `dur`, but wake early if `nmcli monitor` signals link churn.
-fn wait_for_tick(rx: &Receiver<()>, dur: Duration) {
+/// Sleep up to `dur`, but wake early if `nmcli monitor` signals link churn or
+/// a `set_profile` command arrives. Returns the pending action, if any.
+fn wait_for_tick(rx: &Receiver<Wake>, dur: Duration) -> Option<Wake> {
     match rx.recv_timeout(dur) {
-        Ok(()) => {
-            // Drain any burst of events so we don't re-fire immediately.
-            while rx.try_recv().is_ok() {}
+        Ok(first) => {
+            // Drain any burst of churn signals so we don't re-fire
+            // immediately, but never drop a queued set_profile — it's an
+            // action, not a signal, and the earliest one wins.
+            let mut pending = match &first {
+                Wake::SetProfile(_) => Some(first),
+                Wake::LinkChurn => None,
+            };
+            while let Ok(w) = rx.try_recv() {
+                if pending.is_none() && matches!(&w, Wake::SetProfile(_)) {
+                    pending = Some(w);
+                }
+            }
+            pending
         }
-        Err(mpsc::RecvTimeoutError::Timeout) => {}
+        Err(mpsc::RecvTimeoutError::Timeout) => None,
         // Monitor thread gone (shouldn't happen: we hold the sender) — fall
         // back to a plain sleep so we don't busy-spin.
-        Err(mpsc::RecvTimeoutError::Disconnected) => thread::sleep(dur),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            thread::sleep(dur);
+            None
+        }
     }
 }
 
@@ -150,21 +183,25 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
     );
     log("watch: started");
 
-    let (tx, rx) = mpsc::channel::<()>();
+    let (tx, rx) = mpsc::channel::<Wake>();
     spawn_nm_monitor(tx.clone());
 
     // Long-lived, so this uses BreadClient::subscribe (a persistent
     // background thread with its own reconnect/backoff loop). breadd being
     // absent or restarting is transparent: the subscription just quietly
-    // stops delivering commands until it reconnects. A successful
-    // `set_profile` wakes this loop the same way `nmcli monitor` does, so
-    // the new profile is applied on the next tick instead of waiting out
-    // the current poll interval.
+    // stops delivering commands until it reconnects. The callback only
+    // *validates* the command and forwards an action through the channel —
+    // it never touches config/state files itself (that would race this
+    // loop's own Config::load/save), so all file access stays on this one
+    // thread.
     let bread = BreadClient::connect(bread_events::APP_ID);
     let wake = tx;
     let _commands = bread.subscribe("bread.command.crumbs.**", move |event| {
-        if bread_events::handle_command(&event) {
-            let _ = wake.send(());
+        match bread_events::handle_command(&event) {
+            bread_events::CommandAction::SetProfile(name) => {
+                let _ = wake.send(Wake::SetProfile(name));
+            }
+            bread_events::CommandAction::Ignore => {}
         }
     });
 
@@ -178,7 +215,7 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
             ));
         } else {
             log(&format!("watch: initial flow for profile={profile}"));
-            let _ = flow::run(&mut cfg, &profile);
+            let _ = flow::run_quiet(&mut cfg, &profile);
         }
     }
 
@@ -193,9 +230,10 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
         // This always runs *before* `flow::run` below (never after, within
         // the same tick), so a password `flow::run` clears-and-saves this
         // iteration is durably on disk by the time the *next* iteration's
-        // reload runs — there's no window where a stale (still-has-password)
-        // reload could clobber the save, since the two never race on
-        // different threads: everything here is sequential on this loop.
+        // reload runs. All config/state file access happens on this loop
+        // thread: `set_profile` commands from the bread bus are queued as
+        // [`Wake::SetProfile`] and applied here (see the bottom of the
+        // loop), never on the subscription thread.
         if let Ok(fresh) = Config::load() {
             cfg = fresh;
         }
@@ -248,29 +286,43 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
                 fail_streak = fail_streak.saturating_add(1);
             }
             Health::UnknownProfile => {
-                // flow::run() already notifies + logs the "unknown profile"
-                // critical error; re-running it here would just spam that on
-                // every tick, so only surface it once per transition.
+                // flow::run() is quiet from here, so surface the misconfig
+                // ourselves — once per transition/change, not every tick.
                 if transition || profile_changed {
-                    let _ = flow::run(&mut cfg, &profile);
+                    notify(
+                        "breadcrumbs: unknown profile",
+                        &format!("'{profile}' is not defined in breadcrumbs.toml"),
+                        Urgency::Critical,
+                    );
                 }
                 fail_streak = fail_streak.saturating_add(1);
             }
             Health::DownTailscaleManual => {
-                // Can't be auto-fixed (login / not installed). Notify once.
+                // Can't be auto-fixed (login / install / exit-node config).
+                // Notify once per transition.
                 if transition {
                     notify(
                         "Tailscale Error",
-                        "Tailscale needs manual attention (login / install). \
-                         Other Wi-Fi automation paused until resolved.",
+                        "Tailscale needs manual attention (login / install / \
+                         exit node config). Other Wi-Fi automation paused \
+                         until resolved.",
                         Urgency::Critical,
                     );
                 }
-                // Re-run flow only on transition so we land on the bootstrap net.
-                if transition || profile_changed {
-                    let _ = flow::run(&mut cfg, &profile);
+                // Re-attempt periodically and on the transition into this
+                // state: login may have completed since the last attempt, or
+                // the user may have missed the browser window. Quiet — a
+                // still-broken state must not re-notify on every retry.
+                let elapsed = last_flow_at.map(|t| t.elapsed().as_secs()).unwrap_or(u64::MAX);
+                if elapsed >= FLOW_COOLDOWN {
+                    let outcome = flow::run_quiet(&mut cfg, &profile);
+                    last_flow_at = Some(Instant::now());
+                    fail_streak = if outcome.ok() {
+                        0
+                    } else {
+                        fail_streak.saturating_add(1)
+                    };
                 }
-                fail_streak = fail_streak.saturating_add(1);
             }
             Health::DownNoNet | Health::DownTailscaleOther => {
                 if transition {
@@ -288,7 +340,7 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
                         "watch: down ({:?}) profile={profile} ssid={:?} — running flow",
                         health, ssid
                     ));
-                    let outcome = flow::run(&mut cfg, &profile);
+                    let outcome = flow::run_quiet(&mut cfg, &profile);
                     log(&format!("watch: recovery outcome = {:?}", outcome));
                     last_flow_at = Some(Instant::now());
                     fail_streak = if outcome.ok() {
@@ -310,7 +362,12 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
         // Adaptive backoff: healthy -> base; failing -> grow up to ~6x.
         let mult = 1 + fail_streak.min(5);
         let dur = Duration::from_secs(base * mult as u64);
-        wait_for_tick(&rx, dur);
+        // Apply a queued set_profile on this thread — the single owner of
+        // config/state file access — and emit the confirmation. The next
+        // iteration's reload sees the new profile and recovers accordingly.
+        if let Some(Wake::SetProfile(name)) = wait_for_tick(&rx, dur) {
+            bread_events::apply_set_profile(&name);
+        }
     }
 }
 

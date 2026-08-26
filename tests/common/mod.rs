@@ -50,6 +50,7 @@ impl RecordedCall {
 }
 
 type Matcher = Box<dyn Fn(&str, &[&str]) -> bool>;
+type DynamicRule = (Matcher, Box<dyn Fn(&str, &[&str]) -> Output>);
 
 /// A canned, rule-based [`Runner`]. Rules are tried in registration order;
 /// the first whose matcher returns `true` supplies the response. No rule
@@ -58,6 +59,7 @@ type Matcher = Box<dyn Fn(&str, &[&str]) -> bool>;
 /// (a wrong exit code) rather than silently returning success.
 pub struct FakeRunner {
     rules: Vec<(Matcher, Output)>,
+    dynamic_rules: Vec<DynamicRule>,
     commands: HashSet<String>,
     calls: Rc<RefCell<Vec<RecordedCall>>>,
 }
@@ -66,6 +68,7 @@ impl FakeRunner {
     pub fn new() -> Self {
         FakeRunner {
             rules: Vec::new(),
+            dynamic_rules: Vec::new(),
             commands: HashSet::new(),
             calls: Rc::new(RefCell::new(Vec::new())),
         }
@@ -99,6 +102,20 @@ impl FakeRunner {
             output,
         )
     }
+
+    /// Register a rule whose *response* is computed at call time (rather
+    /// than canned), enabling stateful fakes — e.g. answering "which SSID is
+    /// active?" with the SSID of the most recently dialed connection.
+    /// Dynamic rules are tried after the static ones.
+    pub fn on_dynamic(
+        mut self,
+        matcher: impl Fn(&str, &[&str]) -> bool + 'static,
+        out: impl Fn(&str, &[&str]) -> Output + 'static,
+    ) -> Self {
+        self.dynamic_rules
+            .push((Box::new(matcher), Box::new(out)));
+        self
+    }
 }
 
 impl Default for FakeRunner {
@@ -117,6 +134,11 @@ impl Runner for FakeRunner {
         for (matcher, out) in &self.rules {
             if matcher(prog, args) {
                 return out.clone();
+            }
+        }
+        for (matcher, out) in &self.dynamic_rules {
+            if matcher(prog, args) {
+                return out(prog, args);
             }
         }
         Output::failed()

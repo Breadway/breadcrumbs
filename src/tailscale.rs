@@ -21,6 +21,10 @@ pub enum TsHealth {
     ExitNodeMissing,
     /// The exit node exists but is offline.
     ExitNodeOffline,
+    /// The profile requires an exit node but none is configured
+    /// (`settings.exit_node` / per-profile `exit_node` empty). Cannot be
+    /// auto-fixed — the user must configure one.
+    NoExitNode,
     Error(String),
 }
 
@@ -37,6 +41,7 @@ impl TsHealth {
             TsHealth::Stopped => "backend stopped".into(),
             TsHealth::ExitNodeMissing => "exit node not found in tailnet".into(),
             TsHealth::ExitNodeOffline => "exit node is offline".into(),
+            TsHealth::NoExitNode => "no exit node configured".into(),
             TsHealth::Error(e) => format!("error: {e}"),
         }
     }
@@ -225,10 +230,30 @@ pub fn ensure_exit_node(node: &str) -> TsHealth {
     if !installed() {
         return TsHealth::NotInstalled;
     }
+    if node.trim().is_empty() {
+        // Never run `tailscale set --exit-node=` with an empty node — that
+        // would clear the user's current exit-node selection. This is a
+        // config error, surfaced as its own health state.
+        return TsHealth::NoExitNode;
+    }
 
     let v = match status_json() {
         Some(v) => v,
-        None => return TsHealth::Error("could not read tailscale status".into()),
+        None => {
+            // Daemon unreachable — usually *not running*: a stopped daemon
+            // prints its error to stderr and leaves stdout empty, which is
+            // exactly why this branch used to be dead code (the
+            // BackendState "Stopped" case below only fires when the daemon
+            // is up but the backend is stopped). Try to bring it up before
+            // giving up; `tailscale up` is idempotent when already running
+            // and fails fast (no sudo prompt — stdin is /dev/null) when
+            // the caller lacks permission to manage the daemon.
+            let _ = run("tailscale", &["up"], Duration::from_secs(20));
+            match status_json() {
+                Some(v2) => v2,
+                None => return TsHealth::Error("could not read tailscale status".into()),
+            }
+        }
     };
 
     match backend_state(&v).as_str() {
@@ -285,6 +310,11 @@ pub fn ensure_exit_node(node: &str) -> TsHealth {
 pub fn check(node: &str) -> TsHealth {
     if !installed() {
         return TsHealth::NotInstalled;
+    }
+    if node.trim().is_empty() {
+        // Read-only check, so never runs `tailscale set` — an empty node is
+        // a config error, not something this probe can fix.
+        return TsHealth::NoExitNode;
     }
     let v = match status_json() {
         Some(v) => v,
@@ -433,6 +463,7 @@ mod tests {
         assert!(!TsHealth::Stopped.is_ok());
         assert!(!TsHealth::ExitNodeMissing.is_ok());
         assert!(!TsHealth::ExitNodeOffline.is_ok());
+        assert!(!TsHealth::NoExitNode.is_ok());
         assert!(!TsHealth::Error("x".into()).is_ok());
     }
 
@@ -443,6 +474,7 @@ mod tests {
             TsHealth::NeedsLogin.describe(),
             "not logged in (run: tailscale up)"
         );
+        assert_eq!(TsHealth::NoExitNode.describe(), "no exit node configured");
         assert_eq!(TsHealth::Error("boom".into()).describe(), "error: boom");
     }
 

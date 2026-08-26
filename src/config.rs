@@ -28,6 +28,10 @@ fn default_ping_host() -> String {
     "1.1.1.1".to_string()
 }
 
+fn is_false(b: &bool) -> bool {
+    !b
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default = "default_dns")]
@@ -44,6 +48,14 @@ pub struct Settings {
     pub connectivity_url: String,
     #[serde(default = "default_ping_host")]
     pub ping_host: String,
+    /// Set the first time the config is saved. Core profiles (`home` /
+    /// `work` / `away`) are only backfilled for genuinely fresh or legacy
+    /// configs; once the user owns the file, a profile they deliberately
+    /// deleted stays deleted instead of being silently resurrected on the
+    /// next load. Omits itself from the TOML until set, so existing
+    /// configs keep parsing exactly as before.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub core_profiles_initialized: bool,
 }
 
 impl Default for Settings {
@@ -56,6 +68,7 @@ impl Default for Settings {
             watch_interval: default_watch_interval(),
             connectivity_url: default_connectivity_url(),
             ping_host: default_ping_host(),
+            core_profiles_initialized: false,
         }
     }
 }
@@ -175,7 +188,7 @@ impl Config {
     pub fn load() -> Result<Config, String> {
         let path = config_path();
         if !path.exists() {
-            let cfg = build_initial_config();
+            let mut cfg = build_initial_config();
             cfg.save()?;
             return Ok(cfg);
         }
@@ -192,14 +205,31 @@ impl Config {
                 .map_err(|e| format!("reading {}: {e}", net_path.display()))?;
             let nf: NetworksFile = toml::from_str(&net_text)
                 .map_err(|e| format!("parsing {}: {e}", net_path.display()))?;
-            cfg.networks = nf.networks;
+            // Merge, don't overwrite: a legacy config can still carry an
+            // inline `[[networks]]` block, and those entries must survive
+            // even when networks.toml already exists — otherwise the next
+            // save() (which writes only networks.toml) would silently drop
+            // hand-added inline networks. networks.toml wins on SSID
+            // conflicts; inline-only entries are appended and migrated.
+            let mut merged = nf.networks;
+            for def in std::mem::take(&mut cfg.networks) {
+                if !merged.iter().any(|n| n.ssid == def.ssid) {
+                    merged.push(def);
+                }
+            }
+            cfg.networks = merged;
         }
         // else: no networks.toml yet — keep whatever legacy inline networks
         // were read from breadcrumbs.toml above (or none, on a genuinely
         // fresh config). The next `save()` writes them to networks.toml and
         // stops writing them into breadcrumbs.toml, completing the migration.
 
-        // Self-heal: guarantee the three core profiles always exist.
+        // Enforce the documented minimum so `list` and the watch loop agree
+        // on the poll interval (watch silently clamps to 4 otherwise).
+        if cfg.settings.watch_interval < 4 {
+            cfg.settings.watch_interval = 4;
+        }
+
         ensure_core_profiles(&mut cfg);
         Ok(cfg)
     }
@@ -209,7 +239,12 @@ impl Config {
     /// `forget`, `scan`, `profile set`, and `flow::run`'s own credential
     /// clearing) goes through this single method so the two files never
     /// drift out of sync with each other.
-    pub fn save(&self) -> Result<(), String> {
+    pub fn save(&mut self) -> Result<(), String> {
+        // The first save marks the config as user-owned: core profiles are
+        // backfilled only for genuinely fresh/legacy configs, never
+        // resurrected after the user has edited (or deleted) them.
+        self.settings.core_profiles_initialized = true;
+
         let dir = config_dir();
         fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
 
@@ -296,6 +331,13 @@ fn core_profiles() -> BTreeMap<String, Profile> {
 }
 
 fn ensure_core_profiles(cfg: &mut Config) {
+    // Backfill missing core profiles only until the user has taken
+    // ownership of the config (`core_profiles_initialized` is set by the
+    // first save). After that, a profile the user deliberately deleted
+    // stays deleted.
+    if cfg.settings.core_profiles_initialized {
+        return;
+    }
     for (name, prof) in core_profiles() {
         cfg.profiles.entry(name).or_insert(prof);
     }
@@ -348,6 +390,23 @@ mod tests {
         assert!(cfg.profile("home").is_some());
         assert!(cfg.profile("work").is_some());
         assert!(cfg.profile("away").is_some());
+    }
+
+    #[test]
+    fn ensure_core_profiles_skips_backfill_once_initialized() {
+        // After the first save the config is user-owned: a deliberately
+        // deleted core profile must stay deleted instead of being
+        // resurrected on every load.
+        let mut cfg = Config {
+            settings: Settings {
+                core_profiles_initialized: true,
+                ..Default::default()
+            },
+            networks: vec![],
+            profiles: BTreeMap::new(),
+        };
+        ensure_core_profiles(&mut cfg);
+        assert!(cfg.profiles.is_empty(), "no backfill once user-owned");
     }
 
     #[test]

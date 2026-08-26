@@ -37,37 +37,54 @@ pub fn emit_health_changed(client: &BreadClient, profile: &str, health: &str, ss
     );
 }
 
+/// What a `bread.command.crumbs.*` event asks the watch loop to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandAction {
+    /// Persist this profile via [`state::set_profile`]. Applied on the
+    /// watch loop thread — the single owner of config/state file access —
+    /// never on the subscription thread, which would race the loop's own
+    /// `Config::load`/`save`.
+    SetProfile(String),
+    /// Nothing to do: unknown verb, or a validation failure already
+    /// reported via `bread.crumbs.set_profile.failed`.
+    Ignore,
+}
+
 /// Reacts to `bread.command.crumbs.*` verbs. Only `set_profile` maps to
 /// real, existing breadcrumbs functionality today — there is no pin/select
 /// (or other) verb because breadcrumbs has no such concept. Unrecognized
 /// verbs are ignored, not stubbed as no-ops that pretend to succeed.
 ///
-/// Returns `true` when a profile was actually persisted, so the watch loop
-/// can wake immediately and re-evaluate instead of waiting out the current
-/// poll interval.
-///
-/// Emits `bread.crumbs.set_profile.done`/`.failed` per the confirmation
-/// convention in bread's Documentation.md.
-pub fn handle_command(event: &BreadEvent) -> bool {
+/// This only *parses and validates* the command — it performs no file I/O
+/// (that would race the watch loop's own config access from a second
+/// thread). The returned [`CommandAction`] is forwarded to the loop, which
+/// applies it via [`apply_set_profile`].
+pub fn handle_command(event: &BreadEvent) -> CommandAction {
     let Some(verb) = event.event.strip_prefix("bread.command.crumbs.") else {
-        return false;
+        return CommandAction::Ignore;
     };
     match verb {
-        "set_profile" => handle_set_profile(event),
+        "set_profile" => match event.data.get("profile").and_then(|v| v.as_str()) {
+            Some(name) if !name.trim().is_empty() => CommandAction::SetProfile(name.to_string()),
+            _ => {
+                emit_set_profile_failed("missing string \"profile\" in command data");
+                CommandAction::Ignore
+            }
+        },
         other => {
             crate::notify::log(&format!(
                 "watch: ignoring unrecognized bread.command.crumbs.{other}"
             ));
-            false
+            CommandAction::Ignore
         }
     }
 }
 
-fn handle_set_profile(event: &BreadEvent) -> bool {
-    let Some(name) = event.data.get("profile").and_then(|v| v.as_str()) else {
-        emit_set_profile_failed("missing string \"profile\" in command data");
-        return false;
-    };
+/// Apply a `set_profile` command on the watch loop thread and emit the
+/// `done`/`failed` confirmation. Kept separate from [`handle_command`] so
+/// the bread subscription thread never touches config/state files
+/// concurrently with the loop.
+pub fn apply_set_profile(name: &str) {
     match Config::load().and_then(|cfg| state::set_profile(&cfg, name)) {
         Ok(()) => {
             crate::notify::log(&format!(
@@ -77,11 +94,9 @@ fn handle_set_profile(event: &BreadEvent) -> bool {
                 "bread.crumbs.set_profile.done",
                 serde_json::json!({ "profile": name }),
             );
-            true
         }
         Err(e) => {
             emit_set_profile_failed(&e);
-            false
         }
     }
 }

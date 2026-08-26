@@ -52,16 +52,53 @@ fn base_config() -> Config {
 /// the device reports connected after any successful connect attempt.
 fn base_nm(visible_ssids: &[&str]) -> FakeRunner {
     let visible = visible_ssids.join("\n");
-    FakeRunner::new()
+    let runner = FakeRunner::new()
         .on_contains("nmcli", "DEVICE,TYPE", ok("wlan0:wifi"))
         .on_contains("nmcli", "radio wifi on", ok(""))
         .on_contains("nmcli", "wifi rescan", ok(""))
-        .on_contains("nmcli", "-f SSID device wifi list", ok(&visible))
+        // Exact match: `-f ACTIVE,SSID` queries (which contain the substring
+        // "SSID device wifi list") must NOT be answered with the visible
+        // list — they go to the stateful rule below.
+        .on(
+            move |_prog, args| args.join(" ") == "-t -f SSID device wifi list ifname wlan0",
+            ok(&visible),
+        )
         .on_contains("nmcli", "NAME,TYPE", ok("")) // no saved profiles
         .on_contains("nmcli", "GENERAL.CON-UUID", ok("uuid-1"))
         .on_contains("nmcli", "ipv4.ignore-auto-dns", ok(""))
         .on_contains("nmcli", "device reapply", ok(""))
-        .on_contains("nmcli", "DEVICE,STATE", ok("wlan0:connected"))
+        .on_contains("nmcli", "DEVICE,STATE", ok("wlan0:connected"));
+    let calls = runner.calls_handle();
+    runner.on_dynamic(
+        move |_prog, args| args.join(" ") == "-t -f ACTIVE,SSID device wifi list ifname wlan0",
+        move |_prog, _args| {
+            // Stateful: answer with the SSID of the most recently dialed
+            // connection, so connect_and_verify's post-connect SSID check
+            // sees the network that was just activated (bootstrap first,
+            // then the target).
+            let rec = calls.borrow();
+            let ssid = rec.iter().rev().find_map(|call| {
+                let j = call.args.join(" ");
+                if j.contains("connect") {
+                    call.args
+                        .iter()
+                        .position(|a| a == "connect")
+                        .map(|i| call.args[i + 1].clone())
+                } else if j.contains("connection up") {
+                    call.args
+                        .iter()
+                        .position(|a| a == "up")
+                        .map(|i| call.args[i + 1].clone())
+                } else {
+                    None
+                }
+            });
+            match ssid {
+                Some(s) => ok(&format!("yes:{s}")),
+                None => ok(""),
+            }
+        },
+    )
 }
 
 /// A successful `device wifi connect <ssid> ...` for every ssid in `ssids`.
@@ -494,12 +531,17 @@ fn set_profile_command_persists_even_with_no_daemon_reachable() {
     state::set_profile(&cfg, "away").unwrap();
     assert_eq!(State::load("away").profile, "away");
 
-    let acted = bread_events::handle_command(&command_event(
+    // handle_command only parses/validates (no file I/O on the subscription
+    // thread); the loop thread then applies the action.
+    let action = bread_events::handle_command(&command_event(
         "bread.command.crumbs.set_profile",
         serde_json::json!({ "profile": "home" }),
     ));
-
-    assert!(acted, "known profile must persist");
+    assert!(
+        matches!(action, bread_events::CommandAction::SetProfile(n) if n == "home"),
+        "a known profile must yield a SetProfile action"
+    );
+    bread_events::apply_set_profile("home");
     assert_eq!(State::load("away").profile, "home");
 }
 
@@ -509,12 +551,14 @@ fn set_profile_command_rejects_unknown_profile() {
     let cfg = Config::load().expect("fresh config");
     state::set_profile(&cfg, "away").unwrap();
 
-    let acted = bread_events::handle_command(&command_event(
+    let action = bread_events::handle_command(&command_event(
         "bread.command.crumbs.set_profile",
         serde_json::json!({ "profile": "bogus" }),
     ));
-
-    assert!(!acted);
+    assert!(matches!(action, bread_events::CommandAction::SetProfile(n) if n == "bogus"));
+    // The rejection happens when the loop thread applies it: state is
+    // untouched and the failure event is emitted (a no-op without breadd).
+    bread_events::apply_set_profile("bogus");
     assert_eq!(
         State::load("away").profile,
         "away",
@@ -528,12 +572,11 @@ fn set_profile_command_rejects_missing_profile_field() {
     let cfg = Config::load().expect("fresh config");
     state::set_profile(&cfg, "away").unwrap();
 
-    let acted = bread_events::handle_command(&command_event(
+    let action = bread_events::handle_command(&command_event(
         "bread.command.crumbs.set_profile",
         serde_json::json!({}),
     ));
-
-    assert!(!acted);
+    assert!(matches!(action, bread_events::CommandAction::Ignore));
     assert_eq!(State::load("away").profile, "away");
 }
 
@@ -543,12 +586,11 @@ fn handle_command_ignores_unrecognized_verb() {
     let cfg = Config::load().expect("fresh config");
     state::set_profile(&cfg, "away").unwrap();
 
-    let acted = bread_events::handle_command(&command_event(
+    let action = bread_events::handle_command(&command_event(
         "bread.command.crumbs.pin",
         serde_json::json!({}),
     ));
-
-    assert!(!acted);
+    assert!(matches!(action, bread_events::CommandAction::Ignore));
     assert_eq!(
         State::load("away").profile,
         "away",
@@ -562,14 +604,20 @@ fn handle_command_ignores_events_outside_its_own_command_namespace() {
     let cfg = Config::load().expect("fresh config");
     state::set_profile(&cfg, "away").unwrap();
 
-    assert!(!bread_events::handle_command(&command_event(
-        "bread.command.clip.clear",
-        serde_json::json!({}),
-    )));
-    assert!(!bread_events::handle_command(&command_event(
-        "bread.crumbs.profile.changed",
-        serde_json::json!({ "from": "away", "to": "home" }),
-    )));
+    assert!(matches!(
+        bread_events::handle_command(&command_event(
+            "bread.command.clip.clear",
+            serde_json::json!({}),
+        )),
+        bread_events::CommandAction::Ignore
+    ));
+    assert!(matches!(
+        bread_events::handle_command(&command_event(
+            "bread.crumbs.profile.changed",
+            serde_json::json!({ "from": "away", "to": "home" }),
+        )),
+        bread_events::CommandAction::Ignore
+    ));
     assert_eq!(State::load("away").profile, "away");
 }
 

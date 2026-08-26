@@ -139,13 +139,6 @@ fn spawn_run(prog: &str, args: &[&str], stdin: Option<&str>, timeout: Duration) 
         Err(_) => return Output::failed(),
     };
 
-    if let Some(data) = stdin {
-        if let Some(mut sink) = child.stdin.take() {
-            let _ = sink.write_all(data.as_bytes());
-            // Drop closes the pipe so the child's read sees EOF.
-        }
-    }
-
     let mut stdout_pipe = child.stdout.take();
     let mut stderr_pipe = child.stderr.take();
 
@@ -163,6 +156,16 @@ fn spawn_run(prog: &str, args: &[&str], stdin: Option<&str>, timeout: Duration) 
         }
         buf
     });
+
+    // Feed stdin only now that the reader threads are draining stdout and
+    // stderr: a chatty child could otherwise fill its stdout pipe while we
+    // block writing stdin, deadlocking both sides.
+    if let Some(data) = stdin {
+        if let Some(mut sink) = child.stdin.take() {
+            let _ = sink.write_all(data.as_bytes());
+            // Drop closes the pipe so the child's read sees EOF.
+        }
+    }
 
     let start = Instant::now();
     let status = loop {

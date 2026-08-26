@@ -4,6 +4,7 @@
 //! consumers (including the integration tests under `tests/`).
 
 use std::io::{BufRead, Write};
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
@@ -66,9 +67,11 @@ enum Cmd {
         ssid: String,
         /// Password (prompted if omitted)
         password: Option<String>,
-        /// Network is hidden (does not broadcast its SSID)
-        #[arg(long)]
-        hidden: bool,
+        /// Network is hidden (does not broadcast its SSID).
+        /// `--hidden` sets it; `--hidden=false` clears it on an existing
+        /// entry; omitted leaves an existing entry's flag untouched.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        hidden: Option<bool>,
         /// Attach this SSID to a profile's priority list
         #[arg(long)]
         to: Option<String>,
@@ -321,8 +324,15 @@ fn detect_profile(cfg: &Config) -> Option<String> {
         }
     }
 
-    // Fall back to the default profile if no markers matched.
-    Some(cfg.settings.default_profile.clone())
+    // Fall back to the default profile if no markers matched — but only if
+    // it actually exists: a stale `default_profile` name is a config error,
+    // not a detection result, and persisting it would wedge the watcher in
+    // UnknownProfile forever.
+    if cfg.profiles.contains_key(&cfg.settings.default_profile) {
+        Some(cfg.settings.default_profile.clone())
+    } else {
+        None
+    }
 }
 
 fn cmd_detect(cfg: &mut Config, apply: bool) -> Result<i32, String> {
@@ -330,18 +340,19 @@ fn cmd_detect(cfg: &mut Config, apply: bool) -> Result<i32, String> {
         Some(p) => {
             println!("{p}");
             if apply {
-                State {
-                    profile: p.clone(),
-                    updated: crate::util::timestamp(),
-                }
-                .save()?;
+                // Route through state::set_profile (like the CLI and the
+                // bread bus do) so an unknown fallback is rejected with a
+                // proper error instead of being persisted as active.
+                state::set_profile(cfg, &p)?;
                 let outcome = flow::run(cfg, &p);
                 print_outcome(&p, &outcome);
                 return Ok(if outcome.ok() { 0 } else { 1 });
             }
             Ok(0)
         }
-        None => Err("could not detect a profile (no Wi-Fi adapter?)".into()),
+        None => Err("could not detect a profile (no Wi-Fi adapter, or no \
+                      profile matches and the default is misconfigured)"
+            .into()),
     }
 }
 
@@ -385,7 +396,7 @@ fn cmd_add(
     cfg: &mut Config,
     ssid: String,
     password: Option<String>,
-    hidden: bool,
+    hidden: Option<bool>,
     to: Option<String>,
     at: Option<usize>,
 ) -> Result<i32, String> {
@@ -397,12 +408,17 @@ fn cmd_add(
     match cfg.networks.iter_mut().find(|n| n.ssid == ssid) {
         Some(n) => {
             n.password = password;
-            n.hidden = hidden || n.hidden;
+            // `--hidden` / `--hidden=false` set the flag explicitly; when
+            // the flag is omitted, leave an existing entry's hidden state
+            // alone (a password-only update must not un-hide a network).
+            if let Some(h) = hidden {
+                n.hidden = h;
+            }
         }
         None => cfg.networks.push(NetworkDef {
             ssid: ssid.clone(),
             password,
-            hidden,
+            hidden: hidden.unwrap_or(false),
         }),
     }
     if let Some(prof_name) = to {
@@ -443,6 +459,14 @@ fn cmd_forget(cfg: &mut Config, ssid: &str) -> Result<i32, String> {
 }
 
 fn cmd_scan(cfg: &mut Config, to: Option<String>) -> Result<i32, String> {
+    // Validate `--to` up front, before any side effects (connecting is
+    // one): `add --to` errors on an unknown profile, so `scan --to` must
+    // too instead of silently saving a network that never gets attached.
+    if let Some(prof_name) = &to {
+        if !cfg.profiles.contains_key(prof_name) {
+            return Err(format!("unknown profile '{prof_name}'"));
+        }
+    }
     let iface = nm::wifi_interface().ok_or("no Wi-Fi adapter")?;
     nm::radio_on();
     nm::rescan(&iface, &[]);
@@ -502,12 +526,13 @@ fn cmd_scan(cfg: &mut Config, to: Option<String>) -> Result<i32, String> {
     Ok(0)
 }
 
-/// Mask a secret for display. Operates on chars (not bytes) so multi-byte
-/// UTF-8 passwords don't panic on a mid-character byte slice, and never
-/// echoes back any real character of the secret (previously the first byte
-/// was shown unmasked).
-fn mask(p: &str) -> String {
-    "•".repeat(p.chars().count().max(2))
+/// Mask a secret for display. Always renders the same fixed-length
+/// placeholder so the output reveals neither the secret's length nor any
+/// character of it (a fixed placeholder is what password managers show;
+/// length-hiding also means multi-byte UTF-8 passwords need no special
+/// handling).
+fn mask(_p: &str) -> String {
+    "•".repeat(8)
 }
 
 fn cmd_list(cfg: &Config, show_pw: bool) -> Result<i32, String> {
@@ -567,7 +592,15 @@ fn cmd_list(cfg: &Config, show_pw: bool) -> Result<i32, String> {
 fn cmd_edit() -> Result<i32, String> {
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nano".into());
     let path = config::config_path();
-    let status = Command::new(&editor)
+    // EDITOR values routinely carry arguments ("code -w", "subl -w"), so
+    // split on whitespace: the first token is the program, the rest are its
+    // arguments. The path stays a separate argument — never interpolated
+    // into a shell string — so it can't be used for injection.
+    let mut parts = editor.split_whitespace();
+    let prog = parts.next().unwrap_or("nano");
+    let mut cmd = Command::new(prog);
+    cmd.args(parts);
+    let status = cmd
         .arg(&path)
         .status()
         .map_err(|e| format!("launching {editor}: {e}"))?;
@@ -685,7 +718,13 @@ fn exec_replace(prog: &str, dir: &std::path::Path) -> String {
 }
 
 fn cmd_install_service(enable: bool) -> Result<i32, String> {
-    let unit_dir = home_dir().join(".config/systemd/user");
+    // Honor XDG_CONFIG_HOME like the rest of the app: systemd --user units
+    // live in $XDG_CONFIG_HOME/systemd/user (default ~/.config/systemd/user).
+    let unit_dir = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".config"))
+        .join("systemd")
+        .join("user");
     std::fs::create_dir_all(&unit_dir)
         .map_err(|e| format!("creating {}: {e}", unit_dir.display()))?;
     let bin = std::env::current_exe().map_err(|e| format!("resolving current executable: {e}"))?;
@@ -746,24 +785,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mask_empty_password() {
-        // len() == 0 <= 2 branch: still at least 2 dots so an empty saved
-        // password doesn't visually collapse to nothing in `list`.
-        assert_eq!(mask(""), "••");
-    }
-
-    #[test]
-    fn mask_short_passwords_reveal_nothing() {
-        assert_eq!(mask("a"), "••");
-        assert_eq!(mask("ab"), "••");
-    }
-
-    #[test]
-    fn mask_never_echoes_a_real_character() {
-        let pw = "hunter2";
-        let masked = mask(pw);
-        assert_eq!(masked, "•".repeat(pw.len()));
-        assert!(!masked.contains('h'), "masked output leaked the first char");
+    fn mask_is_fixed_length_regardless_of_secret() {
+        // Fixed-length masking: the output must reveal neither the secret's
+        // length nor any character of it — for empty, short, and long
+        // secrets alike.
+        assert_eq!(mask(""), "•".repeat(8));
+        assert_eq!(mask("a"), "•".repeat(8));
+        assert_eq!(mask("ab"), "•".repeat(8));
+        assert_eq!(mask("hunter2"), "•".repeat(8));
+        assert!(!mask("hunter2").contains('h'));
     }
 
     #[test]
@@ -773,14 +803,13 @@ mod tests {
         // emoji or accented character), since byte index 1 can land mid-char.
         let pw = "日本語パスワード";
         let masked = mask(pw);
-        assert_eq!(masked.chars().count(), pw.chars().count());
+        assert_eq!(masked, "•".repeat(8));
         assert!(masked.chars().all(|c| c == '•'));
     }
 
     #[test]
     fn mask_emoji_first_character_does_not_panic() {
         let pw = "🔒password123";
-        let masked = mask(pw);
-        assert_eq!(masked.chars().count(), pw.chars().count());
+        assert_eq!(mask(pw), "•".repeat(8));
     }
 }

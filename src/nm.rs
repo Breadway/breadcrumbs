@@ -114,6 +114,15 @@ pub struct ScanEntry {
     pub security: String,
 }
 
+/// Parse an nmcli SIGNAL value ("72" or "72 %") into a comparable number.
+fn signal_strength(s: &str) -> i32 {
+    s.trim()
+        .trim_end_matches('%')
+        .trim()
+        .parse::<i32>()
+        .unwrap_or(-100)
+}
+
 pub fn scan_list(iface: &str) -> Vec<ScanEntry> {
     let o = run(
         "nmcli",
@@ -129,8 +138,7 @@ pub fn scan_list(iface: &str) -> Vec<ScanEntry> {
         ],
         Duration::from_secs(12),
     );
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
+    let mut out: Vec<ScanEntry> = Vec::new();
     if !o.success {
         return out;
     }
@@ -140,14 +148,29 @@ pub fn scan_list(iface: &str) -> Vec<ScanEntry> {
             continue;
         }
         let ssid = fields[0].trim().to_string();
-        if ssid.is_empty() || !seen.insert(ssid.clone()) {
+        if ssid.is_empty() {
+            // Hidden networks have no SSID in the scan; they're not
+            // selectable here anyway (see `cmd_scan`), so skip them.
             continue;
         }
-        out.push(ScanEntry {
-            ssid,
-            signal: fields.get(1).cloned().unwrap_or_default(),
-            security: fields.get(2).cloned().unwrap_or_default(),
-        });
+        let signal = fields.get(1).cloned().unwrap_or_default();
+        let security = fields.get(2).cloned().unwrap_or_default();
+        // One line per BSSID: dedup by SSID keeping the *strongest* signal,
+        // so a network broadcast by several APs shows once (at its best
+        // signal) instead of N times at the first listing.
+        match out.iter_mut().find(|e| e.ssid == ssid) {
+            Some(existing) => {
+                if signal_strength(&signal) > signal_strength(&existing.signal) {
+                    existing.signal = signal;
+                    existing.security = security;
+                }
+            }
+            None => out.push(ScanEntry {
+                ssid,
+                signal,
+                security,
+            }),
+        }
     }
     out
 }

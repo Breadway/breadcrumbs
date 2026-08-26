@@ -21,8 +21,12 @@ pub fn internet_ok(cfg: &Config) -> bool {
             ],
             Duration::from_secs(6),
         );
-        let code = o.stdout.trim();
-        if code == "204" || code == "200" || code == "301" || code == "302" {
+        // Only a 204 counts as real internet. Captive/guest portals answer
+        // 200 (a login page) or 302 (a redirect to it) — accepting those
+        // would classify a portal-trapped device as "Up". The default
+        // endpoint is generate_204, which returns 204 precisely when
+        // traffic isn't being intercepted.
+        if o.stdout.trim() == "204" {
             return true;
         }
     }
@@ -66,7 +70,10 @@ pub fn gather(cfg: &Config, profile_name: &str) -> Status {
     let iface = nm::wifi_interface();
     let ssid = iface.as_deref().and_then(nm::active_ssid);
     let ip = iface.as_deref().and_then(ipv4);
-    let internet = internet_ok(cfg);
+    // Skip the (potentially 4s-blocking) connectivity probe when there's no
+    // Wi-Fi interface at all: the watch loop classifies NoAdapter and would
+    // otherwise burn a network round-trip (curl/ping) every tick for nothing.
+    let internet = iface.is_some() && internet_ok(cfg);
 
     let prof = cfg.profile(profile_name);
     let ts_required = prof.map(|p| p.tailscale).unwrap_or(false);

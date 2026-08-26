@@ -317,7 +317,10 @@ fn install_service_no_enable_writes_valid_unit_file() {
     let o = sb.cmd(&["install-service", "--no-enable"]);
     assert!(o.status.success(), "stderr: {}", stderr(&o));
 
-    let unit_path = sb.root.join(".config/systemd/user/breadcrumbs.service");
+    // The sandbox sets XDG_CONFIG_HOME=$root/config, so the unit lands
+    // under $XDG_CONFIG_HOME/systemd/user — the whole point of the fix is
+    // honoring XDG rather than hardcoding ~/.config.
+    let unit_path = sb.root.join("config/systemd/user/breadcrumbs.service");
     assert!(unit_path.exists());
     let text = fs::read_to_string(unit_path).unwrap();
     assert!(text.contains("ExecStart="));
@@ -423,6 +426,8 @@ case "$args" in
   "device wifi rescan"*) ;;
   "-t -f SSID device wifi list ifname wlan0")
     echo "TestNet" ;;
+  "-t -f ACTIVE,SSID device wifi list ifname wlan0")
+    echo "yes:TestNet" ;;
   "-t -f NAME,TYPE connection show")
     if [ -f "$marker" ]; then
       echo "TestNet:802-11-wireless"
