@@ -9,7 +9,7 @@
 //!   rules ("if the program+args match this predicate, return this canned
 //!   `Output`"), which also records every invocation so a test can assert
 //!   exactly what was — or, just as importantly, was *not* — passed (e.g.
-//!   that a password argument never reaches a fake `nmcli`).
+//!   that a password argument never reaches a fake subprocess).
 //! - [`EnvSandbox`]: real logic (`flow::run`, `watch::classify`) still does
 //!   its own best-effort file logging via `notify::log`, which resolves a
 //!   path from `$HOME`/`$XDG_STATE_HOME`. `EnvSandbox` points those at a
@@ -18,8 +18,14 @@
 //!   inherently cross-test-within-this-binary racy, so it's guarded by a
 //!   process-wide mutex — tests using it serialize against each other but
 //!   not against unrelated tests (each `tests/*.rs` file is its own binary).
+//! - [`fake_nm`]: a real fake NetworkManager D-Bus service on a private
+//!   `dbus-daemon`. The production `nm` module talks to it over real D-Bus
+//!   marshalling (`Connection::system()` honors `DBUS_SYSTEM_BUS_ADDRESS`),
+//!   replacing the old fake-`nmcli`-argv rules.
 
 #![allow(dead_code)] // not every test file uses every helper here
+
+pub mod fake_nm;
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -94,7 +100,7 @@ impl FakeRunner {
     }
 
     /// Shorthand for matching on `prog` plus a whitespace-joined view of
-    /// `args` containing `substr` (handy for `nmcli`/`tailscale` calls, whose
+    /// `args` containing `substr` (handy for `tailscale`/`curl` calls, whose
     /// interesting bit is usually a subcommand somewhere in the middle).
     pub fn on_contains(self, prog: &'static str, substr: &'static str, output: Output) -> Self {
         self.on(

@@ -1,6 +1,10 @@
 //! End-to-end CLI tests. Each run is fully isolated: HOME / XDG dirs point at a
-//! throwaway tempdir and PATH is emptied so no real `nmcli`/`tailscale`/`date`
-//! is ever invoked and the host system is never touched.
+//! throwaway tempdir, PATH is emptied so no real `tailscale`/`curl`/`date` is
+//! ever invoked, and a private `dbus-daemon` (optionally hosting a fake
+//! NetworkManager service — see `tests/common::fake_nm`) stands in for the
+//! system bus so the binary's D-Bus calls never touch the host.
+
+mod common;
 
 use std::fs;
 use std::path::PathBuf;
@@ -8,12 +12,15 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use common::fake_nm::{self, Security};
+
 const BIN: &str = env!("CARGO_BIN_EXE_breadcrumbs");
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
 struct Sandbox {
     root: PathBuf,
+    _bus: fake_nm::Daemon,
 }
 
 impl Sandbox {
@@ -30,7 +37,16 @@ impl Sandbox {
             nanos
         ));
         fs::create_dir_all(root.join("bin")).unwrap();
-        Sandbox { root }
+        Sandbox {
+            root,
+            _bus: fake_nm::launch_daemon(),
+        }
+    }
+
+    /// Attach the fake NetworkManager service to this sandbox's bus and
+    /// return a handle for driving its state.
+    fn nm(&self) -> fake_nm::FakeNmBus {
+        fake_nm::serve_on(&self._bus.addr)
     }
 
     /// Binary invocation with an isolated, side-effect-free environment.
@@ -48,7 +64,10 @@ impl Sandbox {
             .env("XDG_CONFIG_HOME", self.root.join("config"))
             .env("XDG_STATE_HOME", self.root.join("state"))
             // Empty bin dir => no external commands resolve.
-            .env("PATH", self.root.join("bin"));
+            .env("PATH", self.root.join("bin"))
+            // Point the binary's `Connection::system()` at this test's
+            // private bus so it never touches a real system bus.
+            .env("DBUS_SYSTEM_BUS_ADDRESS", &self._bus.addr);
         for (k, v) in extra {
             c.env(k, v);
         }
@@ -66,7 +85,7 @@ impl Sandbox {
     }
 
     /// Write an executable shell script into the sandbox's PATH dir so a
-    /// test can stand in for an external command (e.g. `$EDITOR`).
+    /// test can stand in for an external command (e.g. `$EDITOR`, `curl`).
     fn write_fake_bin(&self, name: &str, script: &str) -> PathBuf {
         let path = self.root.join("bin").join(name);
         fs::write(&path, script).unwrap();
@@ -151,7 +170,7 @@ fn profile_defaults_to_away_then_persists_set() {
     assert!(o.status.success());
     assert_eq!(stdout(&o).trim(), "away");
 
-    // `set --no-apply` must not touch the network (no nmcli available anyway).
+    // `set --no-apply` must not touch the network (no NM on the bus anyway).
     let o = sb.cmd(&["profile", "set", "home", "--no-apply"]);
     assert!(
         o.status.success(),
@@ -194,9 +213,7 @@ fn profile_list_marks_exactly_the_current_profile() {
     let out = stdout(&o);
     assert!(out.contains("* home"), "out: {out}");
     assert_eq!(
-        out.lines()
-            .filter(|l| l.trim_start().starts_with('*'))
-            .count(),
+        out.lines().filter(|l| l.trim_start().starts_with('*')).count(),
         1,
         "expected exactly one marked profile, got: {out}"
     );
@@ -264,10 +281,7 @@ fn forget_removes_network_from_config() {
     );
     // ...and it should never have been in breadcrumbs.toml to begin with.
     let text = fs::read_to_string(sb.config_file()).unwrap();
-    assert!(
-        !text.contains("CafeWifi"),
-        "network leaked into config: {text}"
-    );
+    assert!(!text.contains("CafeWifi"), "network leaked into config: {text}");
 }
 
 #[test]
@@ -275,15 +289,13 @@ fn detect_without_wifi_adapter_errors() {
     let sb = Sandbox::new();
     let o = sb.cmd(&["detect"]);
     assert!(!o.status.success());
-    assert!(
-        stderr(&o).contains("could not detect"),
-        "stderr: {}",
-        stderr(&o)
-    );
+    assert!(stderr(&o).contains("could not detect"), "stderr: {}", stderr(&o));
 }
 
 #[test]
-fn doctor_reports_missing_nmcli_in_sandbox() {
+fn doctor_reports_missing_network_manager_on_private_bus() {
+    // The sandbox bus has no NetworkManager service on it, so doctor must
+    // report it missing rather than assuming presence.
     let sb = Sandbox::new();
     let o = sb.cmd(&["doctor"]);
     assert!(o.status.success(), "stderr: {}", stderr(&o));
@@ -376,11 +388,7 @@ fn networks_are_stored_separately_from_settings_and_profiles() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(sb.networks_file())
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
+        let mode = fs::metadata(sb.networks_file()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "networks.toml should be owner-only");
     }
 }
@@ -390,8 +398,8 @@ fn add_with_empty_password_is_stored_as_no_password() {
     // An explicitly empty password (e.g. `add SSID ""`, or a blank response
     // at the interactive prompt) means "this is an open network" — it must
     // round-trip as an absent `password` key, the same as a cleared one,
-    // not as `password = ""` (which `nm::connect_verbose` would treat as a
-    // blank secret rather than an open network).
+    // not as `password = ""` (which `nm::connect_verbose` would send as a
+    // literal empty PSK and fail against a real open SSID).
     let sb = Sandbox::new();
     let o = sb.cmd(&["add", "OpenCafe", ""]);
     assert!(o.status.success(), "stderr: {}", stderr(&o));
@@ -408,77 +416,25 @@ fn add_with_empty_password_is_stored_as_no_password() {
 // NM-owned credentials (item 4): a password is only ever needed once.
 // -----------------------------------------------------------------------
 
-/// A fake `nmcli` that behaves statefully enough to exercise the "first
-/// connect creates a profile with a password, second connect reuses it
-/// without one" path: it records every invocation's argv (one per line) to
-/// `$HOME/.nmcli-calls`, and remembers — via a marker file, also under
-/// `$HOME` — that "device wifi connect TestNet" has already run, so a
-/// following `connection show` reports a saved profile exists.
-const FAKE_NMCLI_STATEFUL: &str = r#"#!/bin/sh
-record="$HOME/.nmcli-calls"
-marker="$HOME/.nmcli-profile-created"
-echo "$@" >> "$record"
-args="$*"
-case "$args" in
-  "-t -f DEVICE,TYPE device status")
-    echo "wlan0:wifi" ;;
-  "radio wifi on") ;;
-  "device wifi rescan"*) ;;
-  "-t -f SSID device wifi list ifname wlan0")
-    echo "TestNet" ;;
-  "-t -f SSID,SIGNAL device wifi list ifname wlan0")
-    echo "TestNet:80" ;;
-  "-t -f ACTIVE,SSID device wifi list ifname wlan0")
-    echo "yes:TestNet" ;;
-  "-t -f NAME,TYPE connection show")
-    if [ -f "$marker" ]; then
-      echo "TestNet:802-11-wireless"
-    fi
-    ;;
-  *"device wifi connect TestNet"*)
-    # `: > file` (truncate-or-create via a shell builtin + redirection) —
-    # not `touch`, which is an external binary and the sandbox's PATH
-    # deliberately contains nothing but this fake nmcli itself.
-    : > "$marker" ;;
-  *"connection up TestNet"*) ;;
-  *"802-11-wireless-security.psk"*) ;;
-  "-g GENERAL.CON-UUID device show wlan0")
-    echo "uuid-1" ;;
-  *"ipv4.ignore-auto-dns"*) ;;
-  "device reapply wlan0") ;;
-  "-t -f DEVICE,STATE device status")
-    echo "wlan0:connected" ;;
-  *) ;;
-esac
-exit 0
-"#;
-
 #[test]
 fn password_is_cleared_after_first_connect_and_never_sent_again() {
+    // The first connect creates an NM profile carrying the PSK (over D-Bus,
+    // never in argv); the second connect reuses that profile and must not
+    // create a duplicate or resend the password.
     let sb = Sandbox::new();
-    sb.write_fake_bin("nmcli", FAKE_NMCLI_STATEFUL);
+    let nm = sb.nm();
+    let dev = nm.add_wifi_device("wlan0", 100);
+    nm.add_ap(&dev, "TestNet", 80, Security::Wpa2);
 
     let add = sb.cmd(&["add", "TestNet", "hunter2"]);
     assert!(add.status.success(), "stderr: {}", stderr(&add));
     // "away" is the default profile and defaults to include_all_known, so
     // TestNet is already a connect candidate with no `--to` needed.
 
-    let record = sb.root.join(".nmcli-calls");
-
-    // First connect: no saved NM profile yet, so breadcrumbs creates one via
-    // `nmcli --ask device wifi connect ...` with the PSK on stdin, not argv.
+    // First connect: no saved NM profile yet, so breadcrumbs creates one
+    // with the password.
     let first = sb.cmd(&["init"]);
     assert!(first.status.success(), "stderr: {}", stderr(&first));
-    let first_calls = fs::read_to_string(&record).unwrap_or_default();
-    assert!(
-        first_calls.contains("device wifi connect TestNet") && first_calls.contains("--ask"),
-        "first connect should create a new NM profile via --ask: {first_calls}"
-    );
-    assert!(
-        !first_calls.contains("hunter2"),
-        "PSK must not appear on nmcli argv: {first_calls}"
-    );
-    // stdin payload is asserted in-process via FakeRunner (see flow_watch).
 
     // The local copy is gone from disk immediately after.
     let networks = fs::read_to_string(sb.networks_file()).unwrap();
@@ -486,54 +442,43 @@ fn password_is_cleared_after_first_connect_and_never_sent_again() {
         !networks.contains("hunter2"),
         "password should have been cleared from networks.toml: {networks}"
     );
-    assert!(
-        networks.contains("TestNet"),
-        "network entry itself should remain"
-    );
+    assert!(networks.contains("TestNet"), "network entry itself should remain");
 
-    // Reset the recording so the second run's argv can be checked in isolation.
-    fs::write(&record, "").unwrap();
+    // The NM profile durably holds the secret.
+    let psk = {
+        let st = nm.state.lock().unwrap();
+        st.connections
+            .values()
+            .filter_map(|s| {
+                let sec = s.get("802-11-wireless-security")?;
+                sec.get("psk").and_then(|v| v.downcast_ref::<String>().ok())
+            })
+            .next()
+    };
+    assert_eq!(psk.as_deref(), Some("hunter2"), "NM profile must hold the PSK");
 
-    // Second connect: a saved profile now exists (per the fake nmcli's own
-    // bookkeeping) and breadcrumbs has no local password anymore, so it must
-    // reuse the profile via `connection up` and never send a PSK argument.
+    // Second connect: breadcrumbs has no local password anymore, so it must
+    // reuse the existing profile without creating a duplicate.
     let second = sb.cmd(&["init"]);
     assert!(second.status.success(), "stderr: {}", stderr(&second));
-    let second_calls = fs::read_to_string(&record).unwrap_or_default();
-    assert!(
-        second_calls.contains("connection up TestNet"),
-        "second connect should reuse the existing NM profile: {second_calls}"
-    );
-    assert!(
-        !second_calls.to_lowercase().contains("hunter2")
-            && !second_calls.contains("psk")
-            && !second_calls.contains("password"),
-        "second connect must never send a password argument: {second_calls}"
+    assert_eq!(
+        nm.connection_count(),
+        1,
+        "reuse must not accumulate duplicate NM profiles"
     );
 }
 
 // -----------------------------------------------------------------------
-// CLI-level coverage through fake nmcli/tailscale (item 3)
+// CLI-level coverage through fake NM + tailscale (item 3)
 // -----------------------------------------------------------------------
 
-const FAKE_NMCLI_HEALTHY: &str = r#"#!/bin/sh
-args="$*"
-case "$args" in
-  "-t -f DEVICE,TYPE device status")
-    echo "wlan0:wifi" ;;
-  "-t -f ACTIVE,SSID device wifi list ifname wlan0")
-    echo "yes:HomeWifi" ;;
-  "-g IP4.ADDRESS device show wlan0")
-    echo "192.168.1.50/24" ;;
-  *) ;;
-esac
-exit 0
-"#;
-
 #[test]
-fn status_reports_healthy_through_fake_nmcli_and_curl() {
+fn status_reports_healthy_through_fake_nm_and_curl() {
     let sb = Sandbox::new();
-    sb.write_fake_bin("nmcli", FAKE_NMCLI_HEALTHY);
+    let nm = sb.nm();
+    let dev = nm.add_wifi_device("wlan0", 100);
+    let ap = nm.add_ap(&dev, "HomeWifi", 80, Security::Wpa2);
+    nm.set_active_ap(&dev, &ap);
     sb.write_fake_bin("curl", "#!/bin/sh\necho -n 204\nexit 0\n");
 
     let o = sb.cmd(&["status"]);
@@ -544,41 +489,27 @@ fn status_reports_healthy_through_fake_nmcli_and_curl() {
 }
 
 #[test]
-fn doctor_reports_present_when_nmcli_and_tailscale_are_on_path() {
+fn doctor_reports_present_when_nm_and_tailscale_are_available() {
     let sb = Sandbox::new();
-    sb.write_fake_bin("nmcli", FAKE_NMCLI_HEALTHY);
+    let _nm = sb.nm(); // attach the fake NM; keep the handle alive for the run
     sb.write_fake_bin("tailscale", "#!/bin/sh\nexit 0\n");
 
     let o = sb.cmd(&["doctor"]);
     assert!(o.status.success(), "stderr: {}", stderr(&o));
     let out = stdout(&o);
     assert!(
-        out.contains("nmcli") && out.contains("present"),
+        out.contains("network-manager") && out.contains("present"),
         "out: {out}"
     );
     assert!(!out.contains("MISSING"), "out: {out}");
 }
 
-const FAKE_NMCLI_DETECT: &str = r#"#!/bin/sh
-args="$*"
-case "$args" in
-  "-t -f DEVICE,TYPE device status")
-    echo "wlan0:wifi" ;;
-  "radio wifi on") ;;
-  "device wifi rescan"*) ;;
-  "-t -f SSID device wifi list ifname wlan0")
-    echo "CorpWifi" ;;
-  "-t -f SSID,SIGNAL device wifi list ifname wlan0")
-    echo "CorpWifi:80" ;;
-  *) ;;
-esac
-exit 0
-"#;
-
 #[test]
 fn detect_picks_profile_whose_detect_ssids_are_visible() {
     let sb = Sandbox::new();
-    sb.write_fake_bin("nmcli", FAKE_NMCLI_DETECT);
+    let nm = sb.nm();
+    let dev = nm.add_wifi_device("wlan0", 100);
+    nm.add_ap(&dev, "CorpWifi", 80, Security::Wpa2);
     sb.cmd(&["list"]); // bootstrap the default config (home/work/away)
 
     // Attach a marker SSID to "work" so detection has something to match —
@@ -789,7 +720,9 @@ fn status_json_emits_machine_readable_output() {
 #[test]
 fn detect_json_emits_machine_readable_output() {
     let sb = Sandbox::new();
-    sb.write_fake_bin("nmcli", FAKE_NMCLI_DETECT);
+    let nm = sb.nm();
+    let dev = nm.add_wifi_device("wlan0", 100);
+    nm.add_ap(&dev, "CorpWifi", 80, Security::Wpa2);
     sb.cmd(&["list"]); // bootstrap the default config
 
     let text = fs::read_to_string(sb.config_file()).unwrap();
@@ -806,25 +739,13 @@ fn detect_json_emits_machine_readable_output() {
     assert_eq!(v["profile"].as_str(), Some("work"));
 }
 
-const FAKE_NMCLI_DETECT_TWO: &str = r#"#!/bin/sh
-args="$*"
-case "$args" in
-  "-t -f DEVICE,TYPE device status")
-    echo "wlan0:wifi" ;;
-  "radio wifi on") ;;
-  "device wifi rescan"*) ;;
-  "-t -f SSID,SIGNAL device wifi list ifname wlan0")
-    echo "CorpWifi:80"
-    echo "CafeWifi:70" ;;
-  *) ;;
-esac
-exit 0
-"#;
-
 #[test]
 fn detect_prefers_profile_with_more_matching_markers() {
     let sb = Sandbox::new();
-    sb.write_fake_bin("nmcli", FAKE_NMCLI_DETECT_TWO);
+    let nm = sb.nm();
+    let dev = nm.add_wifi_device("wlan0", 100);
+    nm.add_ap(&dev, "CorpWifi", 80, Security::Wpa2);
+    nm.add_ap(&dev, "CafeWifi", 70, Security::Wpa2);
     sb.cmd(&["list"]); // bootstrap
 
     // home matches 1 marker (CorpWifi); work matches 2 (CorpWifi + CafeWifi).
@@ -849,23 +770,11 @@ fn detect_prefers_profile_with_more_matching_markers() {
     );
 }
 
-const FAKE_NMCLI_PRUNE: &str = r#"#!/bin/sh
-args="$*"
-case "$args" in
-  "-t -f NAME,TYPE connection show")
-    echo "OldCafe:802-11-wireless" ;;
-  "-g 802-11-wireless.ssid connection show OldCafe")
-    echo "OldCafe" ;;
-  "connection delete id OldCafe") ;;
-  *) ;;
-esac
-exit 0
-"#;
-
 #[test]
 fn prune_dry_run_lists_stale_nm_profiles() {
     let sb = Sandbox::new();
-    sb.write_fake_bin("nmcli", FAKE_NMCLI_PRUNE);
+    let nm = sb.nm();
+    nm.save_connection("OldCafe", None);
     sb.cmd(&["list"]); // bootstrap (no saved networks → everything is stale)
 
     let o = sb.cmd(&["prune", "--dry-run"]);
@@ -880,7 +789,8 @@ fn prune_dry_run_lists_stale_nm_profiles() {
 #[test]
 fn prune_removes_stale_nm_profiles() {
     let sb = Sandbox::new();
-    sb.write_fake_bin("nmcli", FAKE_NMCLI_PRUNE);
+    let nm = sb.nm();
+    nm.save_connection("OldCafe", None);
     sb.cmd(&["list"]);
 
     let o = sb.cmd(&["prune"]);
@@ -890,53 +800,26 @@ fn prune_removes_stale_nm_profiles() {
         out.contains("removed") && out.contains("OldCafe"),
         "out: {out}"
     );
+    assert_eq!(
+        nm.connection_count(),
+        0,
+        "prune must actually delete the stale profile"
+    );
 }
-
-const FAKE_NMCLI_RETRY: &str = r#"#!/bin/sh
-marker="$HOME/.nmcli-connect-ok"
-args="$*"
-case "$args" in
-  "-t -f DEVICE,TYPE device status")
-    echo "wlan0:wifi" ;;
-  "radio wifi on") ;;
-  "device wifi rescan"*) ;;
-  "-t -f SSID device wifi list ifname wlan0")
-    echo "HomeWifi" ;;
-  "-t -f SSID,SIGNAL device wifi list ifname wlan0")
-    echo "HomeWifi:80" ;;
-  "-t -f ACTIVE,SSID device wifi list ifname wlan0")
-    echo "yes:HomeWifi" ;;
-  "-t -f NAME,TYPE connection show") ;;
-  *"device wifi connect HomeWifi"*)
-    if [ -f "$marker" ]; then
-      exit 0
-    else
-      : > "$marker"
-      exit 1
-    fi ;;
-  *"connection up HomeWifi"*)
-    exit 0 ;;
-  "-g GENERAL.CON-UUID device show wlan0")
-    echo "uuid-1" ;;
-  *"ipv4.ignore-auto-dns"*) ;;
-  "device reapply wlan0") ;;
-  "-t -f DEVICE,STATE device status")
-    echo "wlan0:connected" ;;
-  *) ;;
-esac
-exit 0
-"#;
 
 #[test]
 fn init_wait_retries_until_connect_succeeds() {
     let sb = Sandbox::new();
-    sb.write_fake_bin("nmcli", FAKE_NMCLI_RETRY);
+    let nm = sb.nm();
+    let dev = nm.add_wifi_device("wlan0", 100);
+    nm.add_ap(&dev, "HomeWifi", 80, Security::Wpa2);
     // "away" defaults to include_all_known, so HomeWifi is a candidate.
     let add = sb.cmd(&["add", "HomeWifi", "hunter2"]);
     assert!(add.status.success(), "stderr: {}", stderr(&add));
 
-    // The fake's first `device wifi connect` fails; the retry succeeds.
-    // `--wait` must keep going past the first failure rather than bailing.
+    // The fake's first activation fails; the retry succeeds. `--wait` must
+    // keep going past the first failure rather than bailing.
+    nm.fail_next_activations(1);
     let o = sb.cmd(&["init", "--wait", "5"]);
     assert!(o.status.success(), "stderr: {}", stderr(&o));
     assert!(stdout(&o).contains("connected"), "out: {}", stdout(&o));
