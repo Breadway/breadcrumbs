@@ -2,21 +2,21 @@
 
 A profile-aware Wi-Fi state machine for Linux with Tailscale exit-node management and a self-healing watch daemon.
 
-breadcrumbs sits on top of NetworkManager (`nmcli`) and manages your Wi-Fi based on **location profiles**. Switch between home, work, school, or any other context with a single command — it handles scanning, connecting, DNS pinning, and Tailscale setup automatically.
+breadcrumbs sits on top of NetworkManager's **D-Bus API** (`org.freedesktop.NetworkManager` on the system bus — no `nmcli` subprocesses) and manages your Wi-Fi based on **location profiles**. Switch between home, work, school, or any other context with a single command — it handles scanning, connecting, DNS pinning, and Tailscale setup automatically.
 
 ## Features
 
 - **Profile-based connection management** — define ordered network priority lists per location
 - **Bootstrap + Tailscale gating** — connect to an interim network first, bring up Tailscale, then move to the target network
-- **Self-healing watch daemon** — monitors for drops, auto-recovers, reacts within seconds via `nmcli monitor`
+- **Self-healing watch daemon** — monitors for drops, auto-recovers, reacts within seconds via NetworkManager D-Bus signals
 - **Auto-detection** — scans visible SSIDs and guesses your location from config-defined markers
-- **Credential handling** — a saved network's password is only needed the *first* time breadcrumbs connects to it. Once that connect succeeds, NetworkManager durably owns the credential (a new connection profile, or an updated PSK on an existing one), so breadcrumbs clears its own local copy and stops writing it to disk. Both config files are `0600` (owner-only); saved networks live in a separate `networks.toml` from settings/profiles (see [Configuration](#configuration)). On that first connect the PSK is fed to `nmcli --ask` on stdin, never as a command argument, so it does not appear in `/proc/<pid>/cmdline`.
+- **Credential handling** — a saved network's password is only needed the *first* time breadcrumbs connects to it. Once that connect succeeds, NetworkManager durably owns the credential (a new connection profile, or an updated PSK on an existing one), so breadcrumbs clears its own local copy and stops writing it to disk. Both config files are `0600` (owner-only); saved networks live in a separate `networks.toml` from settings/profiles (see [Configuration](#configuration)). Secrets are never exposed in a process command line: everything travels inside D-Bus `Update2`/`AddAndActivateConnection2` settings payloads, invisible to other local users via `/proc/<pid>/cmdline`.
 - **Desktop notifications** via `notify-send` (optional)
 - **systemd user service** generation via `breadcrumbs install-service`
 
 ## Requirements
 
-- Linux with NetworkManager (`nmcli` in `$PATH`)
+- Linux with NetworkManager running on the D-Bus system bus
 - Rust toolchain (to build from source)
 - `tailscale` (optional — only needed if any profile sets `tailscale = true`)
 - `notify-send` (optional — for desktop notifications)
@@ -52,7 +52,7 @@ Settings and location profiles live in `breadcrumbs.toml` — the file people ac
 ```toml
 [settings]
 dns = "1.1.1.1"          # DNS server pinned on every connection
-nmcli_wait = 8           # seconds to wait for nmcli connect
+connect_wait = 8         # seconds to wait for the device to reach the activated state (legacy key: nmcli_wait)
 exit_node = "myhostname" # default Tailscale exit node
 exit_nodes = ["a", "b"] # optional priority list; tried in order (fallback nodes)
 interface = "wlan0"      # optional preferred Wi-Fi interface
@@ -169,7 +169,7 @@ breadcrumbs install-service
 `breadcrumbs watch` is the recommended way to run breadcrumbs for daily use. It:
 
 1. Polls health every `watch_interval` seconds (adaptive backoff on repeated failures)
-2. Reacts immediately to link-state changes via `nmcli monitor`
+2. Reacts immediately to link-state changes via NetworkManager D-Bus signals (`Device.StateChanged`, `Connectivity` property changes, hotplug events)
 3. Runs `flow::run` (the connect state machine) on any detected drop
 4. Handles profile changes live — re-reads config and state on every tick
 5. Distinguishes captive portals from plain no-internet (a 200/301/302 instead

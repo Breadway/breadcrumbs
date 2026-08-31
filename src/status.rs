@@ -65,23 +65,6 @@ pub fn internet_ok(cfg: &Config) -> bool {
     matches!(connectivity(cfg), Connectivity::Online)
 }
 
-fn ipv4(iface: &str) -> Option<String> {
-    let o = run(
-        "nmcli",
-        &["-g", "IP4.ADDRESS", "device", "show", iface],
-        Duration::from_secs(6),
-    );
-    if !o.success {
-        return None;
-    }
-    let s = o.stdout.trim();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s.lines().next().unwrap_or(s).trim().to_string())
-    }
-}
-
 pub struct Status {
     pub iface: Option<String>,
     pub ssid: Option<String>,
@@ -97,7 +80,7 @@ pub struct Status {
 pub fn gather(cfg: &Config, profile_name: &str) -> Status {
     let iface = nm::wifi_interface_preferred(cfg.settings.interface.as_deref());
     let ssid = iface.as_deref().and_then(nm::active_ssid);
-    let ip = iface.as_deref().and_then(ipv4);
+    let ip = iface.as_deref().and_then(nm::ipv4_address);
     // Skip the (potentially 4s-blocking) connectivity probe when there's no
     // Wi-Fi interface at all: the watch loop classifies NoAdapter and would
     // otherwise burn a network round-trip (curl/ping) every tick for nothing.

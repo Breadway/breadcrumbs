@@ -465,8 +465,9 @@ fn prompt_line(msg: &str) -> String {
 /// response) means "this network has no password" (open Wi-Fi) — normalize
 /// it to `None` right at the point of entry so it flows the same way a
 /// genuinely absent/cleared password does. Without this, `Some("")` would
-/// make `nm::connect_verbose` treat it as a (blank) secret rather than an
-/// open network, and the connect fails against a real open SSID.
+/// make `nm::connect_verbose` send an empty PSK in the settings payload,
+/// which NetworkManager treats as "secured with a blank password" rather
+/// than "open", and the connect fails against a real open SSID.
 fn non_empty(s: String) -> Option<String> {
     if s.is_empty() {
         None
@@ -666,7 +667,7 @@ fn cmd_scan(cfg: &mut Config, to: Option<String>) -> Result<i32, String> {
         ca_cert: None,
         hidden: false,
     };
-    if !nm::connect(&iface, &def, cfg.settings.nmcli_wait, &cfg.settings.dns) {
+    if !nm::connect(&iface, &def, cfg.settings.connect_wait, &cfg.settings.dns) {
         return Err(format!("failed to connect to {ssid}"));
     }
     // A successful connect means NetworkManager now durably holds the PSK
@@ -799,9 +800,9 @@ fn cmd_doctor(cfg: &Config, override_p: &Option<String>, full: bool) -> Result<i
     let s = crate::status::gather(cfg, &p);
     println!("{C_BOLD}breadcrumbs doctor{C_RESET}  (profile {p})");
     println!(
-        "  nmcli       {}",
-        if command_exists("nmcli") {
-            "present"
+        "  network-manager {}",
+        if nm::available() {
+            "present (D-Bus)"
         } else {
             "MISSING"
         }
@@ -895,7 +896,8 @@ fn cmd_install_service(enable: bool) -> Result<i32, String> {
     // session's DISPLAY/WAYLAND_DISPLAY/DBUS so notify-send and the Tailscale
     // login browser-open actually work. PATH is pinned because systemd --user
     // units do not get the login shell's PATH, and the watcher shells out to
-    // nmcli/tailscale/sudo/xdg-open by name.
+    // tailscale/sudo/xdg-open by name (NetworkManager is reached over D-Bus,
+    // so no nmcli is needed).
     let unit = format!(
         "[Unit]\n\
          Description=breadcrumbs Wi-Fi state machine watcher\n\

@@ -97,7 +97,7 @@ fn learn_ssid(cfg: &mut Config, profile: &str, ssid: &str) {
 /// Try to connect + confirm the device actually landed on the *requested*
 /// SSID. Returns Ok(()) on success, Err(reason) on failure.
 fn connect_and_verify(iface: &str, def: &NetworkDef, cfg: &Config) -> Result<(), String> {
-    nm::connect_verbose(iface, def, cfg.settings.nmcli_wait, def.effective_dns(&cfg.settings.dns))?;
+    nm::connect_verbose(iface, def, cfg.settings.connect_wait, def.effective_dns(&cfg.settings.dns))?;
     // Confirm the SSID, not just "device connected": NM autoconnect can win
     // a race and leave the device on a different network, and the wifi list
     // can lag activation by a moment — so poll briefly before giving up.

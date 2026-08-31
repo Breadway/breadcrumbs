@@ -1,18 +1,26 @@
-use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use bread_utils::bread_client::BreadClient;
+use zbus::blocking::{Connection, Proxy};
+use zbus::zvariant::OwnedValue;
 
 use crate::bread_events;
 use crate::config::Config;
 use crate::flow;
+use crate::nm;
 use crate::notify::{log, notify, Urgency};
 use crate::state::{self, State};
 use crate::status::{self};
 use crate::tailscale::TsHealth;
+
+const NM_DEST: &str = "org.freedesktop.NetworkManager";
+const NM_PATH: &str = "/org/freedesktop/NetworkManager";
+const NM_IFACE: &str = "org.freedesktop.NetworkManager";
+const DEV_IFACE: &str = "org.freedesktop.NetworkManager.Device";
+const PROPS_IFACE: &str = "org.freedesktop.DBus.Properties";
 
 /// Coarse health classification the watch loop reacts to each tick. `pub`
 /// (and so is [`classify`]) purely so integration tests can drive the real
@@ -146,58 +154,89 @@ enum Wake {
     SetProfile(String),
 }
 
-/// Tail `nmcli monitor` and ping the channel on link-state churn so we react
-/// to drops within a second instead of waiting out the poll interval.
-fn spawn_nm_monitor(tx: mpsc::Sender<Wake>) {
+/// Whether a `PropertiesChanged` message on the NM root changes the
+/// `Connectivity` property of the NetworkManager interface — the signal
+/// that catches "still connected but lost the internet" (portal, DHCP
+/// failure) without waiting out the poll interval.
+fn props_changed_connectivity(msg: &zbus::Message) -> bool {
+    let Ok(body) = msg.body().deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>() else {
+        return false;
+    };
+    body.0 == NM_IFACE && body.1.contains_key("Connectivity")
+}
+
+/// Subscribe to a D-Bus signal from NetworkManager and ping the channel for
+/// each matching message, reconnecting on bus/NM restarts. One thread per
+/// subscription (a handful at most); each owns its own connection so a dead
+/// bus can't wedge the others.
+fn spawn_signal_watcher<F>(tx: mpsc::Sender<Wake>, path: String, iface: &'static str, signal: &'static str, mut on_msg: F)
+where
+    F: FnMut(&zbus::Message) -> bool + Send + 'static,
+{
     thread::spawn(move || loop {
-        let child = Command::new("nmcli")
-            .arg("monitor")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn();
-        let mut child = match child {
-            Ok(c) => c,
-            Err(_) => {
-                thread::sleep(Duration::from_secs(10));
-                continue;
-            }
+        let Ok(conn) = Connection::system() else {
+            thread::sleep(Duration::from_secs(10));
+            continue;
         };
-        if let Some(out) = child.stdout.take() {
-            let reader = BufReader::new(out);
-            // `None` means "haven't fired yet, so fire on the first interesting
-            // line". Storing an `Option` instead of seeding with
-            // `Instant::now() - 10s` avoids a panic: `Instant - Duration`
-            // underflows (and panics) when the monotonic clock is younger than
-            // the offset, which happens if `watch` starts within ~10s of boot —
-            // exactly when the systemd unit (ordered after graphical-session)
-            // tends to launch.
-            let mut last: Option<Instant> = None;
-            for line in reader.lines().map_while(Result::ok) {
-                let l = line.to_lowercase();
-                // `connectivity` lines catch drops that keep the device
-                // "connected" but lose the internet (captive portal, DHCP
-                // failure); `deactivating` covers teardown. Everything else
-                // waits out the poll interval.
-                let interesting = l.contains("disconnect")
-                    || l.contains("unavailable")
-                    || l.contains("failed")
-                    || l.contains("deactivating")
-                    || l.contains("connectivity");
-                if interesting && debounce_ready(last, Duration::from_millis(1500)) {
-                    last = Some(Instant::now());
-                    let _ = tx.send(Wake::LinkChurn);
-                }
+        let Ok(proxy) = Proxy::new(&conn, NM_DEST, path.as_str(), iface) else {
+            thread::sleep(Duration::from_secs(10));
+            continue;
+        };
+        let Ok(mut iter) = proxy.receive_signal(signal) else {
+            thread::sleep(Duration::from_secs(10));
+            continue;
+        };
+        // `None` means "haven't fired yet, so fire on the first interesting
+        // signal". Storing an `Option` instead of seeding with
+        // `Instant::now() - 10s` avoids a panic: `Instant - Duration`
+        // underflows (and panics) when the monotonic clock is younger than
+        // the offset, which happens if `watch` starts within ~10s of boot —
+        // exactly when the systemd unit (ordered after graphical-session)
+        // tends to launch.
+        let mut last: Option<Instant> = None;
+        for msg in iter.by_ref() {
+            if on_msg(&msg) && debounce_ready(last, Duration::from_millis(1500)) {
+                last = Some(Instant::now());
+                let _ = tx.send(Wake::LinkChurn);
             }
         }
-        let _ = child.wait();
-        // monitor died (NM restart?) — back off and respawn.
+        // Subscription died (NM or bus restart) — back off and resubscribe.
         thread::sleep(Duration::from_secs(5));
     });
 }
 
-/// Sleep up to `dur`, but wake early if `nmcli monitor` signals link churn or
-/// a `set_profile` command arrives. Returns the pending action, if any.
+/// Subscribe to NetworkManager D-Bus signals and ping the channel on
+/// link-state churn so we react to drops within a second instead of waiting
+/// out the poll interval. Replaces the old `nmcli monitor` subprocess: the
+/// same events are observed, but as structured D-Bus signals.
+///
+/// Watched signals:
+/// - `PropertiesChanged` on the NM root object, filtered to the
+///   `Connectivity` property — catches captive portals / DHCP failures that
+///   keep the device "connected" while losing the internet;
+/// - `DeviceAdded` / `DeviceRemoved` — hotplug;
+/// - `Device.StateChanged` on every Wi-Fi device — drops and reconnects.
+fn spawn_nm_monitor(tx: mpsc::Sender<Wake>) {
+    spawn_signal_watcher(
+        tx.clone(),
+        NM_PATH.to_string(),
+        PROPS_IFACE,
+        "PropertiesChanged",
+        props_changed_connectivity,
+    );
+    spawn_signal_watcher(tx.clone(), NM_PATH.to_string(), NM_IFACE, "DeviceAdded", |_| true);
+    spawn_signal_watcher(tx.clone(), NM_PATH.to_string(), NM_IFACE, "DeviceRemoved", |_| true);
+    // StateChanged on each Wi-Fi device. Devices added later (USB dongle
+    // hotplug) are caught by the DeviceAdded watcher waking the loop; the
+    // poll interval covers anything else.
+    for path in nm::wifi_device_paths() {
+        spawn_signal_watcher(tx.clone(), path, DEV_IFACE, "StateChanged", |_| true);
+    }
+}
+
+/// Sleep up to `dur`, but wake early if the D-Bus signal monitor signals
+/// link churn or a `set_profile` command arrives. Returns the pending
+/// action, if any.
 fn wait_for_tick(rx: &Receiver<Wake>, dur: Duration) -> Option<Wake> {
     match rx.recv_timeout(dur) {
         Ok(first) => {
@@ -301,10 +340,10 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
         }
         profile = State::load(&cfg.settings.default_profile).profile;
 
-        // Suspend/resume: `nmcli monitor` sees nothing while the machine
-        // sleeps, so a large wall-clock gap means the network state may have
-        // changed underneath us — allow an immediate recovery run instead of
-        // waiting out any remaining flow cooldown.
+        // Suspend/resume: the D-Bus signal monitor sees nothing while the
+        // machine sleeps, so a large wall-clock gap means the network state
+        // may have changed underneath us — allow an immediate recovery run
+        // instead of waiting out any remaining flow cooldown.
         if last_tick_at.elapsed() > prev_wait + RESUME_SLACK {
             log("watch: large gap since last tick (suspend/resume?) — forcing recovery check");
             last_flow_at = None;

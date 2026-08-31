@@ -9,7 +9,7 @@ use crate::util::home_dir;
 fn default_dns() -> String {
     "1.1.1.1".to_string()
 }
-fn default_nmcli_wait() -> u32 {
+fn default_connect_wait() -> u32 {
     8
 }
 fn default_exit_node() -> String {
@@ -77,8 +77,10 @@ fn is_false(b: &bool) -> bool {
 pub struct Settings {
     #[serde(default = "default_dns")]
     pub dns: String,
-    #[serde(default = "default_nmcli_wait")]
-    pub nmcli_wait: u32,
+    /// Seconds to wait for a connect to reach the ACTIVATED device state.
+    /// `nmcli_wait` is accepted as a legacy alias.
+    #[serde(default = "default_connect_wait", alias = "nmcli_wait")]
+    pub connect_wait: u32,
     #[serde(default = "default_exit_node")]
     pub exit_node: String,
     #[serde(default = "default_profile_name")]
@@ -118,7 +120,7 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             dns: default_dns(),
-            nmcli_wait: default_nmcli_wait(),
+            connect_wait: default_connect_wait(),
             exit_node: default_exit_node(),
             default_profile: default_profile_name(),
             watch_interval: default_watch_interval(),
@@ -560,7 +562,7 @@ mod tests {
     fn settings_default_matches_documented_defaults() {
         let s = Settings::default();
         assert_eq!(s.dns, "1.1.1.1");
-        assert_eq!(s.nmcli_wait, 8);
+        assert_eq!(s.connect_wait, 8);
         assert_eq!(s.default_profile, "away");
         assert_eq!(s.watch_interval, 12);
         assert_eq!(s.ping_host, "1.1.1.1");
