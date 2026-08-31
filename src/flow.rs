@@ -1,3 +1,6 @@
+use std::thread;
+use std::time::Duration;
+
 use crate::config::{Config, NetworkDef};
 use crate::nm;
 use crate::notify::{log, notify, Urgency};
@@ -74,14 +77,62 @@ fn clear_password_if_used(cfg: &mut Config, ssid: &str) {
     }
 }
 
-/// Try to connect + confirm it actually carries traffic.
-/// Returns Ok(()) on success, Err(reason) on failure.
-fn connect_and_verify(iface: &str, def: &NetworkDef, cfg: &Config) -> Result<(), String> {
-    nm::connect_verbose(iface, def, cfg.settings.nmcli_wait, &cfg.settings.dns)?;
-    if !nm::device_connected(iface) {
-        return Err("device not connected after nmcli success".into());
+/// Opt-in learning (`profiles.<name>.learn = true`): remember the SSIDs a
+/// profile successfully connects to so `breadcrumbs detect` improves without
+/// hand-editing. Bounded to keep the list sane; never touches an existing
+/// marker.
+fn learn_ssid(cfg: &mut Config, profile: &str, ssid: &str) {
+    let Some(p) = cfg.profiles.get_mut(profile) else {
+        return;
+    };
+    if !p.learn || p.detect_ssids.len() >= 8 || p.detect_ssids.iter().any(|s| s == ssid) {
+        return;
     }
-    Ok(())
+    p.detect_ssids.push(ssid.to_string());
+    if let Err(e) = cfg.save() {
+        log(&format!("failed to persist learned SSID {ssid} for {profile}: {e}"));
+    }
+}
+
+/// Try to connect + confirm the device actually landed on the *requested*
+/// SSID. Returns Ok(()) on success, Err(reason) on failure.
+fn connect_and_verify(iface: &str, def: &NetworkDef, cfg: &Config) -> Result<(), String> {
+    nm::connect_verbose(iface, def, cfg.settings.connect_wait, def.effective_dns(&cfg.settings.dns))?;
+    // Confirm the SSID, not just "device connected": NM autoconnect can win
+    // a race and leave the device on a different network, and the wifi list
+    // can lag activation by a moment — so poll briefly before giving up.
+    for _ in 0..8 {
+        match nm::active_ssid(iface) {
+            // Explicitly on the requested network — success.
+            Some(active) if active == def.ssid => return Ok(()),
+            // Associated with a *different* network — the failure this
+            // check exists to catch.
+            Some(_) => break,
+            // Scan list stale right after activation — keep polling while
+            // the device is at least connected.
+            None => {
+                if !nm::device_connected(iface) {
+                    break;
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    Err(format!("not associated with '{}' after connect", def.ssid))
+}
+
+/// Run the connection state machine for `profile_name`, with desktop
+/// notifications enabled. See [`run_quiet`] for the daemon-facing variant.
+pub fn run(cfg: &mut Config, profile_name: &str) -> Outcome {
+    run_inner(cfg, profile_name, true)
+}
+
+/// Same state machine, but suppresses desktop notifications. Used by the
+/// watch loop, which does its own transition-gated notifications — without
+/// this, a persistent failure (e.g. a stopped Tailscale daemon) would
+/// re-notify on every recovery retry instead of once per state change.
+pub fn run_quiet(cfg: &mut Config, profile_name: &str) -> Outcome {
+    run_inner(cfg, profile_name, false)
 }
 
 /// Run the connection state machine for `profile_name`.
@@ -91,36 +142,38 @@ fn connect_and_verify(iface: &str, def: &NetworkDef, cfg: &Config) -> Result<(),
 /// immediately (see [`clear_password_if_used`]) — this is the only way that
 /// clearing happens for the `init` / `profile set --apply` / `detect --apply`
 /// commands and the watch loop, all of which route through here.
-pub fn run(cfg: &mut Config, profile_name: &str) -> Outcome {
+fn run_inner(cfg: &mut Config, profile_name: &str, notify_user: bool) -> Outcome {
     let profile = match cfg.profile(profile_name) {
         Some(p) => p.clone(),
         None => {
-            notify(
-                "breadcrumbs: unknown profile",
-                &format!("'{profile_name}' is not defined in breadcrumbs.toml"),
-                Urgency::Critical,
-            );
+            if notify_user {
+                notify(
+                    "breadcrumbs: unknown profile",
+                    &format!("'{profile_name}' is not defined in breadcrumbs.toml"),
+                    Urgency::Critical,
+                );
+            }
             return Outcome::UnknownProfile(profile_name.to_string());
         }
     };
 
-    let iface = match nm::wifi_interface() {
+    let iface = match nm::wifi_interface_preferred(cfg.settings.interface.as_deref()) {
         Some(i) => i,
         None => {
-            notify(
-                "breadcrumbs: no Wi-Fi adapter",
-                "Hardware issue — Wi-Fi device not found. Manual check needed.",
-                Urgency::Critical,
-            );
+            if notify_user {
+                notify(
+                    "breadcrumbs: no Wi-Fi adapter",
+                    "Hardware issue — Wi-Fi device not found. Manual check needed.",
+                    Urgency::Critical,
+                );
+            }
             return Outcome::NoInterface;
         }
     };
     nm::radio_on();
 
-    let exit_node = profile
-        .exit_node
-        .clone()
-        .unwrap_or_else(|| cfg.settings.exit_node.clone());
+    let exit_nodes = cfg.exit_nodes_for(profile_name);
+    let exit_node = exit_nodes.first().cloned().unwrap_or_default();
     let candidates = resolve_candidates(cfg, &profile);
 
     log(&format!(
@@ -170,18 +223,20 @@ pub fn run(cfg: &mut Config, profile_name: &str) -> Outcome {
             }
         }
 
-        let ts = tailscale::ensure_exit_node(&exit_node);
+        let ts = tailscale::ensure_exit_node(&exit_nodes);
         if !ts.is_ok() {
             let ssid = nm::active_ssid(&iface).or_else(|| profile.bootstrap.clone());
-            notify(
-                "Tailscale Error",
-                &format!(
-                    "{} — staying on {}",
-                    ts.describe(),
-                    ssid.clone().unwrap_or_else(|| "Wi-Fi".into())
-                ),
-                Urgency::Critical,
-            );
+            if notify_user {
+                notify(
+                    "Tailscale Error",
+                    &format!(
+                        "{} — staying on {}",
+                        ts.describe(),
+                        ssid.clone().unwrap_or_else(|| "Wi-Fi".into())
+                    ),
+                    Urgency::Critical,
+                );
+            }
             return Outcome::TailscaleError { ssid, health: ts };
         }
         log(&format!("tailscale healthy via exit node {exit_node}"));
@@ -189,30 +244,41 @@ pub fn run(cfg: &mut Config, profile_name: &str) -> Outcome {
         nm::rescan(&iface, &scan_targets);
     }
 
-    let visible = nm::visible_ssids(&iface);
+    // Signals are re-read after the Tailscale gate so pass 1 can prefer the
+    // strongest AP among a profile's visible networks.
+    let visible_sig = nm::visible_signals(&iface);
 
     // ---- Connect to the priority list ----------------------------------
-    // Pass 1: visible networks in priority order.
+    // Pass 1: visible networks, strongest signal first (priority order is
+    // the stable tiebreaker for equal signals).
+    let mut visible_candidates: Vec<&NetworkDef> = candidates
+        .iter()
+        .filter(|d| visible_sig.contains_key(&d.ssid))
+        .collect();
+    visible_candidates.sort_by(|a, b| {
+        visible_sig
+            .get(&b.ssid)
+            .cmp(&visible_sig.get(&a.ssid))
+    });
     let mut any_attempted = false;
-    for def in &candidates {
-        if visible.contains(&def.ssid) {
-            any_attempted = true;
-            match connect_and_verify(&iface, def, cfg) {
-                Ok(()) => {
-                    clear_password_if_used(cfg, &def.ssid);
-                    let note = if internet_ok(cfg) {
-                        None
-                    } else {
-                        Some("associated but no internet yet".to_string())
-                    };
-                    finish_connected(&def.ssid, profile_name, &note);
-                    return Outcome::Connected {
-                        ssid: def.ssid.clone(),
-                        note,
-                    };
-                }
-                Err(e) => log(&format!("connect failed (visible): {} — {e}", def.ssid)),
+    for def in &visible_candidates {
+        any_attempted = true;
+        match connect_and_verify(&iface, def, cfg) {
+            Ok(()) => {
+                clear_password_if_used(cfg, &def.ssid);
+                learn_ssid(cfg, profile_name, &def.ssid);
+                let note = if internet_ok(cfg) {
+                    None
+                } else {
+                    Some("associated but no internet yet".to_string())
+                };
+                finish_connected(&def.ssid, profile_name, &note, notify_user);
+                return Outcome::Connected {
+                    ssid: def.ssid.clone(),
+                    note,
+                };
             }
+            Err(e) => log(&format!("connect failed (visible): {} — {e}", def.ssid)),
         }
     }
     // Pass 2: hidden networks we couldn't see in the scan.
@@ -222,12 +288,13 @@ pub fn run(cfg: &mut Config, profile_name: &str) -> Outcome {
             match connect_and_verify(&iface, def, cfg) {
                 Ok(()) => {
                     clear_password_if_used(cfg, &def.ssid);
+                    learn_ssid(cfg, profile_name, &def.ssid);
                     let note = if internet_ok(cfg) {
                         None
                     } else {
                         Some("associated but no internet yet".to_string())
                     };
-                    finish_connected(&def.ssid, profile_name, &note);
+                    finish_connected(&def.ssid, profile_name, &note, notify_user);
                     return Outcome::Connected {
                         ssid: def.ssid.clone(),
                         note,
@@ -272,7 +339,9 @@ pub fn run(cfg: &mut Config, profile_name: &str) -> Outcome {
             } else {
                 format!("target network not in range — staying on {bs_ssid} (Tailscale OK)")
             };
-            notify("breadcrumbs: using bootstrap", &reason, Urgency::Normal);
+            if notify_user {
+                notify("breadcrumbs: using bootstrap", &reason, Urgency::Normal);
+            }
             log(&format!("flow end: on bootstrap {bs_ssid}; {reason}"));
             return Outcome::Connected {
                 ssid: bs_ssid,
@@ -286,33 +355,40 @@ pub fn run(cfg: &mut Config, profile_name: &str) -> Outcome {
         .map(|c| c.ssid.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    notify(
-        "breadcrumbs: no known networks",
-        &format!("profile '{profile_name}': none of [{names}] are in range"),
-        Urgency::Critical,
-    );
+    let msg = if candidates.is_empty() {
+        format!("profile '{profile_name}' has no networks configured")
+    } else {
+        format!("profile '{profile_name}': none of [{names}] are in range")
+    };
+    if notify_user {
+        notify("breadcrumbs: no known networks", &msg, Urgency::Critical);
+    }
     log(&format!(
         "flow end: no networks connected (profile={profile_name})"
     ));
     Outcome::NoNetworks
 }
 
-fn finish_connected(ssid: &str, profile: &str, note: &Option<String>) {
+fn finish_connected(ssid: &str, profile: &str, note: &Option<String>, notify_user: bool) {
     match note {
         None => {
-            notify(
-                "breadcrumbs: connected",
-                &format!("{ssid} ({profile})"),
-                Urgency::Low,
-            );
+            if notify_user {
+                notify(
+                    "breadcrumbs: connected",
+                    &format!("{ssid} ({profile})"),
+                    Urgency::Low,
+                );
+            }
             log(&format!("flow end: connected {ssid} (profile={profile})"));
         }
         Some(n) => {
-            notify(
-                "breadcrumbs: connected (degraded)",
-                &format!("{ssid} ({profile}) — {n}"),
-                Urgency::Normal,
-            );
+            if notify_user {
+                notify(
+                    "breadcrumbs: connected (degraded)",
+                    &format!("{ssid} ({profile}) — {n}"),
+                    Urgency::Normal,
+                );
+            }
             log(&format!(
                 "flow end: connected {ssid} (profile={profile}) note={n}"
             ));
@@ -330,6 +406,10 @@ mod tests {
         NetworkDef {
             ssid: ssid.into(),
             password: Some("x".into()),
+            dns: None,
+            eap: None,
+            identity: None,
+            ca_cert: None,
             hidden: false,
         }
     }

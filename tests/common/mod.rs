@@ -9,7 +9,7 @@
 //!   rules ("if the program+args match this predicate, return this canned
 //!   `Output`"), which also records every invocation so a test can assert
 //!   exactly what was — or, just as importantly, was *not* — passed (e.g.
-//!   that a password argument never reaches a fake `nmcli`).
+//!   that a password argument never reaches a fake subprocess).
 //! - [`EnvSandbox`]: real logic (`flow::run`, `watch::classify`) still does
 //!   its own best-effort file logging via `notify::log`, which resolves a
 //!   path from `$HOME`/`$XDG_STATE_HOME`. `EnvSandbox` points those at a
@@ -18,8 +18,14 @@
 //!   inherently cross-test-within-this-binary racy, so it's guarded by a
 //!   process-wide mutex — tests using it serialize against each other but
 //!   not against unrelated tests (each `tests/*.rs` file is its own binary).
+//! - [`fake_nm`]: a real fake NetworkManager D-Bus service on a private
+//!   `dbus-daemon`. The production `nm` module talks to it over real D-Bus
+//!   marshalling (`Connection::system()` honors `DBUS_SYSTEM_BUS_ADDRESS`),
+//!   replacing the old fake-`nmcli`-argv rules.
 
 #![allow(dead_code)] // not every test file uses every helper here
+
+pub mod fake_nm;
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -50,6 +56,7 @@ impl RecordedCall {
 }
 
 type Matcher = Box<dyn Fn(&str, &[&str]) -> bool>;
+type DynamicRule = (Matcher, Box<dyn Fn(&str, &[&str]) -> Output>);
 
 /// A canned, rule-based [`Runner`]. Rules are tried in registration order;
 /// the first whose matcher returns `true` supplies the response. No rule
@@ -58,6 +65,7 @@ type Matcher = Box<dyn Fn(&str, &[&str]) -> bool>;
 /// (a wrong exit code) rather than silently returning success.
 pub struct FakeRunner {
     rules: Vec<(Matcher, Output)>,
+    dynamic_rules: Vec<DynamicRule>,
     commands: HashSet<String>,
     calls: Rc<RefCell<Vec<RecordedCall>>>,
 }
@@ -66,6 +74,7 @@ impl FakeRunner {
     pub fn new() -> Self {
         FakeRunner {
             rules: Vec::new(),
+            dynamic_rules: Vec::new(),
             commands: HashSet::new(),
             calls: Rc::new(RefCell::new(Vec::new())),
         }
@@ -91,13 +100,27 @@ impl FakeRunner {
     }
 
     /// Shorthand for matching on `prog` plus a whitespace-joined view of
-    /// `args` containing `substr` (handy for `nmcli`/`tailscale` calls, whose
+    /// `args` containing `substr` (handy for `tailscale`/`curl` calls, whose
     /// interesting bit is usually a subcommand somewhere in the middle).
     pub fn on_contains(self, prog: &'static str, substr: &'static str, output: Output) -> Self {
         self.on(
             move |p, args| p == prog && args.join(" ").contains(substr),
             output,
         )
+    }
+
+    /// Register a rule whose *response* is computed at call time (rather
+    /// than canned), enabling stateful fakes — e.g. answering "which SSID is
+    /// active?" with the SSID of the most recently dialed connection.
+    /// Dynamic rules are tried after the static ones.
+    pub fn on_dynamic(
+        mut self,
+        matcher: impl Fn(&str, &[&str]) -> bool + 'static,
+        out: impl Fn(&str, &[&str]) -> Output + 'static,
+    ) -> Self {
+        self.dynamic_rules
+            .push((Box::new(matcher), Box::new(out)));
+        self
     }
 }
 
@@ -117,6 +140,11 @@ impl Runner for FakeRunner {
         for (matcher, out) in &self.rules {
             if matcher(prog, args) {
                 return out.clone();
+            }
+        }
+        for (matcher, out) in &self.dynamic_rules {
+            if matcher(prog, args) {
+                return out(prog, args);
             }
         }
         Output::failed()

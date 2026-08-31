@@ -21,12 +21,31 @@ pub enum TsHealth {
     ExitNodeMissing,
     /// The exit node exists but is offline.
     ExitNodeOffline,
+    /// The profile requires an exit node but none is configured
+    /// (`settings.exit_node` / per-profile `exit_node` empty). Cannot be
+    /// auto-fixed — the user must configure one.
+    NoExitNode,
     Error(String),
 }
 
 impl TsHealth {
     pub fn is_ok(&self) -> bool {
         matches!(self, TsHealth::Ok)
+    }
+
+    /// Wire name for `bread.crumbs.*` event payloads (variant name, like
+    /// `Health::as_str`).
+    pub fn state_str(&self) -> &'static str {
+        match self {
+            TsHealth::Ok => "Ok",
+            TsHealth::NotInstalled => "NotInstalled",
+            TsHealth::NeedsLogin => "NeedsLogin",
+            TsHealth::Stopped => "Stopped",
+            TsHealth::ExitNodeMissing => "ExitNodeMissing",
+            TsHealth::ExitNodeOffline => "ExitNodeOffline",
+            TsHealth::NoExitNode => "NoExitNode",
+            TsHealth::Error(_) => "Error",
+        }
     }
 
     pub fn describe(&self) -> String {
@@ -37,6 +56,7 @@ impl TsHealth {
             TsHealth::Stopped => "backend stopped".into(),
             TsHealth::ExitNodeMissing => "exit node not found in tailnet".into(),
             TsHealth::ExitNodeOffline => "exit node is offline".into(),
+            TsHealth::NoExitNode => "no exit node configured".into(),
             TsHealth::Error(e) => format!("error: {e}"),
         }
     }
@@ -219,16 +239,82 @@ fn run_login() {
     }
 }
 
-/// Bring Tailscale to a state where `node` is the active, online exit node.
-/// Performs at most one bring-up/login and one `tailscale set` attempt.
-pub fn ensure_exit_node(node: &str) -> TsHealth {
+/// Strip whitespace and drop empty entries from the acceptable-node list.
+fn effective_nodes(nodes: &[String]) -> Vec<String> {
+    nodes
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Given a status JSON and the acceptable exit nodes, report `Ok` when the
+/// active selection is one of them and online; otherwise the closest
+/// actionable failure: not-selected (present + online, flow must select),
+/// offline, or missing.
+fn exit_node_health(nodes: &[String], v: &Value) -> TsHealth {
+    let mut any_exists = false;
+    let mut any_online = false;
+    let mut any_selected = false;
+    for node in nodes {
+        let (exists, online, selected) = exit_node_state(v, node);
+        if exists {
+            any_exists = true;
+            if online {
+                any_online = true;
+            }
+            if selected {
+                any_selected = true;
+            }
+        }
+    }
+    if any_selected && any_online {
+        TsHealth::Ok
+    } else if any_selected {
+        // The active exit node is one of ours but offline.
+        TsHealth::ExitNodeOffline
+    } else if any_online {
+        // Present + online but not selected — the flow will select it.
+        TsHealth::Error("exit node not selected".into())
+    } else if any_exists {
+        TsHealth::ExitNodeOffline
+    } else {
+        TsHealth::ExitNodeMissing
+    }
+}
+
+/// Bring Tailscale to a state where one of `nodes` (priority order) is the
+/// active, online exit node. Performs at most one bring-up/login, then one
+/// `tailscale set` per node until one takes.
+pub fn ensure_exit_node(nodes: &[String]) -> TsHealth {
     if !installed() {
         return TsHealth::NotInstalled;
+    }
+    let eff = effective_nodes(nodes);
+    if eff.is_empty() {
+        // Never run `tailscale set --exit-node=` with an empty node — that
+        // would clear the user's current exit-node selection. This is a
+        // config error, surfaced as its own health state.
+        return TsHealth::NoExitNode;
     }
 
     let v = match status_json() {
         Some(v) => v,
-        None => return TsHealth::Error("could not read tailscale status".into()),
+        None => {
+            // Daemon unreachable — usually *not running*: a stopped daemon
+            // prints its error to stderr and leaves stdout empty, which is
+            // exactly why this branch used to be dead code (the
+            // BackendState "Stopped" case below only fires when the daemon
+            // is up but the backend is stopped). Try to bring it up before
+            // giving up; `tailscale up` is idempotent when already running
+            // and fails fast (no sudo prompt — stdin is /dev/null) when
+            // the caller lacks permission to manage the daemon.
+            let _ = run("tailscale", &["up"], Duration::from_secs(20));
+            match status_json() {
+                Some(v2) => v2,
+                None => return TsHealth::Error("could not read tailscale status".into()),
+            }
+        }
     };
 
     match backend_state(&v).as_str() {
@@ -249,42 +335,44 @@ pub fn ensure_exit_node(node: &str) -> TsHealth {
         _ => {}
     }
 
-    // Select the exit node (idempotent).
-    let _ = run(
-        "tailscale",
-        &["set", &format!("--exit-node={node}")],
-        Duration::from_secs(10),
-    );
+    // Failover: try each acceptable node in priority order until one is
+    // selected and online.
+    for node in &eff {
+        let _ = run(
+            "tailscale",
+            &["set", &format!("--exit-node={node}")],
+            Duration::from_secs(10),
+        );
+        if let Some(v2) = status_json() {
+            if matches!(exit_node_health(std::slice::from_ref(node), &v2), TsHealth::Ok) {
+                return TsHealth::Ok;
+            }
+        }
+    }
 
     let v = match status_json() {
         Some(v) => v,
         None => return TsHealth::Error("could not re-read tailscale status".into()),
     };
-
     match backend_state(&v).as_str() {
         "Running" => {}
         "NeedsLogin" | "NoState" => return TsHealth::NeedsLogin,
         "Stopped" => return TsHealth::Stopped,
         other => return TsHealth::Error(format!("backend state: {other}")),
     }
-
-    let (exists, online, selected) = exit_node_state(&v, node);
-    if !exists {
-        TsHealth::ExitNodeMissing
-    } else if !online {
-        TsHealth::ExitNodeOffline
-    } else if !selected {
-        // Online and present but our set didn't take — treat as missing/selectable error.
-        TsHealth::Error("exit node not selected".into())
-    } else {
-        TsHealth::Ok
-    }
+    exit_node_health(&eff, &v)
 }
 
 /// Lightweight health check without trying to (re)configure anything.
-pub fn check(node: &str) -> TsHealth {
+pub fn check(nodes: &[String]) -> TsHealth {
     if !installed() {
         return TsHealth::NotInstalled;
+    }
+    let eff = effective_nodes(nodes);
+    if eff.is_empty() {
+        // Read-only check, so never runs `tailscale set` — an empty node is
+        // a config error, not something this probe can fix.
+        return TsHealth::NoExitNode;
     }
     let v = match status_json() {
         Some(v) => v,
@@ -296,16 +384,7 @@ pub fn check(node: &str) -> TsHealth {
         "Stopped" => return TsHealth::Stopped,
         other => return TsHealth::Error(format!("backend state: {other}")),
     }
-    let (exists, online, selected) = exit_node_state(&v, node);
-    if !exists {
-        TsHealth::ExitNodeMissing
-    } else if !online {
-        TsHealth::ExitNodeOffline
-    } else if !selected {
-        TsHealth::Error("exit node not selected".into())
-    } else {
-        TsHealth::Ok
-    }
+    exit_node_health(&eff, &v)
 }
 
 #[cfg(test)]
@@ -433,6 +512,7 @@ mod tests {
         assert!(!TsHealth::Stopped.is_ok());
         assert!(!TsHealth::ExitNodeMissing.is_ok());
         assert!(!TsHealth::ExitNodeOffline.is_ok());
+        assert!(!TsHealth::NoExitNode.is_ok());
         assert!(!TsHealth::Error("x".into()).is_ok());
     }
 
@@ -443,6 +523,7 @@ mod tests {
             TsHealth::NeedsLogin.describe(),
             "not logged in (run: tailscale up)"
         );
+        assert_eq!(TsHealth::NoExitNode.describe(), "no exit node configured");
         assert_eq!(TsHealth::Error("boom".into()).describe(), "error: boom");
     }
 
@@ -453,5 +534,77 @@ mod tests {
             Some("https://login.tailscale.com/abc".to_string())
         );
         assert_eq!(extract_url("no url on this line"), None);
+    }
+
+    #[test]
+    fn effective_nodes_trims_and_drops_empties() {
+        assert_eq!(
+            effective_nodes(&["  a  ".into(), "".into(), "b".into()]),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn exit_node_health_ok_when_any_node_selected_and_online() {
+        let v = json!({
+            "BackendState": "Running",
+            "Peer": {
+                "k1": { "HostName": "nodeB", "DNSName": "nodeB.ts.net.",
+                        "Online": true, "ExitNode": true, "ExitNodeOption": true }
+            }
+        });
+        assert_eq!(
+            exit_node_health(&["nodeA".into(), "nodeB".into()], &v),
+            TsHealth::Ok
+        );
+    }
+
+    #[test]
+    fn exit_node_health_reports_not_selected_when_a_node_is_online_but_unselected() {
+        let v = json!({
+            "Peer": {
+                "k1": { "HostName": "nodeA", "DNSName": "nodeA.ts.net.",
+                        "Online": true, "ExitNode": false, "ExitNodeOption": true }
+            }
+        });
+        assert_eq!(
+            exit_node_health(&["nodeA".into()], &v),
+            TsHealth::Error("exit node not selected".into())
+        );
+    }
+
+    #[test]
+    fn exit_node_health_reports_offline_when_all_exist_but_none_online() {
+        let v = json!({
+            "Peer": {
+                "k1": { "HostName": "nodeA", "DNSName": "nodeA.ts.net.",
+                        "Online": false, "ExitNode": false, "ExitNodeOption": true }
+            }
+        });
+        assert_eq!(
+            exit_node_health(&["nodeA".into()], &v),
+            TsHealth::ExitNodeOffline
+        );
+    }
+
+    #[test]
+    fn exit_node_health_reports_missing_when_no_node_present() {
+        let v = json!({ "BackendState": "Running" });
+        assert_eq!(
+            exit_node_health(&["nodeA".into()], &v),
+            TsHealth::ExitNodeMissing
+        );
+    }
+
+    #[test]
+    fn state_str_is_the_variant_name() {
+        assert_eq!(TsHealth::Ok.state_str(), "Ok");
+        assert_eq!(TsHealth::NotInstalled.state_str(), "NotInstalled");
+        assert_eq!(TsHealth::NeedsLogin.state_str(), "NeedsLogin");
+        assert_eq!(TsHealth::Stopped.state_str(), "Stopped");
+        assert_eq!(TsHealth::ExitNodeMissing.state_str(), "ExitNodeMissing");
+        assert_eq!(TsHealth::ExitNodeOffline.state_str(), "ExitNodeOffline");
+        assert_eq!(TsHealth::NoExitNode.state_str(), "NoExitNode");
+        assert_eq!(TsHealth::Error("x".into()).state_str(), "Error");
     }
 }

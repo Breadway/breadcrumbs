@@ -88,14 +88,14 @@ pub fn command_exists(name: &str) -> bool {
 }
 
 /// Run a command with a hard timeout. The child is killed if it overruns so a
-/// hung nmcli/tailscale can never wedge the daemon.
+/// hung subprocess can never wedge the daemon.
 pub fn run(prog: &str, args: &[&str], timeout: Duration) -> Output {
     run_with_stdin(prog, args, None, timeout)
 }
 
-/// Like [`run`], but feeds `stdin` to the child's standard input. Used to hand
-/// secrets (e.g. Wi-Fi PSKs) to `nmcli --ask` without exposing them in argv,
-/// where any local user could read them via `ps`.
+/// Like [`run`], but feeds `stdin` to the child's standard input.
+/// (Wi-Fi secrets no longer go through here: `nm` sends them inside D-Bus
+/// payloads, never on a command line.)
 pub fn run_with_stdin(prog: &str, args: &[&str], stdin: Option<&str>, timeout: Duration) -> Output {
     RUNNER.with(|r| r.borrow().run(prog, args, stdin, timeout))
 }
@@ -139,13 +139,6 @@ fn spawn_run(prog: &str, args: &[&str], stdin: Option<&str>, timeout: Duration) 
         Err(_) => return Output::failed(),
     };
 
-    if let Some(data) = stdin {
-        if let Some(mut sink) = child.stdin.take() {
-            let _ = sink.write_all(data.as_bytes());
-            // Drop closes the pipe so the child's read sees EOF.
-        }
-    }
-
     let mut stdout_pipe = child.stdout.take();
     let mut stderr_pipe = child.stderr.take();
 
@@ -163,6 +156,16 @@ fn spawn_run(prog: &str, args: &[&str], stdin: Option<&str>, timeout: Duration) 
         }
         buf
     });
+
+    // Feed stdin only now that the reader threads are draining stdout and
+    // stderr: a chatty child could otherwise fill its stdout pipe while we
+    // block writing stdin, deadlocking both sides.
+    if let Some(data) = stdin {
+        if let Some(mut sink) = child.stdin.take() {
+            let _ = sink.write_all(data.as_bytes());
+            // Drop closes the pipe so the child's read sees EOF.
+        }
+    }
 
     let start = Instant::now();
     let status = loop {
@@ -188,6 +191,19 @@ fn spawn_run(prog: &str, args: &[&str], stdin: Option<&str>, timeout: Duration) 
         stdout,
         stderr,
     }
+}
+
+/// Current local "HH:MM" (24h), for the time-of-day schedule. `None` if the
+/// clock can't be read — the schedule is skipped, never guessed.
+pub fn local_hhmm() -> Option<String> {
+    let o = run("date", &["+%H:%M"], Duration::from_secs(2));
+    if o.success {
+        let t = o.stdout.trim().to_string();
+        if t.len() == 5 && t.as_bytes()[2] == b':' {
+            return Some(t);
+        }
+    }
+    None
 }
 
 /// Local "YYYY-MM-DD HH:MM:SS". Uses `date` for correct local time, falling

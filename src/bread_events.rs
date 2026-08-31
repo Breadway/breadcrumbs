@@ -26,15 +26,72 @@ pub fn emit_profile_changed(client: &BreadClient, from: &str, to: &str) {
     );
 }
 
-pub fn emit_health_changed(client: &BreadClient, profile: &str, health: &str, ssid: Option<&str>) {
+/// Payload for `bread.crumbs.health.changed`. Constructed by the watch
+/// loop from a classification and passed as a unit so the emit functions
+/// stay small.
+pub struct HealthChanged<'a> {
+    pub profile: &'a str,
+    pub health: &'a str,
+    pub ssid: Option<&'a str>,
+    pub iface: Option<&'a str>,
+    pub ip: Option<&'a str>,
+    pub exit_node: &'a str,
+    pub tailscale: Option<&'a str>,
+}
+
+pub fn emit_health_changed(client: &BreadClient, ev: HealthChanged<'_>) {
     client.emit(
         "bread.crumbs.health.changed",
         serde_json::json!({
-            "profile": profile,
-            "health": health,
-            "ssid": ssid,
+            "profile": ev.profile,
+            "health": ev.health,
+            "ssid": ev.ssid,
+            "iface": ev.iface,
+            "ip": ev.ip,
+            "exit_node": ev.exit_node,
+            "tailscale": ev.tailscale,
         }),
     );
+}
+
+/// `bread.crumbs.network.changed` — the watch loop observed the active SSID
+/// transition. `from` is `null` when there was no previous association.
+pub fn emit_network_changed(client: &BreadClient, from: Option<&str>, to: Option<&str>, profile: &str) {
+    client.emit(
+        "bread.crumbs.network.changed",
+        serde_json::json!({ "from": from, "to": to, "profile": profile }),
+    );
+}
+
+/// `bread.crumbs.tailscale.changed` — the Tailscale health state (or its
+/// mere presence) changed between watch-loop ticks.
+pub fn emit_tailscale_changed(
+    client: &BreadClient,
+    profile: &str,
+    state: Option<&str>,
+    exit_node: &str,
+) {
+    client.emit(
+        "bread.crumbs.tailscale.changed",
+        serde_json::json!({
+            "profile": profile,
+            "state": state,
+            "exit_node": exit_node,
+        }),
+    );
+}
+
+/// What a `bread.command.crumbs.*` event asks the watch loop to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandAction {
+    /// Persist this profile via [`state::set_profile`]. Applied on the
+    /// watch loop thread — the single owner of config/state file access —
+    /// never on the subscription thread, which would race the loop's own
+    /// `Config::load`/`save`.
+    SetProfile(String),
+    /// Nothing to do: unknown verb, or a validation failure already
+    /// reported via `bread.crumbs.set_profile.failed`.
+    Ignore,
 }
 
 /// Reacts to `bread.command.crumbs.*` verbs. Only `set_profile` maps to
@@ -42,32 +99,36 @@ pub fn emit_health_changed(client: &BreadClient, profile: &str, health: &str, ss
 /// (or other) verb because breadcrumbs has no such concept. Unrecognized
 /// verbs are ignored, not stubbed as no-ops that pretend to succeed.
 ///
-/// Returns `true` when a profile was actually persisted, so the watch loop
-/// can wake immediately and re-evaluate instead of waiting out the current
-/// poll interval.
-///
-/// Emits `bread.crumbs.set_profile.done`/`.failed` per the confirmation
-/// convention in bread's Documentation.md.
-pub fn handle_command(event: &BreadEvent) -> bool {
+/// This only *parses and validates* the command — it performs no file I/O
+/// (that would race the watch loop's own config access from a second
+/// thread). The returned [`CommandAction`] is forwarded to the loop, which
+/// applies it via [`apply_set_profile`].
+pub fn handle_command(event: &BreadEvent) -> CommandAction {
     let Some(verb) = event.event.strip_prefix("bread.command.crumbs.") else {
-        return false;
+        return CommandAction::Ignore;
     };
     match verb {
-        "set_profile" => handle_set_profile(event),
+        "set_profile" => match event.data.get("profile").and_then(|v| v.as_str()) {
+            Some(name) if !name.trim().is_empty() => CommandAction::SetProfile(name.to_string()),
+            _ => {
+                emit_set_profile_failed("missing string \"profile\" in command data");
+                CommandAction::Ignore
+            }
+        },
         other => {
             crate::notify::log(&format!(
                 "watch: ignoring unrecognized bread.command.crumbs.{other}"
             ));
-            false
+            CommandAction::Ignore
         }
     }
 }
 
-fn handle_set_profile(event: &BreadEvent) -> bool {
-    let Some(name) = event.data.get("profile").and_then(|v| v.as_str()) else {
-        emit_set_profile_failed("missing string \"profile\" in command data");
-        return false;
-    };
+/// Apply a `set_profile` command on the watch loop thread and emit the
+/// `done`/`failed` confirmation. Kept separate from [`handle_command`] so
+/// the bread subscription thread never touches config/state files
+/// concurrently with the loop.
+pub fn apply_set_profile(name: &str) {
     match Config::load().and_then(|cfg| state::set_profile(&cfg, name)) {
         Ok(()) => {
             crate::notify::log(&format!(
@@ -77,11 +138,9 @@ fn handle_set_profile(event: &BreadEvent) -> bool {
                 "bread.crumbs.set_profile.done",
                 serde_json::json!({ "profile": name }),
             );
-            true
         }
         Err(e) => {
             emit_set_profile_failed(&e);
-            false
         }
     }
 }

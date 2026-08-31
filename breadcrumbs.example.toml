@@ -13,7 +13,7 @@
 
 [settings]
 dns = "1.1.1.1"
-nmcli_wait = 8
+connect_wait = 8
 exit_node = "my-exit-node"     # Tailscale hostname of your preferred exit node
 default_profile = "away"
 watch_interval = 12

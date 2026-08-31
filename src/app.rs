@@ -4,6 +4,7 @@
 //! consumers (including the integration tests under `tests/`).
 
 use std::io::{BufRead, Write};
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
@@ -37,13 +38,54 @@ struct Cli {
     cmd: Option<Cmd>,
 }
 
+/// Optional flags for `add`. Flattened into the `Add` subcommand so the
+/// CLI surface is unchanged while keeping `cmd_add`'s signature small.
+#[derive(clap::Args)]
+struct AddOpts {
+    /// Password (prompted if omitted)
+    password: Option<String>,
+    /// Network is hidden (does not broadcast its SSID).
+    /// `--hidden` sets it; `--hidden=false` clears it on an existing
+    /// entry; omitted leaves an existing entry's flag untouched.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    hidden: Option<bool>,
+    /// Per-network DNS override (empty string disables DNS pinning
+    /// for this network)
+    #[arg(long)]
+    dns: Option<String>,
+    /// 802.1x EAP method for enterprise networks (e.g. "peap", "tls")
+    #[arg(long)]
+    eap: Option<String>,
+    /// 802.1x identity for enterprise networks
+    #[arg(long)]
+    identity: Option<String>,
+    /// Path to a CA certificate for 802.1x
+    #[arg(long)]
+    ca_cert: Option<String>,
+    /// Attach this SSID to a profile's priority list
+    #[arg(long)]
+    to: Option<String>,
+    /// Position in the profile list (0 = highest priority)
+    #[arg(long)]
+    at: Option<usize>,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Show current Wi-Fi / profile / Tailscale status (default)
-    Status,
+    Status {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Run the full connect sequence for the active profile
     #[command(visible_aliases = ["up", "connect", "i"])]
-    Init,
+    Init {
+        /// Retry until connected or this many seconds have elapsed
+        /// (0 = single attempt)
+        #[arg(long, default_value_t = 0)]
+        wait: u64,
+    },
     /// Run as a daemon: watch for drops and auto-recover
     Watch {
         /// Skip the connect attempt on startup
@@ -60,24 +102,25 @@ enum Cmd {
         /// Set + apply the detected profile
         #[arg(long)]
         apply: bool,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Add or update a saved network
     Add {
         ssid: String,
-        /// Password (prompted if omitted)
-        password: Option<String>,
-        /// Network is hidden (does not broadcast its SSID)
-        #[arg(long)]
-        hidden: bool,
-        /// Attach this SSID to a profile's priority list
-        #[arg(long)]
-        to: Option<String>,
-        /// Position in the profile list (0 = highest priority)
-        #[arg(long)]
-        at: Option<usize>,
+        #[command(flatten)]
+        opts: AddOpts,
     },
     /// Remove a saved network (config + NetworkManager)
     Forget { ssid: String },
+    /// Remove NetworkManager wireless profiles whose SSID is no longer in
+    /// the breadcrumbs config
+    Prune {
+        /// Only list what would be removed
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Scan, pick, connect and save a network interactively
     Scan {
         /// Attach the saved network to this profile
@@ -144,7 +187,7 @@ fn active_profile(cfg: &Config, override_p: &Option<String>) -> String {
 }
 
 fn real_main(cli: Cli) -> Result<i32, String> {
-    let cmd = cli.cmd.unwrap_or(Cmd::Status);
+    let cmd = cli.cmd.unwrap_or(Cmd::Status { json: false });
 
     // `cd` and `install-service` don't need a parsed config first.
     if let Cmd::Cd { shell } = &cmd {
@@ -154,30 +197,46 @@ fn real_main(cli: Cli) -> Result<i32, String> {
     let mut cfg = Config::load()?;
 
     match cmd {
-        Cmd::Status => cmd_status(&cfg, &cli.profile),
-        Cmd::Init => {
-            let p = active_profile(&cfg, &cli.profile);
-            let outcome = flow::run(&mut cfg, &p);
-            print_outcome(&p, &outcome);
-            Ok(if outcome.ok() { 0 } else { 1 })
-        }
+        Cmd::Status { json } => cmd_status(&cfg, &cli.profile, json),
+        Cmd::Init { wait } => cmd_init(&mut cfg, &cli.profile, wait),
         Cmd::Watch { no_initial } => Ok(watch::run(cfg, !no_initial)),
         Cmd::Profile { action } => cmd_profile(&mut cfg, action),
-        Cmd::Detect { apply } => cmd_detect(&mut cfg, apply),
-        Cmd::Add {
-            ssid,
-            password,
-            hidden,
-            to,
-            at,
-        } => cmd_add(&mut cfg, ssid, password, hidden, to, at),
+        Cmd::Detect { apply, json } => cmd_detect(&mut cfg, apply, json),
+        Cmd::Add { ssid, opts } => cmd_add(&mut cfg, ssid, opts),
         Cmd::Forget { ssid } => cmd_forget(&mut cfg, &ssid),
+        Cmd::Prune { dry_run } => cmd_prune(&cfg, dry_run),
         Cmd::Scan { to } => cmd_scan(&mut cfg, to),
         Cmd::List { show_passwords } => cmd_list(&cfg, show_passwords),
         Cmd::Edit => cmd_edit(),
         Cmd::Doctor { full } => cmd_doctor(&cfg, &cli.profile, full),
         Cmd::InstallService { no_enable } => cmd_install_service(!no_enable),
         Cmd::Cd { .. } => unreachable!(),
+    }
+}
+
+fn cmd_init(cfg: &mut Config, override_p: &Option<String>, wait: u64) -> Result<i32, String> {
+    let p = active_profile(cfg, override_p);
+    let deadline = std::time::Instant::now() + Duration::from_secs(wait);
+    let mut attempt = 0;
+    loop {
+        // First attempt notifies normally (user-initiated); retries are
+        // quiet so a long --wait run doesn't spam notifications.
+        let outcome = if attempt == 0 {
+            flow::run(cfg, &p)
+        } else {
+            flow::run_quiet(cfg, &p)
+        };
+        if outcome.ok() {
+            print_outcome(&p, &outcome);
+            return Ok(0);
+        }
+        if wait == 0 || std::time::Instant::now() >= deadline {
+            print_outcome(&p, &outcome);
+            return Ok(1);
+        }
+        attempt += 1;
+        println!("{C_DIM}not connected yet — retrying in 3s…{C_RESET}");
+        std::thread::sleep(Duration::from_secs(3));
     }
 }
 
@@ -209,9 +268,33 @@ fn print_outcome(profile: &str, o: &flow::Outcome) {
     }
 }
 
-fn cmd_status(cfg: &Config, override_p: &Option<String>) -> Result<i32, String> {
+fn cmd_status(cfg: &Config, override_p: &Option<String>, json: bool) -> Result<i32, String> {
     let p = active_profile(cfg, override_p);
     let s = crate::status::gather(cfg, &p);
+
+    let healthy = s.internet
+        && s.iface.is_some()
+        && (!s.tailscale_required || s.tailscale.as_ref().map(|h| h.is_ok()).unwrap_or(false));
+
+    if json {
+        let tailscale = s.tailscale.as_ref().map(|h| h.state_str());
+        println!(
+            "{}",
+            serde_json::json!({
+                "profile": p,
+                "iface": s.iface,
+                "ssid": s.ssid,
+                "ip": s.ip,
+                "internet": s.internet,
+                "portal": s.portal,
+                "tailscale_required": s.tailscale_required,
+                "tailscale": tailscale,
+                "exit_node": s.exit_node,
+                "healthy": healthy,
+            })
+        );
+        return Ok(if healthy { 0 } else { 1 });
+    }
 
     let dot = |ok: bool| {
         if ok {
@@ -259,9 +342,6 @@ fn cmd_status(cfg: &Config, override_p: &Option<String>) -> Result<i32, String> 
         (None, _) => println!("  tailscale   {C_DIM}not installed{C_RESET}"),
     }
 
-    let healthy = s.internet
-        && s.iface.is_some()
-        && (!s.tailscale_required || s.tailscale.as_ref().map(|h| h.is_ok()).unwrap_or(false));
     println!(
         "  state       {}",
         if healthy {
@@ -301,47 +381,75 @@ fn cmd_profile(cfg: &mut Config, action: Option<ProfileCmd>) -> Result<i32, Stri
 }
 
 fn detect_profile(cfg: &Config) -> Option<String> {
-    let iface = nm::wifi_interface()?;
+    let iface = nm::wifi_interface_preferred(cfg.settings.interface.as_deref())?;
     nm::radio_on();
     nm::rescan(&iface, &[]);
-    let visible = nm::visible_ssids(&iface);
+    let visible = nm::visible_signals(&iface);
 
-    // Profiles are stored in a BTreeMap so iteration order is deterministic
-    // (alphabetical). The caller can rely on that for tie-breaking.
+    // Scored detection: the profile with the most matching markers wins, so
+    // a 2-marker match beats a 1-marker one. Profiles are stored in a
+    // BTreeMap, so ties resolve deterministically (alphabetically first).
+    let mut best: Option<(String, usize)> = None;
     for (name, profile) in &cfg.profiles {
         if profile.detect_ssids.is_empty() {
             continue;
         }
-        if profile
+        let count = profile
             .detect_ssids
             .iter()
-            .any(|s| visible.contains(s.as_str()))
-        {
-            return Some(name.clone());
+            .filter(|s| visible.contains_key(s.as_str()))
+            .count();
+        if count > 0 {
+            let better = match &best {
+                None => true,
+                Some((_, c)) => count > *c,
+            };
+            if better {
+                best = Some((name.clone(), count));
+            }
         }
     }
 
-    // Fall back to the default profile if no markers matched.
-    Some(cfg.settings.default_profile.clone())
+    best.map(|(p, _)| p).or_else(|| {
+        // Fall back to the default profile if no markers matched — but only
+        // if it actually exists: a stale `default_profile` name is a config
+        // error, not a detection result, and persisting it would wedge the
+        // watcher in UnknownProfile forever.
+        if cfg.profiles.contains_key(&cfg.settings.default_profile) {
+            Some(cfg.settings.default_profile.clone())
+        } else {
+            None
+        }
+    })
 }
 
-fn cmd_detect(cfg: &mut Config, apply: bool) -> Result<i32, String> {
+fn cmd_detect(cfg: &mut Config, apply: bool, json: bool) -> Result<i32, String> {
     match detect_profile(cfg) {
         Some(p) => {
-            println!("{p}");
+            if json && !apply {
+                println!("{}", serde_json::json!({ "profile": p }));
+                return Ok(0);
+            }
             if apply {
-                State {
-                    profile: p.clone(),
-                    updated: crate::util::timestamp(),
+                if json {
+                    println!("{}", serde_json::json!({ "profile": p }));
+                } else {
+                    println!("{p}");
                 }
-                .save()?;
+                // Route through state::set_profile (like the CLI and the
+                // bread bus do) so an unknown fallback is rejected with a
+                // proper error instead of being persisted as active.
+                state::set_profile(cfg, &p)?;
                 let outcome = flow::run(cfg, &p);
                 print_outcome(&p, &outcome);
                 return Ok(if outcome.ok() { 0 } else { 1 });
             }
+            println!("{p}");
             Ok(0)
         }
-        None => Err("could not detect a profile (no Wi-Fi adapter?)".into()),
+        None => Err("could not detect a profile (no Wi-Fi adapter, or no \
+                      profile matches and the default is misconfigured)"
+            .into()),
     }
 }
 
@@ -357,8 +465,9 @@ fn prompt_line(msg: &str) -> String {
 /// response) means "this network has no password" (open Wi-Fi) — normalize
 /// it to `None` right at the point of entry so it flows the same way a
 /// genuinely absent/cleared password does. Without this, `Some("")` would
-/// make `nm::connect_verbose` treat it as a (blank) secret rather than an
-/// open network, and the connect fails against a real open SSID.
+/// make `nm::connect_verbose` send an empty PSK in the settings payload,
+/// which NetworkManager treats as "secured with a blank password" rather
+/// than "open", and the connect fails against a real open SSID.
 fn non_empty(s: String) -> Option<String> {
     if s.is_empty() {
         None
@@ -381,28 +490,61 @@ fn prompt_secret(msg: &str) -> String {
     val
 }
 
-fn cmd_add(
-    cfg: &mut Config,
-    ssid: String,
-    password: Option<String>,
-    hidden: bool,
-    to: Option<String>,
-    at: Option<usize>,
-) -> Result<i32, String> {
+fn cmd_add(cfg: &mut Config, ssid: String, opts: AddOpts) -> Result<i32, String> {
+    let AddOpts {
+        password,
+        hidden,
+        dns,
+        eap,
+        identity,
+        ca_cert,
+        to,
+        at,
+    } = opts;
+    // `--dns ""` is the explicit "don't pin DNS" opt-out; normalize an
+    // absent flag to None (use the global setting).
+    let dns = match dns {
+        Some(s) if s.is_empty() => Some(String::new()),
+        Some(s) => Some(s),
+        None => None,
+    };
+    // For enterprise networks, the password is the 802.1x password.
     let password = match password {
         Some(p) => p,
+        None if eap.is_some() => prompt_secret(&format!("802.1x password for '{ssid}': ")),
         None => prompt_secret(&format!("Password for '{ssid}': ")),
     };
     let password = non_empty(password);
     match cfg.networks.iter_mut().find(|n| n.ssid == ssid) {
         Some(n) => {
             n.password = password;
-            n.hidden = hidden || n.hidden;
+            // `--hidden` / `--hidden=false` set the flag explicitly; when
+            // the flag is omitted, leave an existing entry's hidden state
+            // alone (a password-only update must not un-hide a network).
+            if let Some(h) = hidden {
+                n.hidden = h;
+            }
+            if dns.is_some() {
+                n.dns = dns;
+            }
+            if eap.is_some() {
+                n.eap = eap;
+            }
+            if identity.is_some() {
+                n.identity = identity;
+            }
+            if ca_cert.is_some() {
+                n.ca_cert = ca_cert;
+            }
         }
         None => cfg.networks.push(NetworkDef {
             ssid: ssid.clone(),
             password,
-            hidden,
+            dns,
+            eap,
+            identity,
+            ca_cert,
+            hidden: hidden.unwrap_or(false),
         }),
     }
     if let Some(prof_name) = to {
@@ -442,8 +584,50 @@ fn cmd_forget(cfg: &mut Config, ssid: &str) -> Result<i32, String> {
     Ok(0)
 }
 
+/// Remove NetworkManager wireless profiles whose SSID is no longer known to
+/// breadcrumbs (config `networks`, or any profile's priority list or
+/// bootstrap). `--dry-run` only lists. Returns the number removed.
+fn cmd_prune(cfg: &Config, dry_run: bool) -> Result<i32, String> {
+    let known: Vec<&str> = cfg
+        .networks
+        .iter()
+        .map(|n| n.ssid.as_str())
+        .chain(
+            cfg.profiles
+                .values()
+                .flat_map(|p| p.networks.iter().map(|s| s.as_str()).chain(p.bootstrap.iter().map(|s| s.as_str()))),
+        )
+        .collect();
+    let stale: Vec<(String, String)> = nm::wireless_profiles()
+        .into_iter()
+        .filter(|(_name, ssid)| !known.contains(&ssid.as_str()))
+        .collect();
+    if stale.is_empty() {
+        println!("{C_GREEN}nothing to prune{C_RESET}");
+        return Ok(0);
+    }
+    for (name, ssid) in &stale {
+        if dry_run {
+            println!("{C_DIM}would remove{C_RESET} {name} ({ssid})");
+        } else {
+            println!("{C_GREEN}removed{C_RESET} {name} ({ssid})");
+            let _ = nm::delete_connections_for_ssid(ssid);
+        }
+    }
+    Ok(0)
+}
+
 fn cmd_scan(cfg: &mut Config, to: Option<String>) -> Result<i32, String> {
-    let iface = nm::wifi_interface().ok_or("no Wi-Fi adapter")?;
+    // Validate `--to` up front, before any side effects (connecting is
+    // one): `add --to` errors on an unknown profile, so `scan --to` must
+    // too instead of silently saving a network that never gets attached.
+    if let Some(prof_name) = &to {
+        if !cfg.profiles.contains_key(prof_name) {
+            return Err(format!("unknown profile '{prof_name}'"));
+        }
+    }
+    let iface = nm::wifi_interface_preferred(cfg.settings.interface.as_deref())
+        .ok_or("no Wi-Fi adapter")?;
     nm::radio_on();
     nm::rescan(&iface, &[]);
     let entries = nm::scan_list(&iface);
@@ -477,9 +661,13 @@ fn cmd_scan(cfg: &mut Config, to: Option<String>) -> Result<i32, String> {
     let mut def = NetworkDef {
         ssid: ssid.clone(),
         password,
+        dns: None,
+        eap: None,
+        identity: None,
+        ca_cert: None,
         hidden: false,
     };
-    if !nm::connect(&iface, &def, cfg.settings.nmcli_wait, &cfg.settings.dns) {
+    if !nm::connect(&iface, &def, cfg.settings.connect_wait, &cfg.settings.dns) {
         return Err(format!("failed to connect to {ssid}"));
     }
     // A successful connect means NetworkManager now durably holds the PSK
@@ -502,12 +690,13 @@ fn cmd_scan(cfg: &mut Config, to: Option<String>) -> Result<i32, String> {
     Ok(0)
 }
 
-/// Mask a secret for display. Operates on chars (not bytes) so multi-byte
-/// UTF-8 passwords don't panic on a mid-character byte slice, and never
-/// echoes back any real character of the secret (previously the first byte
-/// was shown unmasked).
-fn mask(p: &str) -> String {
-    "•".repeat(p.chars().count().max(2))
+/// Mask a secret for display. Always renders the same fixed-length
+/// placeholder so the output reveals neither the secret's length nor any
+/// character of it (a fixed placeholder is what password managers show;
+/// length-hiding also means multi-byte UTF-8 passwords need no special
+/// handling).
+fn mask(_p: &str) -> String {
+    "•".repeat(8)
 }
 
 fn cmd_list(cfg: &Config, show_pw: bool) -> Result<i32, String> {
@@ -567,7 +756,15 @@ fn cmd_list(cfg: &Config, show_pw: bool) -> Result<i32, String> {
 fn cmd_edit() -> Result<i32, String> {
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nano".into());
     let path = config::config_path();
-    let status = Command::new(&editor)
+    // EDITOR values routinely carry arguments ("code -w", "subl -w"), so
+    // split on whitespace: the first token is the program, the rest are its
+    // arguments. The path stays a separate argument — never interpolated
+    // into a shell string — so it can't be used for injection.
+    let mut parts = editor.split_whitespace();
+    let prog = parts.next().unwrap_or("nano");
+    let mut cmd = Command::new(prog);
+    cmd.args(parts);
+    let status = cmd
         .arg(&path)
         .status()
         .map_err(|e| format!("launching {editor}: {e}"))?;
@@ -603,9 +800,9 @@ fn cmd_doctor(cfg: &Config, override_p: &Option<String>, full: bool) -> Result<i
     let s = crate::status::gather(cfg, &p);
     println!("{C_BOLD}breadcrumbs doctor{C_RESET}  (profile {p})");
     println!(
-        "  nmcli       {}",
-        if command_exists("nmcli") {
-            "present"
+        "  network-manager {}",
+        if nm::available() {
+            "present (D-Bus)"
         } else {
             "MISSING"
         }
@@ -685,7 +882,13 @@ fn exec_replace(prog: &str, dir: &std::path::Path) -> String {
 }
 
 fn cmd_install_service(enable: bool) -> Result<i32, String> {
-    let unit_dir = home_dir().join(".config/systemd/user");
+    // Honor XDG_CONFIG_HOME like the rest of the app: systemd --user units
+    // live in $XDG_CONFIG_HOME/systemd/user (default ~/.config/systemd/user).
+    let unit_dir = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".config"))
+        .join("systemd")
+        .join("user");
     std::fs::create_dir_all(&unit_dir)
         .map_err(|e| format!("creating {}: {e}", unit_dir.display()))?;
     let bin = std::env::current_exe().map_err(|e| format!("resolving current executable: {e}"))?;
@@ -693,7 +896,8 @@ fn cmd_install_service(enable: bool) -> Result<i32, String> {
     // session's DISPLAY/WAYLAND_DISPLAY/DBUS so notify-send and the Tailscale
     // login browser-open actually work. PATH is pinned because systemd --user
     // units do not get the login shell's PATH, and the watcher shells out to
-    // nmcli/tailscale/sudo/xdg-open by name.
+    // tailscale/sudo/xdg-open by name (NetworkManager is reached over D-Bus,
+    // so no nmcli is needed).
     let unit = format!(
         "[Unit]\n\
          Description=breadcrumbs Wi-Fi state machine watcher\n\
@@ -746,24 +950,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mask_empty_password() {
-        // len() == 0 <= 2 branch: still at least 2 dots so an empty saved
-        // password doesn't visually collapse to nothing in `list`.
-        assert_eq!(mask(""), "••");
-    }
-
-    #[test]
-    fn mask_short_passwords_reveal_nothing() {
-        assert_eq!(mask("a"), "••");
-        assert_eq!(mask("ab"), "••");
-    }
-
-    #[test]
-    fn mask_never_echoes_a_real_character() {
-        let pw = "hunter2";
-        let masked = mask(pw);
-        assert_eq!(masked, "•".repeat(pw.len()));
-        assert!(!masked.contains('h'), "masked output leaked the first char");
+    fn mask_is_fixed_length_regardless_of_secret() {
+        // Fixed-length masking: the output must reveal neither the secret's
+        // length nor any character of it — for empty, short, and long
+        // secrets alike.
+        assert_eq!(mask(""), "•".repeat(8));
+        assert_eq!(mask("a"), "•".repeat(8));
+        assert_eq!(mask("ab"), "•".repeat(8));
+        assert_eq!(mask("hunter2"), "•".repeat(8));
+        assert!(!mask("hunter2").contains('h'));
     }
 
     #[test]
@@ -773,14 +968,13 @@ mod tests {
         // emoji or accented character), since byte index 1 can land mid-char.
         let pw = "日本語パスワード";
         let masked = mask(pw);
-        assert_eq!(masked.chars().count(), pw.chars().count());
+        assert_eq!(masked, "•".repeat(8));
         assert!(masked.chars().all(|c| c == '•'));
     }
 
     #[test]
     fn mask_emoji_first_character_does_not_panic() {
         let pw = "🔒password123";
-        let masked = mask(pw);
-        assert_eq!(masked.chars().count(), pw.chars().count());
+        assert_eq!(mask(pw), "•".repeat(8));
     }
 }
