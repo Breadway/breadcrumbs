@@ -19,7 +19,7 @@ one branch removes the class of bug; there's nothing left that can fall out
 of sync.
 
 ## Remotes
-- `origin` — Forgejo (`git.breadway.dev` via Hestia, SSH) — authoritative.
+- `origin` — Forgejo (`git.breadway.dev`, SSH) — authoritative.
 - `github` — GitHub mirror. Push both when publishing. Agents push `origin` only; the GitHub remote auto-mirrors.
 
 ## Distribution

@@ -8,7 +8,7 @@ on:
 
 jobs:
   check:
-    runs-on: [self-hosted, hestia]
+    runs-on: [self-hosted]
     steps:
       - name: checkout
         run: |
