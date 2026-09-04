@@ -921,6 +921,44 @@ fn wifi_interface_preferred_falls_back_to_first_wifi_when_pref_missing() {
 }
 
 #[test]
+fn wifi_interface_preferred_skips_broken_device_instead_of_aborting_scan() {
+    // CRUMB-4 regression: a per-device D-Bus hiccup on one device (property
+    // fetch fails) must not abort the whole scan via `?` — it should just be
+    // skipped, leaving the real Wi-Fi device discoverable.
+    let _env = EnvSandbox::new();
+    let nm = fake_nm::shared();
+    nm.reset();
+    nm.add_broken_device();
+    nm.add_wifi_device("wlan0", 100);
+    nm.add_broken_device();
+
+    assert_eq!(
+        breadcrumbs::nm::wifi_interface_preferred(None).as_deref(),
+        Some("wlan0"),
+        "a broken device elsewhere in GetDevices() must not make the scan return None"
+    );
+}
+
+#[test]
+fn device_connected_skips_broken_device_ahead_of_real_one() {
+    // CRUMB-4 regression: `device_path` (used by the public `device_connected`)
+    // must skip a broken device instead of propagating its error out of the
+    // whole lookup, even when the broken device sorts ahead of the real one
+    // in GetDevices()'s order.
+    let _env = EnvSandbox::new();
+    let nm = fake_nm::shared();
+    nm.reset();
+    nm.add_broken_device();
+    // 100 == NM_DEVICE_STATE_ACTIVATED.
+    nm.add_wifi_device("wlan0", 100);
+
+    assert!(
+        breadcrumbs::nm::device_connected("wlan0"),
+        "a broken device ahead of the real one must not hide it from device_connected"
+    );
+}
+
+#[test]
 fn visible_signals_dedups_by_strongest_signal() {
     let _env = EnvSandbox::new();
     let (nm, dev) = setup_wifi(&[]);

@@ -96,6 +96,12 @@ pub struct FakeApData {
 #[derive(Debug, Default)]
 pub struct FakeState {
     pub devices: BTreeMap<String, FakeDeviceData>,
+    /// The order `GetDevices()` returns paths in — call order, not lexical
+    /// `devices` key order. Includes both real device paths and any
+    /// "broken" ones added via `add_broken_device` (which have no `devices`
+    /// entry and no D-Bus object registered, so any property fetch against
+    /// them fails, simulating a mid-scan D-Bus hiccup on that device).
+    pub device_order: Vec<String>,
     pub aps: BTreeMap<String, FakeApData>,
     pub dev_aps: HashMap<String, Vec<String>>,
     pub connections: BTreeMap<String, SettingsMap>,
@@ -210,7 +216,7 @@ struct FakeNm {
 impl FakeNm {
     async fn get_devices(&self) -> fdo::Result<Vec<OwnedObjectPath>> {
         let st = self.shared.state.lock().unwrap();
-        Ok(st.devices.keys().map(|p| obj(p)).collect())
+        Ok(st.device_order.iter().map(|p| obj(p)).collect())
     }
 
     #[zbus(property)]
@@ -733,6 +739,7 @@ impl FakeNmBus {
     pub fn reset(&self) {
         let mut st = self.state.lock().unwrap();
         st.devices.clear();
+        st.device_order.clear();
         st.aps.clear();
         st.dev_aps.clear();
         st.connections.clear();
@@ -769,6 +776,7 @@ impl FakeNmBus {
                     ip4: ip4_path.clone(),
                 },
             );
+            st.device_order.push(dev_path.clone());
             (dev_path, ip4_path)
         };
         self.server
@@ -808,6 +816,22 @@ impl FakeNmBus {
         Shared {
             state: self.state.clone(),
         }
+    }
+
+    /// Add a device path that appears in `GetDevices()` but has no D-Bus
+    /// object registered behind it — no `Device`/`Wireless` interface, and
+    /// no entry in `devices` either. Any property fetch against it (e.g.
+    /// `Interface`, `DeviceType`) fails with `UnknownObject`, exactly like a
+    /// device that NetworkManager briefly reports but that vanishes (or
+    /// hits some other per-device D-Bus hiccup) before the follow-up
+    /// property reads land. Returns its object path.
+    pub fn add_broken_device(&self) -> String {
+        let mut st = self.state.lock().unwrap();
+        let id = st.next_dev;
+        st.next_dev += 1;
+        let dev_path = format!("{DEVICES_PREFIX}/{id}-broken");
+        st.device_order.push(dev_path.clone());
+        dev_path
     }
 
     /// Add an access point to a device; returns its object path.
