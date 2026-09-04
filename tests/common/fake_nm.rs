@@ -829,7 +829,8 @@ impl FakeNmBus {
         let mut st = self.state.lock().unwrap();
         let id = st.next_dev;
         st.next_dev += 1;
-        let dev_path = format!("{DEVICES_PREFIX}/{id}-broken");
+        // D-Bus object path segments allow only [A-Za-z0-9_] — no `-`.
+        let dev_path = format!("{DEVICES_PREFIX}/{id}_broken");
         st.device_order.push(dev_path.clone());
         dev_path
     }
