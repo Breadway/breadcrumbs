@@ -62,7 +62,7 @@ fn resolve_candidates(cfg: &Config, p: &crate::config::Profile) -> Vec<NetworkDe
 /// its own plaintext copy: clear it and persist immediately so it doesn't sit
 /// on disk any longer than necessary. A no-op (no save) if the network has no
 /// local password to begin with.
-fn clear_password_if_used(cfg: &mut Config, ssid: &str) {
+pub(crate) fn clear_password_if_used(cfg: &mut Config, ssid: &str) {
     let Some(def) = cfg.networks.iter_mut().find(|n| n.ssid == ssid) else {
         return;
     };
@@ -96,7 +96,7 @@ fn learn_ssid(cfg: &mut Config, profile: &str, ssid: &str) {
 
 /// Try to connect + confirm the device actually landed on the *requested*
 /// SSID. Returns Ok(()) on success, Err(reason) on failure.
-fn connect_and_verify(iface: &str, def: &NetworkDef, cfg: &Config) -> Result<(), String> {
+pub(crate) fn connect_and_verify(iface: &str, def: &NetworkDef, cfg: &Config) -> Result<(), String> {
     nm::connect_verbose(iface, def, cfg.settings.connect_wait, def.effective_dns(&cfg.settings.dns))?;
     // Confirm the SSID, not just "device connected": NM autoconnect can win
     // a race and leave the device on a different network, and the wifi list
