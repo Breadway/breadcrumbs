@@ -74,6 +74,33 @@ impl Sandbox {
         c.output().expect("failed to spawn breadcrumbs")
     }
 
+    /// Like [`cmd`], but pipes `input` to the child's stdin — used for
+    /// `--password-stdin` and similar non-interactive input.
+    fn cmd_stdin(&self, args: &[&str], input: &str) -> std::process::Output {
+        use std::io::Write;
+        use std::process::Stdio;
+        let mut child = Command::new(BIN)
+            .args(args)
+            .env_clear()
+            .env("HOME", &self.root)
+            .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .env("XDG_STATE_HOME", self.root.join("state"))
+            .env("PATH", self.root.join("bin"))
+            .env("DBUS_SYSTEM_BUS_ADDRESS", &self._bus.addr)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn breadcrumbs");
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(input.as_bytes())
+            .expect("write to child stdin");
+        child.wait_with_output().expect("wait for breadcrumbs")
+    }
+
     fn config_file(&self) -> PathBuf {
         self.root.join("config/breadcrumbs/breadcrumbs.toml")
     }
@@ -236,6 +263,38 @@ fn add_with_multibyte_password_does_not_crash_list() {
         stderr(&list)
     );
     assert!(!stdout(&list).contains("日本語パスワード🔒"));
+}
+
+#[test]
+fn add_warns_when_password_given_positionally() {
+    // CRUMB-5 regression: the positional password form is kept for backward
+    // compat but must emit a loud deprecation warning pointing callers at a
+    // safer path, since it leaks the secret via argv / shell history.
+    let sb = Sandbox::new();
+    let o = sb.cmd(&["add", "CafeWifi", "hunter2"]);
+    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    assert!(
+        stderr(&o).contains("deprecated") && stderr(&o).contains("--password-stdin"),
+        "expected a deprecation warning pointing at --password-stdin, got: {}",
+        stderr(&o)
+    );
+}
+
+#[test]
+fn add_password_stdin_reads_secret_without_argv_or_warning() {
+    // CRUMB-5 regression: --password-stdin must work as a non-interactive,
+    // non-argv way to supply the password, with no deprecation warning.
+    let sb = Sandbox::new();
+    let o = sb.cmd_stdin(&["add", "CafeWifi", "--password-stdin"], "hunter2\n");
+    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    assert!(
+        !stderr(&o).contains("deprecated"),
+        "unexpected deprecation warning for --password-stdin: {}",
+        stderr(&o)
+    );
+
+    let shown = sb.cmd(&["list", "--show-passwords"]);
+    assert!(stdout(&shown).contains("hunter2"));
 }
 
 #[test]

@@ -10,7 +10,7 @@ breadcrumbs sits on top of NetworkManager's **D-Bus API** (`org.freedesktop.Netw
 - **Bootstrap + Tailscale gating** — connect to an interim network first, bring up Tailscale, then move to the target network
 - **Self-healing watch daemon** — monitors for drops, auto-recovers, reacts within seconds via NetworkManager D-Bus signals
 - **Auto-detection** — scans visible SSIDs and guesses your location from config-defined markers
-- **Credential handling** — a saved network's password is only needed the *first* time breadcrumbs connects to it. Once that connect succeeds, NetworkManager durably owns the credential (a new connection profile, or an updated PSK on an existing one), so breadcrumbs clears its own local copy and stops writing it to disk. Both config files are `0600` (owner-only); saved networks live in a separate `networks.toml` from settings/profiles (see [Configuration](#configuration)). Secrets are never exposed in a process command line: everything travels inside D-Bus `Update2`/`AddAndActivateConnection2` settings payloads, invisible to other local users via `/proc/<pid>/cmdline`.
+- **Credential handling** — a saved network's password is only needed the *first* time breadcrumbs connects to it. Once that connect succeeds, NetworkManager durably owns the credential (a new connection profile, or an updated PSK on an existing one), so breadcrumbs clears its own local copy and stops writing it to disk. Both config files are `0600` (owner-only); saved networks live in a separate `networks.toml` from settings/profiles (see [Configuration](#configuration)). Secrets are never exposed on the NetworkManager side of things: everything travels inside D-Bus `Update2`/`AddAndActivateConnection2` settings payloads, invisible to other local users via `/proc/<pid>/cmdline`. `breadcrumbs add` itself prompts interactively (no echo) by default, or reads the password from stdin with `--password-stdin` — the one remaining way to leak a password onto argv/shell history is the deprecated positional `add <ssid> <password>` form, kept only for backward compatibility and no longer documented here.
 - **Desktop notifications** via `notify-send` (optional)
 - **systemd user service** generation via `breadcrumbs install-service`
 
@@ -129,7 +129,7 @@ breadcrumbs [--profile <name>] <command>
 | `profile set <name>` | Switch profile (and apply it, unless `--no-apply`) |
 | `profile list` | List all profiles |
 | `detect [--apply] [--json]` | Guess profile from visible networks; optionally apply it |
-| `add <ssid> [password]` | Add or update a saved network (`--dns`, `--eap`, `--identity`, `--ca-cert`, `--hidden`, `--to`, `--at`) |
+| `add <ssid> [--password-stdin]` | Add or update a saved network; password is prompted for interactively (no echo) unless `--password-stdin` is given (`--dns`, `--eap`, `--identity`, `--ca-cert`, `--hidden`, `--to`, `--at`) |
 | `forget <ssid>` | Remove a network from config and NetworkManager |
 | `prune [--dry-run]` | Remove NetworkManager wireless profiles whose SSID is no longer in the config |
 | `scan [--to <profile>]` | Interactive scan, pick, connect and save |
@@ -154,8 +154,13 @@ breadcrumbs watch
 # Override profile for one run without persisting
 breadcrumbs --profile home init
 
-# Add a new network and attach it to a profile
+# Add a new network and attach it to a profile (prompts for the
+# password interactively, with echo off)
 breadcrumbs add "CoffeeShop5G" --to away
+
+# Add a network non-interactively, e.g. from a script (reads the
+# password as a single line from stdin — never put it on argv)
+echo "hunter2" | breadcrumbs add "CoffeeShop5G" --password-stdin
 
 # Detect and switch profile based on visible networks
 breadcrumbs detect --apply

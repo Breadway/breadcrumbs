@@ -42,8 +42,18 @@ struct Cli {
 /// CLI surface is unchanged while keeping `cmd_add`'s signature small.
 #[derive(clap::Args)]
 struct AddOpts {
-    /// Password (prompted if omitted)
+    /// Password (prompted if omitted).
+    ///
+    /// Deprecated: passing it here puts it on breadcrumbs' own argv and in
+    /// shell history (visible to co-resident users via `ps`/`/proc/<pid>/
+    /// cmdline`). Kept for backward compatibility only — use
+    /// `--password-stdin` or the interactive prompt instead.
     password: Option<String>,
+    /// Read the password from stdin (one line) instead of the command line
+    /// or the interactive prompt. For scripted/non-interactive callers that
+    /// want to avoid putting the password on argv or in shell history.
+    #[arg(long)]
+    password_stdin: bool,
     /// Network is hidden (does not broadcast its SSID).
     /// `--hidden` sets it; `--hidden=false` clears it on an existing
     /// entry; omitted leaves an existing entry's flag untouched.
@@ -461,6 +471,15 @@ fn prompt_line(msg: &str) -> String {
     s.trim_end_matches(['\n', '\r']).to_string()
 }
 
+/// Read a single line from stdin with no prompt printed and no echo
+/// suppression — used by `--password-stdin` for scripted/non-interactive
+/// callers that pipe the secret in directly.
+fn read_stdin_line() -> String {
+    let mut s = String::new();
+    let _ = std::io::stdin().lock().read_line(&mut s);
+    s.trim_end_matches(['\n', '\r']).to_string()
+}
+
 /// An empty string entered for a password (CLI arg or a blank prompt
 /// response) means "this network has no password" (open Wi-Fi) — normalize
 /// it to `None` right at the point of entry so it flows the same way a
@@ -493,6 +512,7 @@ fn prompt_secret(msg: &str) -> String {
 fn cmd_add(cfg: &mut Config, ssid: String, opts: AddOpts) -> Result<i32, String> {
     let AddOpts {
         password,
+        password_stdin,
         hidden,
         dns,
         eap,
@@ -501,6 +521,13 @@ fn cmd_add(cfg: &mut Config, ssid: String, opts: AddOpts) -> Result<i32, String>
         to,
         at,
     } = opts;
+    if password.is_some() {
+        eprintln!(
+            "warning: passing the Wi-Fi password on the command line is deprecated and \
+             leaks it via `ps`/`/proc/<pid>/cmdline` and shell history — use \
+             --password-stdin or the interactive prompt instead"
+        );
+    }
     // `--dns ""` is the explicit "don't pin DNS" opt-out; normalize an
     // absent flag to None (use the global setting).
     let dns = match dns {
@@ -511,6 +538,7 @@ fn cmd_add(cfg: &mut Config, ssid: String, opts: AddOpts) -> Result<i32, String>
     // For enterprise networks, the password is the 802.1x password.
     let password = match password {
         Some(p) => p,
+        None if password_stdin => read_stdin_line(),
         None if eap.is_some() => prompt_secret(&format!("802.1x password for '{ssid}': ")),
         None => prompt_secret(&format!("Password for '{ssid}': ")),
     };
