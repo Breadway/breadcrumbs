@@ -468,6 +468,50 @@ fn password_is_cleared_after_first_connect_and_never_sent_again() {
     );
 }
 
+#[test]
+fn join_connects_a_saved_network_without_a_password_argument() {
+    // `join` must work from config alone — no --password/positional arg
+    // exists on it at all, so there's nothing to check off argv here; this
+    // just proves the command actually activates the network.
+    let sb = Sandbox::new();
+    let nm = sb.nm();
+    let dev = nm.add_wifi_device("wlan0", 100);
+    nm.add_ap(&dev, "TestNet", 80, Security::Wpa2);
+
+    let add = sb.cmd(&["add", "TestNet", "hunter2"]);
+    assert!(add.status.success(), "stderr: {}", stderr(&add));
+
+    let join = sb.cmd(&["join", "TestNet"]);
+    assert!(join.status.success(), "stderr: {}", stderr(&join));
+    assert!(stdout(&join).contains("connected"));
+
+    let psk = {
+        let st = nm.state.lock().unwrap();
+        st.connections
+            .values()
+            .filter_map(|s| {
+                let sec = s.get("802-11-wireless-security")?;
+                sec.get("psk").and_then(|v| v.downcast_ref::<String>().ok())
+            })
+            .next()
+    };
+    assert_eq!(psk.as_deref(), Some("hunter2"), "NM profile must hold the PSK");
+
+    let networks = fs::read_to_string(sb.networks_file()).unwrap();
+    assert!(
+        !networks.contains("hunter2"),
+        "password should have been cleared from networks.toml: {networks}"
+    );
+}
+
+#[test]
+fn join_unknown_ssid_errors() {
+    let sb = Sandbox::new();
+    let join = sb.cmd(&["join", "NeverSaved"]);
+    assert!(!join.status.success());
+    assert!(stderr(&join).contains("no saved network"), "stderr: {}", stderr(&join));
+}
+
 // -----------------------------------------------------------------------
 // CLI-level coverage through fake NM + tailscale (item 3)
 // -----------------------------------------------------------------------

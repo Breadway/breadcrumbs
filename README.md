@@ -130,6 +130,7 @@ breadcrumbs [--profile <name>] <command>
 | `profile list` | List all profiles |
 | `detect [--apply] [--json]` | Guess profile from visible networks; optionally apply it |
 | `add <ssid> [password]` | Add or update a saved network (`--dns`, `--eap`, `--identity`, `--ca-cert`, `--hidden`, `--to`, `--at`) |
+| `join <ssid>` | Connect to an already-saved network right now, outside any profile. Takes no password — for GUI callers that already ran `add` |
 | `forget <ssid>` | Remove a network from config and NetworkManager |
 | `prune [--dry-run]` | Remove NetworkManager wireless profiles whose SSID is no longer in the config |
 | `scan [--to <profile>]` | Interactive scan, pick, connect and save |

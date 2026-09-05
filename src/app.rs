@@ -112,6 +112,12 @@ enum Cmd {
         #[command(flatten)]
         opts: AddOpts,
     },
+    /// Connect to an already-saved network by SSID, outside of any profile.
+    /// Takes no password — the secret was already persisted by `add`, so
+    /// this command never puts a secret on its own argv. For callers (e.g.
+    /// breadbar's "join network" dialog) that just ran `add` and now need
+    /// NetworkManager to actually activate the network.
+    Join { ssid: String },
     /// Remove a saved network (config + NetworkManager)
     Forget { ssid: String },
     /// Remove NetworkManager wireless profiles whose SSID is no longer in
@@ -203,6 +209,7 @@ fn real_main(cli: Cli) -> Result<i32, String> {
         Cmd::Profile { action } => cmd_profile(&mut cfg, action),
         Cmd::Detect { apply, json } => cmd_detect(&mut cfg, apply, json),
         Cmd::Add { ssid, opts } => cmd_add(&mut cfg, ssid, opts),
+        Cmd::Join { ssid } => cmd_join(&mut cfg, &ssid),
         Cmd::Forget { ssid } => cmd_forget(&mut cfg, &ssid),
         Cmd::Prune { dry_run } => cmd_prune(&cfg, dry_run),
         Cmd::Scan { to } => cmd_scan(&mut cfg, to),
@@ -559,6 +566,33 @@ fn cmd_add(cfg: &mut Config, ssid: String, opts: AddOpts) -> Result<i32, String>
     cfg.save()?;
     println!("{C_GREEN}saved{C_RESET} {ssid}");
     Ok(0)
+}
+
+/// Activate an already-saved network right now, independent of any profile.
+/// Deliberately takes no password argument: `add` is the only command that
+/// accepts a secret, and it never appears on this command's argv, so a
+/// caller can safely shell this out without any secret-handling of its own.
+fn cmd_join(cfg: &mut Config, ssid: &str) -> Result<i32, String> {
+    let net = cfg
+        .networks
+        .iter()
+        .find(|n| n.ssid == ssid)
+        .cloned()
+        .ok_or_else(|| format!("no saved network '{ssid}' — run `add` first"))?;
+    let iface = nm::wifi_interface_preferred(cfg.settings.interface.as_deref())
+        .ok_or_else(|| "no Wi-Fi adapter found".to_string())?;
+    nm::radio_on();
+    match flow::connect_and_verify(&iface, &net, cfg) {
+        Ok(()) => {
+            flow::clear_password_if_used(cfg, ssid);
+            println!("{C_GREEN}connected{C_RESET} {ssid}");
+            Ok(0)
+        }
+        Err(e) => {
+            println!("{C_RED}failed{C_RESET}: {e}");
+            Ok(1)
+        }
+    }
 }
 
 fn cmd_forget(cfg: &mut Config, ssid: &str) -> Result<i32, String> {
