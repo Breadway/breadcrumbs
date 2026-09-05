@@ -106,11 +106,16 @@ fn devices(conn: &Connection) -> Vec<OwnedObjectPath> {
 fn device_path(conn: &Connection, iface: &str) -> Option<OwnedObjectPath> {
     for d in devices(conn) {
         // Scope the proxy so its borrow of `d` ends before we move `d` out.
-        let name: String = {
-            let dev = proxy(conn, d.as_str(), DEV_IFACE)?;
-            dev.get_property("Interface").ok()?
+        // A failure here is per-device (e.g. a mid-scan D-Bus hiccup on an
+        // unrelated device) — skip just this one and keep scanning, rather
+        // than aborting the whole lookup via `?`.
+        let name: Option<String> = {
+            let Some(dev) = proxy(conn, d.as_str(), DEV_IFACE) else {
+                continue;
+            };
+            dev.get_property("Interface").ok()
         };
-        if name == iface {
+        if name.as_deref() == Some(iface) {
             return Some(d);
         }
     }
@@ -198,10 +203,18 @@ pub fn wifi_interface_preferred(pref: Option<&str>) -> Option<String> {
     let conn = connection()?;
     let mut wifi: Vec<String> = Vec::new();
     for d in devices(&conn) {
-        let dev = proxy(&conn, d.as_str(), DEV_IFACE)?;
-        let devtype: u32 = dev.get_property("DeviceType").ok()?;
+        // As in `device_path`: skip just this device on a per-device D-Bus
+        // failure instead of aborting the whole scan with `?`.
+        let Some(dev) = proxy(&conn, d.as_str(), DEV_IFACE) else {
+            continue;
+        };
+        let Ok(devtype) = dev.get_property::<u32>("DeviceType") else {
+            continue;
+        };
         if devtype == DEV_TYPE_WIFI {
-            let name: String = dev.get_property("Interface").ok()?;
+            let Ok(name) = dev.get_property::<String>("Interface") else {
+                continue;
+            };
             wifi.push(name);
         }
     }
