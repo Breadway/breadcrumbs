@@ -6,7 +6,7 @@
 # The real breadcrumbs.toml is gitignored and never committed.
 #
 # Saved networks (SSID + optional local password) live in a separate file,
-# networks.toml, in the same directory — not here. See
+# networks.toml, in the same directory, not here. See
 # networks.example.toml for its format; in practice you never hand-edit it,
 # `breadcrumbs add` / `scan` / `forget` manage it for you. This file is just
 # settings + the location profiles built from those saved networks.

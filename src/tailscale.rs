@@ -23,7 +23,7 @@ pub enum TsHealth {
     ExitNodeOffline,
     /// The profile requires an exit node but none is configured
     /// (`settings.exit_node` / per-profile `exit_node` empty). Cannot be
-    /// auto-fixed — the user must configure one.
+    /// auto-fixed; the user must configure one.
     NoExitNode,
     Error(String),
 }
@@ -274,7 +274,7 @@ fn exit_node_health(nodes: &[String], v: &Value) -> TsHealth {
         // The active exit node is one of ours but offline.
         TsHealth::ExitNodeOffline
     } else if any_online {
-        // Present + online but not selected — the flow will select it.
+        // Present + online but not selected: the flow will select it.
         TsHealth::Error("exit node not selected".into())
     } else if any_exists {
         TsHealth::ExitNodeOffline
@@ -292,7 +292,7 @@ pub fn ensure_exit_node(nodes: &[String]) -> TsHealth {
     }
     let eff = effective_nodes(nodes);
     if eff.is_empty() {
-        // Never run `tailscale set --exit-node=` with an empty node — that
+        // Never run `tailscale set --exit-node=` with an empty node: that
         // would clear the user's current exit-node selection. This is a
         // config error, surfaced as its own health state.
         return TsHealth::NoExitNode;
@@ -301,13 +301,13 @@ pub fn ensure_exit_node(nodes: &[String]) -> TsHealth {
     let v = match status_json() {
         Some(v) => v,
         None => {
-            // Daemon unreachable — usually *not running*: a stopped daemon
+            // Daemon unreachable, usually *not running*: a stopped daemon
             // prints its error to stderr and leaves stdout empty, which is
             // exactly why this branch used to be dead code (the
             // BackendState "Stopped" case below only fires when the daemon
             // is up but the backend is stopped). Try to bring it up before
             // giving up; `tailscale up` is idempotent when already running
-            // and fails fast (no sudo prompt — stdin is /dev/null) when
+            // and fails fast (no sudo prompt: stdin is /dev/null) when
             // the caller lacks permission to manage the daemon.
             let _ = run("tailscale", &["up"], Duration::from_secs(20));
             match status_json() {
@@ -322,7 +322,7 @@ pub fn ensure_exit_node(nodes: &[String]) -> TsHealth {
             login_and_open();
         }
         "Stopped" => {
-            // Daemon not running — bring it up, then check if it needs auth.
+            // Daemon not running: bring it up, then check if it needs auth.
             let _ = run("tailscale", &["up"], Duration::from_secs(20));
             if let Some(v2) = status_json() {
                 if matches!(backend_state(&v2).as_str(), "NeedsLogin" | "NoState") {
@@ -370,7 +370,7 @@ pub fn check(nodes: &[String]) -> TsHealth {
     }
     let eff = effective_nodes(nodes);
     if eff.is_empty() {
-        // Read-only check, so never runs `tailscale set` — an empty node is
+        // Read-only check, so never runs `tailscale set`: an empty node is
         // a config error, not something this probe can fix.
         return TsHealth::NoExitNode;
     }
@@ -491,7 +491,7 @@ mod tests {
 
     #[test]
     fn exit_node_status_online_only_applies_when_selected() {
-        // ExitNodeStatus.Online reflects the currently *active* exit node —
+        // ExitNodeStatus.Online reflects the currently *active* exit node:
         // it must not leak into the reported state of a peer that merely
         // matches by name but isn't the one actually selected.
         let v = json!({

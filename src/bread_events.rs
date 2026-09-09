@@ -1,4 +1,4 @@
-//! `bread.crumbs.*` event integration — optional, non-blocking. See
+//! `bread.crumbs.*` event integration: optional, non-blocking. See
 //! `EVENTS.md` at the repo root for the full contract. breadcrumbs works
 //! identically with or without breadd running; every call here is
 //! fire-and-forget (`BreadClient::emit` never blocks or errors this
@@ -11,7 +11,7 @@ use crate::config::Config;
 use crate::state;
 
 /// This app's id in bread's sibling-app namespace registry
-/// (`bread_shared::apps::KNOWN_APPS`) — events publish as `bread.crumbs.*`,
+/// (`bread_shared::apps::KNOWN_APPS`); events publish as `bread.crumbs.*`,
 /// commands arrive on `bread.command.crumbs.*`.
 pub const APP_ID: &str = "crumbs";
 
@@ -54,7 +54,7 @@ pub fn emit_health_changed(client: &BreadClient, ev: HealthChanged<'_>) {
     );
 }
 
-/// `bread.crumbs.network.changed` — the watch loop observed the active SSID
+/// `bread.crumbs.network.changed`: the watch loop observed the active SSID
 /// transition. `from` is `null` when there was no previous association.
 pub fn emit_network_changed(client: &BreadClient, from: Option<&str>, to: Option<&str>, profile: &str) {
     client.emit(
@@ -63,7 +63,7 @@ pub fn emit_network_changed(client: &BreadClient, from: Option<&str>, to: Option
     );
 }
 
-/// `bread.crumbs.tailscale.changed` — the Tailscale health state (or its
+/// `bread.crumbs.tailscale.changed`: the Tailscale health state (or its
 /// mere presence) changed between watch-loop ticks.
 pub fn emit_tailscale_changed(
     client: &BreadClient,
@@ -85,7 +85,7 @@ pub fn emit_tailscale_changed(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandAction {
     /// Persist this profile via [`state::set_profile`]. Applied on the
-    /// watch loop thread — the single owner of config/state file access —
+    /// watch loop thread (the single owner of config/state file access),
     /// never on the subscription thread, which would race the loop's own
     /// `Config::load`/`save`.
     SetProfile(String),
@@ -95,11 +95,11 @@ pub enum CommandAction {
 }
 
 /// Reacts to `bread.command.crumbs.*` verbs. Only `set_profile` maps to
-/// real, existing breadcrumbs functionality today — there is no pin/select
+/// real, existing breadcrumbs functionality today; there is no pin/select
 /// (or other) verb because breadcrumbs has no such concept. Unrecognized
 /// verbs are ignored, not stubbed as no-ops that pretend to succeed.
 ///
-/// This only *parses and validates* the command — it performs no file I/O
+/// This only *parses and validates* the command; it performs no file I/O
 /// (that would race the watch loop's own config access from a second
 /// thread). The returned [`CommandAction`] is forwarded to the loop, which
 /// applies it via [`apply_set_profile`].

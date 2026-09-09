@@ -136,7 +136,7 @@ impl Default for Settings {
 
 impl Settings {
     /// The profile a time-of-day schedule picks for `now_minutes` (minutes
-    /// since midnight), if any — first matching rule wins.
+    /// since midnight), if any; first matching rule wins.
     pub fn scheduled_profile(&self, now_minutes: u32) -> Option<String> {
         self.schedule
             .iter()
@@ -154,7 +154,7 @@ pub struct NetworkDef {
     /// clears this field and, on the next save, omits the key entirely
     /// rather than writing a plaintext copy that's no longer needed. `None`
     /// means either "NetworkManager already owns this secret" or "this is
-    /// an open (unsecured) network" — both cases behave the same way on
+    /// an open (unsecured) network": both cases behave the same way on
     /// connect: no PSK is sent to nmcli at all. When `Some`, the PSK is
     /// fed to `nmcli --ask` on stdin, never as an argv element.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -220,7 +220,7 @@ pub struct Config {
     pub settings: Settings,
     /// Saved networks (SSID + optional local password). Persisted to the
     /// separate `networks.toml` file (see [`networks_path`]), not to
-    /// `breadcrumbs.toml` — kept here, and still deserialized from a
+    /// `breadcrumbs.toml`, kept here, and still deserialized from a
     /// `[[networks]]` block if one is present in `breadcrumbs.toml`, purely
     /// for backward compatibility with configs written before the secrets
     /// split: an old-format file's inline networks load in on first read and
@@ -254,7 +254,7 @@ pub fn config_path() -> PathBuf {
 }
 
 /// Where saved networks (SSID + optional local password) live, split out of
-/// `breadcrumbs.toml`. Not meant to be hand-edited — managed via
+/// `breadcrumbs.toml`. Not meant to be hand-edited; managed via
 /// `breadcrumbs add` / `scan` / `forget`.
 pub fn networks_path() -> PathBuf {
     config_dir().join("networks.toml")
@@ -313,7 +313,7 @@ impl Config {
         let text =
             fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
         // May carry a legacy inline `[[networks]]` block (pre-split
-        // configs) — that's fine, see the field doc on `Config::networks`.
+        // configs); that's fine, see the field doc on `Config::networks`.
         let mut cfg: Config =
             toml::from_str(&text).map_err(|e| format!("parsing {}: {e}", path.display()))?;
 
@@ -325,7 +325,7 @@ impl Config {
                 .map_err(|e| format!("parsing {}: {e}", net_path.display()))?;
             // Merge, don't overwrite: a legacy config can still carry an
             // inline `[[networks]]` block, and those entries must survive
-            // even when networks.toml already exists — otherwise the next
+            // even when networks.toml already exists: otherwise the next
             // save() (which writes only networks.toml) would silently drop
             // hand-added inline networks. networks.toml wins on SSID
             // conflicts; inline-only entries are appended and migrated.
@@ -337,7 +337,7 @@ impl Config {
             }
             cfg.networks = merged;
         }
-        // else: no networks.toml yet — keep whatever legacy inline networks
+        // else: no networks.toml yet, keep whatever legacy inline networks
         // were read from breadcrumbs.toml above (or none, on a genuinely
         // fresh config). The next `save()` writes them to networks.toml and
         // stops writing them into breadcrumbs.toml, completing the migration.
@@ -387,7 +387,7 @@ impl Config {
 
 /// Any local Wi-Fi passwords still held (pre-first-connect, or a network
 /// breadcrumbs doesn't yet know NetworkManager owns) live in plaintext on
-/// disk — keep both config files owner-only. Best-effort: a failure here
+/// disk; keep both config files owner-only. Best-effort: a failure here
 /// isn't fatal to saving the config itself.
 #[cfg(unix)]
 fn secure_permissions(path: &std::path::Path) {
@@ -398,7 +398,7 @@ fn secure_permissions(path: &std::path::Path) {
 fn secure_permissions(_path: &std::path::Path) {}
 
 /// Initial skeleton networks generated for a brand-new installation.
-/// Passwords are intentionally blank — secrets never live in source.
+/// Passwords are intentionally blank: secrets never live in source.
 /// Users fill them via `breadcrumbs add`, `breadcrumbs scan`, or
 /// `breadcrumbs edit`, or by copying `breadcrumbs.example.toml`.
 fn canonical_networks() -> Vec<NetworkDef> {
@@ -533,7 +533,7 @@ mod tests {
     #[test]
     fn ensure_core_profiles_preserves_user_customized_core_profile() {
         // A user-edited "home" (custom SSIDs) must not be clobbered by the
-        // self-heal backfill — only genuinely *missing* core profiles should
+        // self-heal backfill; only genuinely *missing* core profiles should
         // be inserted.
         let mut profiles = BTreeMap::new();
         profiles.insert(
@@ -579,7 +579,7 @@ password = "pw""#;
 
     #[test]
     fn network_def_password_defaults_to_none_when_key_absent() {
-        // No `password` key at all — e.g. a network whose secret breadcrumbs
+        // No `password` key at all: e.g. a network whose secret breadcrumbs
         // already cleared after NetworkManager took it over.
         let text = r#"ssid = "Cafe"
 hidden = false"#;
@@ -591,7 +591,7 @@ hidden = false"#;
     fn network_def_omits_password_key_entirely_when_none() {
         // Round-tripping a cleared password must not write `password = ""`
         // (which would read back as "has an empty secret") or any other
-        // stand-in — the key should be gone, full stop.
+        // stand-in; the key should be gone, full stop.
         let n = NetworkDef {
             ssid: "Cafe".into(),
             password: None,
@@ -627,7 +627,7 @@ hidden = false"#;
     // is covered by `tests/cli.rs`'s Sandbox-isolated integration tests
     // (`networks_are_stored_separately_from_settings_and_profiles`,
     // `password_is_cleared_after_first_connect_and_never_sent_again`) rather
-    // than here — this module's tests stay pure per the project's test
+    // than here; this module's tests stay pure per the project's test
     // discipline (no real fs/env/subprocess access from a `#[cfg(test)]`
     // unit test).
 
@@ -650,7 +650,7 @@ hidden = false"#;
     #[test]
     fn config_with_only_settings_defaults_networks_and_profiles() {
         // A hand-written config that only sets `[settings]` shouldn't require
-        // `networks`/`profiles` sections — both must fall back to `#[serde(default)]`.
+        // `networks`/`profiles` sections; both must fall back to `#[serde(default)]`.
         let text = r#"[settings]
 dns = "9.9.9.9""#;
         let cfg: Config = toml::from_str(text).unwrap();
@@ -735,7 +735,7 @@ dns = "9.9.9.9""#;
                 to: "18:00".into(),
             },
         ];
-        // 10:00 matches both — the first rule (work) wins.
+        // 10:00 matches both; the first rule (work) wins.
         assert_eq!(cfg.settings.scheduled_profile(600), Some("work".into()));
         // Outside every window → no schedule applies.
         assert_eq!(cfg.settings.scheduled_profile(60), None);

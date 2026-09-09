@@ -2,7 +2,7 @@
 /target/
 
 # Secrets: live config holds plaintext Wi-Fi passwords (until NetworkManager
-# takes over each one on first connect — see README's "Credential handling").
+# takes over each one on first connect; see README's "Credential handling").
 # Keep local only; see breadcrumbs.example.toml / networks.example.toml for
 # the schemas.
 /breadcrumbs.toml

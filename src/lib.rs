@@ -1,7 +1,7 @@
 //! breadcrumbs library crate.
 //!
 //! All actual logic lives here; `src/main.rs` is a thin binary shim that
-//! parses no arguments itself — it just calls [`app::run`]. Splitting things
+//! parses no arguments itself; it just calls [`app::run`]. Splitting things
 //! this way means integration tests can link against `breadcrumbs` as an
 //! ordinary library crate and drive the real state machine (`flow::run`,
 //! `watch::classify`, …) in-process, instead of only being able to spawn the

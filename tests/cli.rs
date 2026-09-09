@@ -1,7 +1,7 @@
 //! End-to-end CLI tests. Each run is fully isolated: HOME / XDG dirs point at a
 //! throwaway tempdir, PATH is emptied so no real `tailscale`/`curl`/`date` is
 //! ever invoked, and a private `dbus-daemon` (optionally hosting a fake
-//! NetworkManager service — see `tests/common::fake_nm`) stands in for the
+//! NetworkManager service, see `tests/common::fake_nm`) stands in for the
 //! system bus so the binary's D-Bus calls never touch the host.
 
 mod common;
@@ -74,7 +74,7 @@ impl Sandbox {
         c.output().expect("failed to spawn breadcrumbs")
     }
 
-    /// Like [`cmd`], but pipes `input` to the child's stdin — used for
+    /// Like [`cmd`], but pipes `input` to the child's stdin, used for
     /// `--password-stdin` and similar non-interactive input.
     fn cmd_stdin(&self, args: &[&str], input: &str) -> std::process::Output {
         use std::io::Write;
@@ -259,7 +259,7 @@ fn add_with_multibyte_password_does_not_crash_list() {
     let list = sb.cmd(&["list"]);
     assert!(
         list.status.success(),
-        "list crashed on multibyte password — stderr: {}",
+        "list crashed on multibyte password; stderr: {}",
         stderr(&list)
     );
     assert!(!stdout(&list).contains("日本語パスワード🔒"));
@@ -331,7 +331,7 @@ fn forget_removes_network_from_config() {
     let o = sb.cmd(&["forget", "CafeWifi"]);
     assert!(o.status.success(), "stderr: {}", stderr(&o));
 
-    // Networks live in networks.toml (see the split-secrets test below) —
+    // Networks live in networks.toml (see the split-secrets test below);
     // that's the file that actually needs to lose the entry.
     let networks = fs::read_to_string(sb.networks_file()).unwrap();
     assert!(
@@ -389,7 +389,7 @@ fn install_service_no_enable_writes_valid_unit_file() {
     assert!(o.status.success(), "stderr: {}", stderr(&o));
 
     // The sandbox sets XDG_CONFIG_HOME=$root/config, so the unit lands
-    // under $XDG_CONFIG_HOME/systemd/user — the whole point of the fix is
+    // under $XDG_CONFIG_HOME/systemd/user: the whole point of the fix is
     // honoring XDG rather than hardcoding ~/.config.
     let unit_path = sb.root.join("config/systemd/user/breadcrumbs.service");
     assert!(unit_path.exists());
@@ -437,7 +437,7 @@ fn networks_are_stored_separately_from_settings_and_profiles() {
         "breadcrumbs.toml should hold settings/profiles only, not network credentials: {settings}"
     );
     // The profile's priority list (an SSID *reference*, not a credential)
-    // does still live in breadcrumbs.toml — that's expected and fine.
+    // does still live in breadcrumbs.toml; that's expected and fine.
     assert!(settings.contains("[profiles.away]"));
     assert!(settings.contains("CafeWifi"));
 
@@ -455,7 +455,7 @@ fn networks_are_stored_separately_from_settings_and_profiles() {
 #[test]
 fn add_with_empty_password_is_stored_as_no_password() {
     // An explicitly empty password (e.g. `add SSID ""`, or a blank response
-    // at the interactive prompt) means "this is an open network" — it must
+    // at the interactive prompt) means "this is an open network"; it must
     // round-trip as an absent `password` key, the same as a cleared one,
     // not as `password = ""` (which `nm::connect_verbose` would send as a
     // literal empty PSK and fail against a real open SSID).
@@ -529,7 +529,7 @@ fn password_is_cleared_after_first_connect_and_never_sent_again() {
 
 #[test]
 fn join_connects_a_saved_network_without_a_password_argument() {
-    // `join` must work from config alone — no --password/positional arg
+    // `join` must work from config alone: no --password/positional arg
     // exists on it at all, so there's nothing to check off argv here; this
     // just proves the command actually activates the network.
     let sb = Sandbox::new();
@@ -615,7 +615,7 @@ fn detect_picks_profile_whose_detect_ssids_are_visible() {
     nm.add_ap(&dev, "CorpWifi", 80, Security::Wpa2);
     sb.cmd(&["list"]); // bootstrap the default config (home/work/away)
 
-    // Attach a marker SSID to "work" so detection has something to match —
+    // Attach a marker SSID to "work" so detection has something to match:
     // the skeleton config ships with empty detect_ssids everywhere.
     let text = fs::read_to_string(sb.config_file()).unwrap();
     let patched = text.replace(
@@ -691,7 +691,7 @@ fn watch_interval_below_minimum_is_clamped_to_four() {
 #[test]
 fn legacy_inline_networks_merge_with_networks_toml_instead_of_dropping() {
     // A breadcrumbs.toml still carrying a legacy inline `[[networks]]` block
-    // must keep those networks even when networks.toml already exists — the
+    // must keep those networks even when networks.toml already exists; the
     // merge is completed (and the inline block dropped) on the next save.
     let sb = Sandbox::new();
     fs::create_dir_all(sb.root.join("config/breadcrumbs")).unwrap();
@@ -754,7 +754,7 @@ fn core_profiles_are_not_resurrected_once_config_is_user_owned() {
 #[test]
 fn legacy_config_without_profiles_gets_core_profiles_backfilled() {
     // Pre-ownership configs (no flag yet) still get the core profiles
-    // backfilled once — the self-heal that makes bare `[settings]` configs
+    // backfilled once: the self-heal that makes bare `[settings]` configs
     // usable.
     let sb = Sandbox::new();
     fs::create_dir_all(sb.root.join("config/breadcrumbs")).unwrap();

@@ -31,7 +31,7 @@ const PROPS_IFACE: &str = "org.freedesktop.DBus.Properties";
 pub enum Health {
     Up,
     DownNoNet,
-    /// Traffic is being intercepted — a captive/guest portal answered the
+    /// Traffic is being intercepted: a captive/guest portal answered the
     /// connectivity check with 200/301/302 instead of 204. Not something
     /// reconnecting fixes; the user must sign in.
     CaptivePortal,
@@ -44,7 +44,7 @@ pub enum Health {
 }
 
 impl Health {
-    /// Wire name used in `bread.crumbs.health.changed` — the Rust variant
+    /// Wire name used in `bread.crumbs.health.changed`: the Rust variant
     /// as a string, not a prettier label.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -146,7 +146,7 @@ fn recovery_due(last_flow_at: Option<Instant>, now: Instant, cooldown_secs: u64)
 }
 
 /// A wake signal for the watch loop. `SetProfile` is an *action* (applied on
-/// the loop thread), `LinkChurn` is just "go look" — the distinction keeps
+/// the loop thread), `LinkChurn` is just "go look"; the distinction keeps
 /// every config/state file access on the single loop thread, so the bread
 /// subscription thread can never race the loop's own `Config::load`/`save`.
 enum Wake {
@@ -155,7 +155,7 @@ enum Wake {
 }
 
 /// Whether a `PropertiesChanged` message on the NM root changes the
-/// `Connectivity` property of the NetworkManager interface — the signal
+/// `Connectivity` property of the NetworkManager interface: the signal
 /// that catches "still connected but lost the internet" (portal, DHCP
 /// failure) without waiting out the poll interval.
 fn props_changed_connectivity(msg: &zbus::Message) -> bool {
@@ -190,7 +190,7 @@ where
         // signal". Storing an `Option` instead of seeding with
         // `Instant::now() - 10s` avoids a panic: `Instant - Duration`
         // underflows (and panics) when the monotonic clock is younger than
-        // the offset, which happens if `watch` starts within ~10s of boot —
+        // the offset, which happens if `watch` starts within ~10s of boot,
         // exactly when the systemd unit (ordered after graphical-session)
         // tends to launch.
         let mut last: Option<Instant> = None;
@@ -200,7 +200,7 @@ where
                 let _ = tx.send(Wake::LinkChurn);
             }
         }
-        // Subscription died (NM or bus restart) — back off and resubscribe.
+        // Subscription died (NM or bus restart): back off and resubscribe.
         thread::sleep(Duration::from_secs(5));
     });
 }
@@ -212,10 +212,10 @@ where
 ///
 /// Watched signals:
 /// - `PropertiesChanged` on the NM root object, filtered to the
-///   `Connectivity` property — catches captive portals / DHCP failures that
+///   `Connectivity` property: catches captive portals / DHCP failures that
 ///   keep the device "connected" while losing the internet;
-/// - `DeviceAdded` / `DeviceRemoved` — hotplug;
-/// - `Device.StateChanged` on every Wi-Fi device — drops and reconnects.
+/// - `DeviceAdded` / `DeviceRemoved`: hotplug;
+/// - `Device.StateChanged` on every Wi-Fi device: drops and reconnects.
 fn spawn_nm_monitor(tx: mpsc::Sender<Wake>) {
     spawn_signal_watcher(
         tx.clone(),
@@ -241,7 +241,7 @@ fn wait_for_tick(rx: &Receiver<Wake>, dur: Duration) -> Option<Wake> {
     match rx.recv_timeout(dur) {
         Ok(first) => {
             // Drain any burst of churn signals so we don't re-fire
-            // immediately, but never drop a queued set_profile — it's an
+            // immediately, but never drop a queued set_profile: it's an
             // action, not a signal, and the earliest one wins.
             let mut pending = match &first {
                 Wake::SetProfile(_) => Some(first),
@@ -255,7 +255,7 @@ fn wait_for_tick(rx: &Receiver<Wake>, dur: Duration) -> Option<Wake> {
             pending
         }
         Err(mpsc::RecvTimeoutError::Timeout) => None,
-        // Monitor thread gone (shouldn't happen: we hold the sender) — fall
+        // Monitor thread gone (shouldn't happen: we hold the sender); fall
         // back to a plain sleep so we don't busy-spin.
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             thread::sleep(dur);
@@ -280,7 +280,7 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
     // background thread with its own reconnect/backoff loop). breadd being
     // absent or restarting is transparent: the subscription just quietly
     // stops delivering commands until it reconnects. The callback only
-    // *validates* the command and forwards an action through the channel —
+    // *validates* the command and forwards an action through the channel;
     // it never touches config/state files itself (that would race this
     // loop's own Config::load/save), so all file access stays on this one
     // thread.
@@ -342,10 +342,10 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
 
         // Suspend/resume: the D-Bus signal monitor sees nothing while the
         // machine sleeps, so a large wall-clock gap means the network state
-        // may have changed underneath us — allow an immediate recovery run
+        // may have changed underneath us; allow an immediate recovery run
         // instead of waiting out any remaining flow cooldown.
         if last_tick_at.elapsed() > prev_wait + RESUME_SLACK {
-            log("watch: large gap since last tick (suspend/resume?) — forcing recovery check");
+            log("watch: large gap since last tick (suspend/resume?), forcing recovery check");
             last_flow_at = None;
         }
 
@@ -354,7 +354,7 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
         // the grace window.
         if last_schedule_applied.as_deref() != Some(profile.as_str()) {
             // The persisted profile changed and it wasn't our own schedule
-            // switch — a manual set (CLI or bus). Start the grace window.
+            // switch: a manual set (CLI or bus). Start the grace window.
             if last_schedule_applied.is_some() {
                 manual_set_at = Some(Instant::now());
             }
@@ -448,7 +448,7 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
                 if transition {
                     notify(
                         "breadcrumbs: no Wi-Fi adapter",
-                        "Hardware issue — manual check needed.",
+                        "Hardware issue, manual check needed.",
                         Urgency::Critical,
                     );
                 }
@@ -456,7 +456,7 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
             }
             Health::UnknownProfile => {
                 // flow::run() is quiet from here, so surface the misconfig
-                // ourselves — once per transition/change, not every tick.
+                // ourselves, once per transition/change, not every tick.
                 if transition || profile_changed {
                     notify(
                         "breadcrumbs: unknown profile",
@@ -470,7 +470,7 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
                 if transition {
                     notify(
                         "breadcrumbs: captive portal detected",
-                        "Traffic is being intercepted — open a browser and sign in.",
+                        "Traffic is being intercepted, open a browser and sign in.",
                         Urgency::Normal,
                     );
                 }
@@ -493,7 +493,7 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
                 }
                 // Re-attempt periodically and on the transition into this
                 // state: login may have completed since the last attempt, or
-                // the user may have missed the browser window. Quiet — a
+                // the user may have missed the browser window. Quiet: a
                 // still-broken state must not re-notify on every retry.
                 if recovery_due(last_flow_at, Instant::now(), FLOW_COOLDOWN) {
                     let outcome = flow::run_quiet(&mut cfg, &profile);
@@ -515,7 +515,7 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
                 }
                 if recovery_due(last_flow_at, Instant::now(), FLOW_COOLDOWN) {
                     log(&format!(
-                        "watch: down ({:?}) profile={profile} ssid={:?} — running flow",
+                        "watch: down ({:?}) profile={profile} ssid={:?}, running flow",
                         health, ssid
                     ));
                     let outcome = flow::run_quiet(&mut cfg, &profile);
@@ -528,7 +528,7 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
                     };
                 } else {
                     log(&format!(
-                        "watch: down ({:?}) — cooldown, skipping flow",
+                        "watch: down ({:?}), cooldown, skipping flow",
                         health
                     ));
                 }
@@ -542,8 +542,8 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
         let dur = Duration::from_secs(base * mult as u64);
         prev_wait = dur;
         last_tick_at = Instant::now();
-        // Apply a queued set_profile on this thread — the single owner of
-        // config/state file access — and emit the confirmation. The next
+        // Apply a queued set_profile on this thread (the single owner of
+        // config/state file access) and emit the confirmation. The next
         // iteration's reload sees the new profile and recovers accordingly.
         if let Some(Wake::SetProfile(name)) = wait_for_tick(&rx, dur) {
             bread_events::apply_set_profile(&name);

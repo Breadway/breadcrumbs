@@ -20,7 +20,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ ! -f src/ci/build.sh ]; then
-            echo "::error::ci/build.sh is missing — bakery release builds must go through the shared CI wrapper"
+            echo "::error::ci/build.sh is missing; bakery release builds must go through the shared CI wrapper"
             exit 1
           fi
           cd src && bash ci/build.sh cargo build --release --locked || {
@@ -52,7 +52,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${MINISIGN_SEC_KEY:-}" ]; then
-            echo "::error::BAKERY_MINISIGN_SEC_KEY_PATH secret not set — refusing to regenerate index.json unsigned (would leave a stale signature mismatched against fresh content and break bakery for everyone)"
+            echo "::error::BAKERY_MINISIGN_SEC_KEY_PATH secret not set; refusing to regenerate index.json unsigned (would leave a stale signature mismatched against fresh content and break bakery for everyone)"
             exit 1
           fi
           rm -rf /tmp/bread-ecosystem-ci

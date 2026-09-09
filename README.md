@@ -2,15 +2,15 @@
 
 A profile-aware Wi-Fi state machine for Linux with Tailscale exit-node management and a self-healing watch daemon.
 
-breadcrumbs sits on top of NetworkManager's **D-Bus API** (`org.freedesktop.NetworkManager` on the system bus — no `nmcli` subprocesses) and manages your Wi-Fi based on **location profiles**. Switch between home, work, school, or any other context with a single command — it handles scanning, connecting, DNS pinning, and Tailscale setup automatically.
+breadcrumbs sits on top of NetworkManager's **D-Bus API** (`org.freedesktop.NetworkManager` on the system bus; no `nmcli` subprocesses) and manages your Wi-Fi based on **location profiles**. Switch between home, work, school, or any other context with a single command: it handles scanning, connecting, DNS pinning, and Tailscale setup automatically.
 
 ## Features
 
-- **Profile-based connection management** — define ordered network priority lists per location
-- **Bootstrap + Tailscale gating** — connect to an interim network first, bring up Tailscale, then move to the target network
-- **Self-healing watch daemon** — monitors for drops, auto-recovers, reacts within seconds via NetworkManager D-Bus signals
-- **Auto-detection** — scans visible SSIDs and guesses your location from config-defined markers
-- **Credential handling** — a saved network's password is only needed the *first* time breadcrumbs connects to it. Once that connect succeeds, NetworkManager durably owns the credential (a new connection profile, or an updated PSK on an existing one), so breadcrumbs clears its own local copy and stops writing it to disk. Both config files are `0600` (owner-only); saved networks live in a separate `networks.toml` from settings/profiles (see [Configuration](#configuration)). Secrets are never exposed on the NetworkManager side of things: everything travels inside D-Bus `Update2`/`AddAndActivateConnection2` settings payloads, invisible to other local users via `/proc/<pid>/cmdline`. `breadcrumbs add` itself prompts interactively (no echo) by default, or reads the password from stdin with `--password-stdin` — the one remaining way to leak a password onto argv/shell history is the deprecated positional `add <ssid> <password>` form, kept only for backward compatibility and no longer documented here.
+- **Profile-based connection management**: define ordered network priority lists per location
+- **Bootstrap + Tailscale gating**: connect to an interim network first, bring up Tailscale, then move to the target network
+- **Self-healing watch daemon**: monitors for drops, auto-recovers, reacts within seconds via NetworkManager D-Bus signals
+- **Auto-detection**: scans visible SSIDs and guesses your location from config-defined markers
+- **Credential handling**: a saved network's password is only needed the *first* time breadcrumbs connects to it. Once that connect succeeds, NetworkManager durably owns the credential (a new connection profile, or an updated PSK on an existing one), so breadcrumbs clears its own local copy and stops writing it to disk. Both config files are `0600` (owner-only); saved networks live in a separate `networks.toml` from settings/profiles (see [Configuration](#configuration)). Secrets are never exposed on the NetworkManager side of things: everything travels inside D-Bus `Update2`/`AddAndActivateConnection2` settings payloads, invisible to other local users via `/proc/<pid>/cmdline`. `breadcrumbs add` itself prompts interactively (no echo) by default, or reads the password from stdin with `--password-stdin`; the one remaining way to leak a password onto argv/shell history is the deprecated positional `add <ssid> <password>` form, kept only for backward compatibility and no longer documented here.
 - **Desktop notifications** via `notify-send` (optional)
 - **systemd user service** generation via `breadcrumbs install-service`
 
@@ -18,9 +18,9 @@ breadcrumbs sits on top of NetworkManager's **D-Bus API** (`org.freedesktop.Netw
 
 - Linux with NetworkManager running on the D-Bus system bus
 - Rust toolchain (to build from source)
-- `tailscale` (optional — only needed if any profile sets `tailscale = true`)
-- `notify-send` (optional — for desktop notifications)
-- `curl` (optional — used for connectivity checks, falls back to `ping`)
+- `tailscale` (optional, only needed if any profile sets `tailscale = true`)
+- `notify-send` (optional, for desktop notifications)
+- `curl` (optional, used for connectivity checks, falls back to `ping`)
 
 ## Installation
 
@@ -47,7 +47,7 @@ Config paths respect `$XDG_CONFIG_HOME` and `$XDG_STATE_HOME`.
 
 ### Config structure
 
-Settings and location profiles live in `breadcrumbs.toml` — the file people actually hand-edit or dotfile:
+Settings and location profiles live in `breadcrumbs.toml`, the file people actually hand-edit or dotfile:
 
 ```toml
 [settings]
@@ -85,7 +85,7 @@ Saved networks (SSID + optional local password) live separately, in `networks.to
 ```toml
 [[networks]]
 ssid = "MyHomeNetwork"
-password = "hunter2"  # optional — see "Credential handling" below
+password = "hunter2"  # optional, see "Credential handling" below
 hidden = false
 dns = "1.1.1.1"       # optional per-network DNS override; "" disables pinning
 
@@ -98,7 +98,7 @@ dns = "1.1.1.1"       # optional per-network DNS override; "" disables pinning
 # ca_cert = "/etc/ssl/certs/corp-ca.pem"   # optional
 ```
 
-`password` is only needed the first time breadcrumbs connects to a network. Once NetworkManager durably saves the credential, breadcrumbs clears its local copy and omits the key on the next save — an existing config with `password = "..."` still loads fine either way, no migration step needed. A config with `[[networks]]` still written inline in `breadcrumbs.toml` (from before this split) also still loads: it's read once, then migrated into `networks.toml` automatically on the next save.
+`password` is only needed the first time breadcrumbs connects to a network. Once NetworkManager durably saves the credential, breadcrumbs clears its local copy and omits the key on the next save; an existing config with `password = "..."` still loads fine either way, no migration step needed. A config with `[[networks]]` still written inline in `breadcrumbs.toml` (from before this split) also still loads: it's read once, then migrated into `networks.toml` automatically on the next save.
 
 ### Profiles
 
@@ -130,7 +130,7 @@ breadcrumbs [--profile <name>] <command>
 | `profile list` | List all profiles |
 | `detect [--apply] [--json]` | Guess profile from visible networks; optionally apply it |
 | `add <ssid> [--password-stdin]` | Add or update a saved network; password is prompted for interactively (no echo) unless `--password-stdin` is given (`--dns`, `--eap`, `--identity`, `--ca-cert`, `--hidden`, `--to`, `--at`) |
-| `join <ssid>` | Connect to an already-saved network right now, outside any profile. Takes no password — for GUI callers that already ran `add` |
+| `join <ssid>` | Connect to an already-saved network right now, outside any profile. Takes no password, for GUI callers that already ran `add` |
 | `forget <ssid>` | Remove a network from config and NetworkManager |
 | `prune [--dry-run]` | Remove NetworkManager wireless profiles whose SSID is no longer in the config |
 | `scan [--to <profile>]` | Interactive scan, pick, connect and save |
@@ -160,7 +160,7 @@ breadcrumbs --profile home init
 breadcrumbs add "CoffeeShop5G" --to away
 
 # Add a network non-interactively, e.g. from a script (reads the
-# password as a single line from stdin — never put it on argv)
+# password as a single line from stdin, never put it on argv)
 echo "hunter2" | breadcrumbs add "CoffeeShop5G" --password-stdin
 
 # Detect and switch profile based on visible networks
@@ -177,7 +177,7 @@ breadcrumbs install-service
 1. Polls health every `watch_interval` seconds (adaptive backoff on repeated failures)
 2. Reacts immediately to link-state changes via NetworkManager D-Bus signals (`Device.StateChanged`, `Connectivity` property changes, hotplug events)
 3. Runs `flow::run` (the connect state machine) on any detected drop
-4. Handles profile changes live — re-reads config and state on every tick
+4. Handles profile changes live: re-reads config and state on every tick
 5. Distinguishes captive portals from plain no-internet (a 200/301/302 instead
    of the 204 generate_204 returns) and tells you to sign in instead of
    pointlessly reconnecting
@@ -187,7 +187,7 @@ breadcrumbs install-service
    recovery check instead of waiting out the poll interval
 
 When a Tailscale profile is connected through a bootstrap network and the
-connectivity check is intercepted, the watcher stays put and notifies once —
+connectivity check is intercepted, the watcher stays put and notifies once;
 it does not churn reconnects against a portal.
 
 Install as a systemd user service:

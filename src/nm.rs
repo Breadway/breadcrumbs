@@ -1,5 +1,5 @@
 //! All NetworkManager access goes over its D-Bus API
-//! (`org.freedesktop.NetworkManager` on the system bus) — no `nmcli`
+//! (`org.freedesktop.NetworkManager` on the system bus): no `nmcli`
 //! subprocess and no terse-output parsing. The D-Bus API returns structured
 //! values (SSID as a byte array, signal strength as `u8`, device state as a
 //! `u32` enum), so there is nothing like the old `-t` escaping to get wrong.
@@ -11,7 +11,7 @@
 //! surface *why* a connect failed.
 //!
 //! The client connects with [`zbus::blocking::Connection::system`], which
-//! honors the standard `DBUS_SYSTEM_BUS_ADDRESS` environment variable — the
+//! honors the standard `DBUS_SYSTEM_BUS_ADDRESS` environment variable: the
 //! test suite uses that to point at a fake NetworkManager served on a
 //! private bus, with no test-only code paths in here.
 
@@ -49,8 +49,8 @@ const SEC_SAE: u32 = 0x400;
 const FLAG_TO_DISK: u32 = 0x1;
 
 /// A fresh connection to the system bus (or wherever `DBUS_SYSTEM_BUS_ADDRESS`
-/// points). Created per call — cheap relative to the subprocess the old code
-/// spawned — and immune to environment changes between calls.
+/// points). Created per call, cheap relative to the subprocess the old code
+/// spawned, and immune to environment changes between calls.
 fn connection() -> Option<Connection> {
     Connection::system().ok()
 }
@@ -107,7 +107,7 @@ fn device_path(conn: &Connection, iface: &str) -> Option<OwnedObjectPath> {
     for d in devices(conn) {
         // Scope the proxy so its borrow of `d` ends before we move `d` out.
         // A failure here is per-device (e.g. a mid-scan D-Bus hiccup on an
-        // unrelated device) — skip just this one and keep scanning, rather
+        // unrelated device), skip just this one and keep scanning, rather
         // than aborting the whole lookup via `?`.
         let name: Option<String> = {
             let Some(dev) = proxy(conn, d.as_str(), DEV_IFACE) else {
@@ -197,7 +197,7 @@ pub fn available() -> bool {
 }
 
 /// Find the Wi-Fi interface. When `pref` is `Some`, that exact device is
-/// used if present; otherwise (or if the preferred device is missing — e.g.
+/// used if present; otherwise (or if the preferred device is missing, e.g.
 /// an unplugged USB dongle) the first Wi-Fi device wins.
 pub fn wifi_interface_preferred(pref: Option<&str>) -> Option<String> {
     let conn = connection()?;
@@ -346,7 +346,7 @@ pub fn scan_list(iface: &str) -> Vec<ScanEntry> {
     out
 }
 
-/// Numeric rank of a signal string ("72" or "72 %" — the fake NM can emit
+/// Numeric rank of a signal string ("72" or "72 %", the fake NM can emit
 /// either), for the strongest-wins dedup.
 fn signal_rank(s: &str) -> i32 {
     s.trim()
@@ -507,8 +507,8 @@ fn wifi_settings(net: &NetworkDef, uuid: &str) -> SettingsMap {
         }
         if let Some(ca) = &net.ca_cert {
             // NM stores `802-1x.ca-cert` as a GBytes (`ay`). For a filesystem
-            // path we send the conventional `file://` URI — the same form
-            // `nmcli` persists when given a path — not a bare string.
+            // path we send the conventional `file://` URI, the same form
+            // `nmcli` persists when given a path, not a bare string.
             x1.insert(
                 "ca-cert".into(),
                 ov(Value::from(format!("file://{ca}").into_bytes())),
@@ -557,7 +557,7 @@ fn updated_settings_for(net: &NetworkDef, s: &mut SettingsMap) {
     wifi.insert("hidden".into(), ov(Value::from(net.hidden)));
 }
 
-/// RFC 4122 v4 UUID from `/dev/urandom` — used for the `connection.uuid` of
+/// RFC 4122 v4 UUID from `/dev/urandom`: used for the `connection.uuid` of
 /// newly created profiles. (NetworkManager would generate one itself if
 /// omitted, but being explicit matches `nmcli` and keeps the fake NM simple.)
 fn new_uuid() -> String {
@@ -613,7 +613,7 @@ fn enforce_dns(conn: &Connection, iface: &str, dns: &str) -> bool {
     ipv4.insert("ignore-auto-dns".into(), ov(Value::from(true)));
     ipv4.insert("dns".into(), ov(Value::from(vec![dns.to_string()])));
 
-    // Persist the change on the *profile* object via `Update2` — calling
+    // Persist the change on the *profile* object via `Update2`: calling
     // `Settings.AddConnection2` with the profile's own UUID would fail on
     // real NetworkManager (NM_SETTINGS_ERROR_UUID_EXISTS; duplicates are
     // rejected, not upserted).
@@ -659,7 +659,7 @@ pub fn connect(iface: &str, net: &NetworkDef, wait: u32, dns: &str) -> bool {
 /// secret transitions to `None` after its first successful use.
 ///
 /// The secret (when sent) travels inside the D-Bus `Update2`/`AddAndActivate
-/// Connection2` settings payload — never on a process argv line — so it is
+/// Connection2` settings payload, never on a process argv line, so it is
 /// not readable by other local users via `/proc/<pid>/cmdline` the way the
 /// old `nmcli ... psk <pw>` invocation was.
 pub fn connect_verbose(iface: &str, net: &NetworkDef, wait: u32, dns: &str) -> Result<(), String> {
@@ -678,7 +678,7 @@ pub fn connect_verbose(iface: &str, net: &NetworkDef, wait: u32, dns: &str) -> R
             // Update the existing profile in place via `Settings.Connection
             // .Update2`. `Settings.AddConnection2` with the profile's own
             // UUID would be rejected by real NetworkManager
-            // (NM_SETTINGS_ERROR_UUID_EXISTS — duplicates are not upserted).
+            // (NM_SETTINGS_ERROR_UUID_EXISTS: duplicates are not upserted).
             let conn_proxy = proxy(&conn, profile.as_str(), CONN_IFACE)
                 .ok_or_else(|| "NetworkManager Settings.Connection unavailable".to_string())?;
             let _: HashMap<String, OwnedValue> = conn_proxy
@@ -695,7 +695,7 @@ pub fn connect_verbose(iface: &str, net: &NetworkDef, wait: u32, dns: &str) -> R
         return Ok(());
     }
 
-    // No saved profile — create one (and activate it in one call).
+    // No saved profile: create one (and activate it in one call).
     let settings = wifi_settings(net, &new_uuid());
     let nm = nm_proxy(&conn).ok_or_else(|| "NetworkManager unavailable".to_string())?;
     let options: HashMap<String, Value> =

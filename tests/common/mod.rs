@@ -1,6 +1,6 @@
 //! Shared test infrastructure for in-process integration tests (as opposed
 //! to `tests/cli.rs`'s black-box `Sandbox`, which spawns the compiled
-//! binary). This module is `mod`-included by each test file that needs it —
+//! binary). This module is `mod`-included by each test file that needs it:
 //! see `tests/flow_watch.rs`.
 //!
 //! Two pieces:
@@ -8,7 +8,7 @@
 //! - [`FakeRunner`]: a `breadcrumbs::util::Runner` implementation driven by
 //!   rules ("if the program+args match this predicate, return this canned
 //!   `Output`"), which also records every invocation so a test can assert
-//!   exactly what was — or, just as importantly, was *not* — passed (e.g.
+//!   exactly what was (or, just as importantly, was *not*) passed (e.g.
 //!   that a password argument never reaches a fake subprocess).
 //! - [`EnvSandbox`]: real logic (`flow::run`, `watch::classify`) still does
 //!   its own best-effort file logging via `notify::log`, which resolves a
@@ -16,7 +16,7 @@
 //!   throwaway tempdir for the duration of a test so nothing lands in the
 //!   developer's real `~/.local/state/breadcrumbs`. Mutating process env is
 //!   inherently cross-test-within-this-binary racy, so it's guarded by a
-//!   process-wide mutex — tests using it serialize against each other but
+//!   process-wide mutex: tests using it serialize against each other but
 //!   not against unrelated tests (each `tests/*.rs` file is its own binary).
 //! - [`fake_nm`]: a real fake NetworkManager D-Bus service on a private
 //!   `dbus-daemon`. The production `nm` module talks to it over real D-Bus
@@ -60,7 +60,7 @@ type DynamicRule = (Matcher, Box<dyn Fn(&str, &[&str]) -> Output>);
 
 /// A canned, rule-based [`Runner`]. Rules are tried in registration order;
 /// the first whose matcher returns `true` supplies the response. No rule
-/// matching falls back to [`Output::failed`] — the same "closed" default the
+/// matching falls back to [`Output::failed`]: the same "closed" default the
 /// old empty-`PATH` sandbox relied on, so an un-anticipated call fails loud
 /// (a wrong exit code) rather than silently returning success.
 pub struct FakeRunner {
@@ -110,7 +110,7 @@ impl FakeRunner {
     }
 
     /// Register a rule whose *response* is computed at call time (rather
-    /// than canned), enabling stateful fakes — e.g. answering "which SSID is
+    /// than canned), enabling stateful fakes: e.g. answering "which SSID is
     /// active?" with the SSID of the most recently dialed connection.
     /// Dynamic rules are tried after the static ones.
     pub fn on_dynamic(
@@ -186,7 +186,7 @@ static SANDBOX_COUNTER: AtomicU32 = AtomicU32::new(0);
 /// tempdir for its lifetime, so any real filesystem side effect
 /// (`notify::log`'s best-effort log file, `Config::save`, …) that in-process
 /// logic performs during a test lands there instead of the developer's real
-/// home directory. Holds a process-wide lock for its lifetime — construct
+/// home directory. Holds a process-wide lock for its lifetime: construct
 /// one per test, drop it (or let it go out of scope) before the test ends.
 pub struct EnvSandbox {
     _guard: MutexGuard<'static, ()>,

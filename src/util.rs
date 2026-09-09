@@ -34,19 +34,19 @@ impl Output {
 /// (`nm.rs`, `tailscale.rs`, `status.rs`, `notify.rs`, `app.rs`) goes through
 /// the free functions below (`run`/`run_with_stdin`/`run_ok`/
 /// `command_exists`), which are thin wrappers dispatching to whatever
-/// `Runner` is currently installed in the thread-local slot — `RealRunner` by
-/// default.
+/// `Runner` is currently installed in the thread-local slot (`RealRunner` by
+/// default).
 ///
 /// Tests swap in a fake implementation via [`with_runner`] so real call
 /// chains (`flow::run`, `watch::classify`, …) can be driven in-process
 /// against canned output, with no subprocess ever spawned and full
-/// visibility into exactly what *would* have been executed — the natural
+/// visibility into exactly what *would* have been executed: the natural
 /// mechanism for asserting things like "no password ever reaches nmcli's
 /// argv on a repeat connect" (see the credential tests under `tests/`).
 ///
 /// A thread-local (rather than an explicit parameter threaded through every
 /// function) was chosen so the large existing call surface in `nm.rs` et al.
-/// didn't need every signature rewritten to carry a `&dyn Runner` — call
+/// didn't need every signature rewritten to carry a `&dyn Runner`; call
 /// sites are unchanged, only `util`'s internals dispatch differently. It's
 /// safe across `cargo test`'s parallel test threads because each thread gets
 /// its own independent slot, defaulting to `RealRunner`, so tests that don't
@@ -105,7 +105,7 @@ pub fn run_ok(prog: &str, args: &[&str], timeout: Duration) -> bool {
 }
 
 /// Swap the thread-local [`Runner`] for `runner` for the duration of `f`,
-/// restoring whatever was previously installed afterward — even if `f`
+/// restoring whatever was previously installed afterward, even if `f`
 /// panics, so a failing assertion inside a test can't leak a fake runner
 /// into whatever test happens to run next on this thread. This is the seam
 /// integration tests use to drive real logic without spawning subprocesses.
@@ -194,7 +194,7 @@ fn spawn_run(prog: &str, args: &[&str], stdin: Option<&str>, timeout: Duration) 
 }
 
 /// Current local "HH:MM" (24h), for the time-of-day schedule. `None` if the
-/// clock can't be read — the schedule is skipped, never guessed.
+/// clock can't be read: the schedule is skipped, never guessed.
 pub fn local_hhmm() -> Option<String> {
     let o = run("date", &["+%H:%M"], Duration::from_secs(2));
     if o.success {

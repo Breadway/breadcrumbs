@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Delegates to bread-ecosystem's shared CI build image/script, pinned to
-# the commit in ci/bread-ecosystem.rev — not `main`. bread-ecosystem's CI
+# the commit in ci/bread-ecosystem.rev, not `main`. bread-ecosystem's CI
 # files now affect every product's release pipeline, so bumping the pin
 # is a deliberate act instead of silent drift (see the bread-theme test
 # that broke here for exactly that reason, before it was pinned by rev).

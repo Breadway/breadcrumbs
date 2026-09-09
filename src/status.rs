@@ -7,7 +7,7 @@ use crate::util::{command_exists, run};
 
 /// Connectivity verdict. `Portal` is the interesting case: an HTTP response
 /// arrived (200/301/302) but it wasn't the 204 the generate_204 endpoint
-/// returns for genuine internet — the classic captive/guest-portal
+/// returns for genuine internet: the classic captive/guest-portal
 /// signature, and the reason `classify` can tell "no internet at all" from
 /// "internet but intercepted".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,17 +1,17 @@
 //! A faithful fake NetworkManager served as a real D-Bus service on a
 //! private `dbus-daemon`, so the production `nm` module (a pure zbus client
 //! against `org.freedesktop.NetworkManager` on the system bus) can be
-//! exercised end-to-end — real D-Bus marshalling, real property reads, real
-//! method calls — with zero test-only code paths in `src/`.
+//! exercised end-to-end (real D-Bus marshalling, real property reads, real
+//! method calls) with zero test-only code paths in `src/`.
 //!
 //! Two ways to use it:
 //!
-//! - [`launch_private`] — starts a fresh private daemon + fake NM and
+//! - [`launch_private`]: starts a fresh private daemon + fake NM and
 //!   returns a [`FakeNmBus`] handle. The caller passes
 //!   `DBUS_SYSTEM_BUS_ADDRESS=<addr>` to any subprocess (the CLI sandbox) so
 //!   the binary's `Connection::system()` lands on this bus. Independent per
 //!   test → safe to run in parallel.
-//! - [`shared`] — one process-wide fake NM bus pointed at by the process
+//! - [`shared`]: one process-wide fake NM bus pointed at by the process
 //!   env var (in-process tests can't set per-test env safely). Tests using
 //!   it must serialize against each other, which the returned guard does.
 //!
@@ -96,7 +96,7 @@ pub struct FakeApData {
 #[derive(Debug, Default)]
 pub struct FakeState {
     pub devices: BTreeMap<String, FakeDeviceData>,
-    /// The order `GetDevices()` returns paths in — call order, not lexical
+    /// The order `GetDevices()` returns paths in: call order, not lexical
     /// `devices` key order. Includes both real device paths and any
     /// "broken" ones added via `add_broken_device` (which have no `devices`
     /// entry and no D-Bus object registered, so any property fetch against
@@ -393,7 +393,7 @@ impl FakeSettings {
             let mut st = self.shared.state.lock().unwrap();
             st.calls.push("AddConnection2".into());
             // Real NetworkManager rejects a duplicate UUID with
-            // NM_SETTINGS_ERROR_UUID_EXISTS — it does NOT upsert. Existing
+            // NM_SETTINGS_ERROR_UUID_EXISTS: it does NOT upsert. Existing
             // profiles must be edited via Settings.Connection.Update2; model
             // that here so a client regression fails loudly.
             if st.connections.values().any(|s| conn_id(s) == conn_id(&settings)) {
@@ -635,7 +635,7 @@ impl Drop for Daemon {
 static DBUS_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Start a private `dbus-daemon` with permissive policies. Nothing is
-/// registered on it — attach the fake NM with [`serve_on`] if the test
+/// registered on it: attach the fake NM with [`serve_on`] if the test
 /// needs NetworkManager to be present.
 pub fn launch_daemon() -> Daemon {
     let n = DBUS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -819,7 +819,7 @@ impl FakeNmBus {
     }
 
     /// Add a device path that appears in `GetDevices()` but has no D-Bus
-    /// object registered behind it — no `Device`/`Wireless` interface, and
+    /// object registered behind it: no `Device`/`Wireless` interface, and
     /// no entry in `devices` either. Any property fetch against it (e.g.
     /// `Interface`, `DeviceType`) fails with `UnknownObject`, exactly like a
     /// device that NetworkManager briefly reports but that vanishes (or
@@ -829,7 +829,7 @@ impl FakeNmBus {
         let mut st = self.state.lock().unwrap();
         let id = st.next_dev;
         st.next_dev += 1;
-        // D-Bus object path segments allow only [A-Za-z0-9_] — no `-`.
+        // D-Bus object path segments allow only [A-Za-z0-9_], no `-`.
         let dev_path = format!("{DEVICES_PREFIX}/{id}_broken");
         st.device_order.push(dev_path.clone());
         dev_path
@@ -999,7 +999,7 @@ static SHARED: OnceLock<Mutex<SharedBus>> = OnceLock::new();
 /// The process-wide fake NM bus for in-process tests. The env var
 /// `DBUS_SYSTEM_BUS_ADDRESS` is pointed at it once, so the production
 /// `nm` module (which uses `Connection::system()`) reaches it with zero
-/// test seams. Tests using this must serialize against each other — the
+/// test seams. Tests using this must serialize against each other: the
 /// returned guard holds the bus's lock for its whole lifetime.
 pub struct SharedNm {
     guard: MutexGuard<'static, SharedBus>,
@@ -1024,7 +1024,7 @@ pub fn shared() -> SharedNm {
 }
 
 /// Convenience guard used by tests that only need the bus available (no
-/// state control) — e.g. classify tests that merely observe "no adapter".
+/// state control), e.g. classify tests that merely observe "no adapter".
 /// Ensures the shared bus is up (and the env var set) before any `nm`
 /// call happens.
 pub fn ensure_shared() -> SharedNm {

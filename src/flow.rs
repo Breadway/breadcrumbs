@@ -32,7 +32,7 @@ impl Outcome {
 
 /// Resolve a profile's priority list to concrete network definitions.
 ///
-/// Returns owned clones rather than borrows of `cfg` — small structs, and it
+/// Returns owned clones rather than borrows of `cfg`: small structs, and it
 /// decouples the result's lifetime from `cfg` so callers (namely [`run`]) can
 /// still mutate `cfg` (to clear a used password and persist it) while a
 /// candidate from this list is being acted on.
@@ -56,7 +56,7 @@ fn resolve_candidates(cfg: &Config, p: &crate::config::Profile) -> Vec<NetworkDe
 }
 
 /// A network was just connected to using a local password, and NetworkManager
-/// now durably holds that secret — either in a freshly created connection
+/// now durably holds that secret: either in a freshly created connection
 /// profile (`device wifi connect --ask`) or an existing one whose PSK we just
 /// supplied via `--ask connection up`. Either way breadcrumbs no longer needs
 /// its own plaintext copy: clear it and persist immediately so it doesn't sit
@@ -100,15 +100,15 @@ pub(crate) fn connect_and_verify(iface: &str, def: &NetworkDef, cfg: &Config) ->
     nm::connect_verbose(iface, def, cfg.settings.connect_wait, def.effective_dns(&cfg.settings.dns))?;
     // Confirm the SSID, not just "device connected": NM autoconnect can win
     // a race and leave the device on a different network, and the wifi list
-    // can lag activation by a moment — so poll briefly before giving up.
+    // can lag activation by a moment, so poll briefly before giving up.
     for _ in 0..8 {
         match nm::active_ssid(iface) {
-            // Explicitly on the requested network — success.
+            // Explicitly on the requested network: success.
             Some(active) if active == def.ssid => return Ok(()),
-            // Associated with a *different* network — the failure this
+            // Associated with a *different* network: the failure this
             // check exists to catch.
             Some(_) => break,
-            // Scan list stale right after activation — keep polling while
+            // Scan list stale right after activation: keep polling while
             // the device is at least connected.
             None => {
                 if !nm::device_connected(iface) {
@@ -128,7 +128,7 @@ pub fn run(cfg: &mut Config, profile_name: &str) -> Outcome {
 }
 
 /// Same state machine, but suppresses desktop notifications. Used by the
-/// watch loop, which does its own transition-gated notifications — without
+/// watch loop, which does its own transition-gated notifications: without
 /// this, a persistent failure (e.g. a stopped Tailscale daemon) would
 /// re-notify on every recovery retry instead of once per state change.
 pub fn run_quiet(cfg: &mut Config, profile_name: &str) -> Outcome {
@@ -139,7 +139,7 @@ pub fn run_quiet(cfg: &mut Config, profile_name: &str) -> Outcome {
 ///
 /// Takes `cfg` mutably: a successful connect that used a local password
 /// clears that network's `password` field and persists the config
-/// immediately (see [`clear_password_if_used`]) — this is the only way that
+/// immediately (see [`clear_password_if_used`]); this is the only way that
 /// clearing happens for the `init` / `profile set --apply` / `detect --apply`
 /// commands and the watch loop, all of which route through here.
 fn run_inner(cfg: &mut Config, profile_name: &str, notify_user: bool) -> Outcome {
@@ -163,7 +163,7 @@ fn run_inner(cfg: &mut Config, profile_name: &str, notify_user: bool) -> Outcome
             if notify_user {
                 notify(
                     "breadcrumbs: no Wi-Fi adapter",
-                    "Hardware issue — Wi-Fi device not found. Manual check needed.",
+                    "Hardware issue: Wi-Fi device not found. Manual check needed.",
                     Urgency::Critical,
                 );
             }
@@ -210,7 +210,7 @@ fn run_inner(cfg: &mut Config, profile_name: &str, notify_user: bool) -> Outcome
                                 clear_password_if_used(cfg, &bdef.ssid);
                             }
                             Err(e) => {
-                                log(&format!("bootstrap connect failed: {} — {e}", bdef.ssid))
+                                log(&format!("bootstrap connect failed: {} ({e})", bdef.ssid))
                             }
                         }
                     } else {
@@ -230,7 +230,7 @@ fn run_inner(cfg: &mut Config, profile_name: &str, notify_user: bool) -> Outcome
                 notify(
                     "Tailscale Error",
                     &format!(
-                        "{} — staying on {}",
+                        "{}: staying on {}",
                         ts.describe(),
                         ssid.clone().unwrap_or_else(|| "Wi-Fi".into())
                     ),
@@ -278,7 +278,7 @@ fn run_inner(cfg: &mut Config, profile_name: &str, notify_user: bool) -> Outcome
                     note,
                 };
             }
-            Err(e) => log(&format!("connect failed (visible): {} — {e}", def.ssid)),
+            Err(e) => log(&format!("connect failed (visible): {} ({e})", def.ssid)),
         }
     }
     // Pass 2: hidden networks we couldn't see in the scan.
@@ -300,7 +300,7 @@ fn run_inner(cfg: &mut Config, profile_name: &str, notify_user: bool) -> Outcome
                         note,
                     };
                 }
-                Err(e) => log(&format!("connect failed (hidden): {} — {e}", def.ssid)),
+                Err(e) => log(&format!("connect failed (hidden): {} ({e})", def.ssid)),
             }
         }
     }
@@ -327,7 +327,7 @@ fn run_inner(cfg: &mut Config, profile_name: &str, notify_user: bool) -> Outcome
                         clear_password_if_used(cfg, &bdef.ssid);
                     }
                     Err(e) => {
-                        log(&format!("bootstrap reconnect failed: {} — {e}", bdef.ssid));
+                        log(&format!("bootstrap reconnect failed: {} ({e})", bdef.ssid));
                         on_bootstrap = false;
                     }
                 }
@@ -335,9 +335,9 @@ fn run_inner(cfg: &mut Config, profile_name: &str, notify_user: bool) -> Outcome
         }
         if on_bootstrap {
             let reason = if any_attempted {
-                format!("target network connect failed — staying on {bs_ssid} (Tailscale OK)")
+                format!("target network connect failed: staying on {bs_ssid} (Tailscale OK)")
             } else {
-                format!("target network not in range — staying on {bs_ssid} (Tailscale OK)")
+                format!("target network not in range: staying on {bs_ssid} (Tailscale OK)")
             };
             if notify_user {
                 notify("breadcrumbs: using bootstrap", &reason, Urgency::Normal);
@@ -385,7 +385,7 @@ fn finish_connected(ssid: &str, profile: &str, note: &Option<String>, notify_use
             if notify_user {
                 notify(
                     "breadcrumbs: connected (degraded)",
-                    &format!("{ssid} ({profile}) — {n}"),
+                    &format!("{ssid} ({profile}): {n}"),
                     Urgency::Normal,
                 );
             }

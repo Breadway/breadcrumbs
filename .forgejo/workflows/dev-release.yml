@@ -1,7 +1,7 @@
 name: dev release
 
 # Publishes a dev-track build on every push to `main` (the trunk
-# branch — there is no separate `dev` branch). See bread-ecosystem's
+# branch; there is no separate `dev` branch). See bread-ecosystem's
 # docs/release-channels.md for the release-track policy this is part of.
 on:
   push:
@@ -26,7 +26,7 @@ jobs:
           set -euo pipefail
           cd src
           # Base the dev version off the latest published stable tag,
-          # not Cargo.toml — Cargo.toml can go stale relative to the last
+          # not Cargo.toml: Cargo.toml can go stale relative to the last
           # real release (seen in practice: breadbox/breadpad/breadcrumbs/
           # breadpaper), which would make a dev build sort as OLDER than
           # what's already installed and bakery would correctly refuse it.
@@ -57,7 +57,7 @@ jobs:
           cp src/bakery.toml "${PKG_DIR}/bakery.toml"
           ln -sfn "${VERSION}" "/srv/breadway-dl/dev/breadcrumbs/latest"
 
-      # No GitHub Release upload — dev, like the other non-stable track,
+      # No GitHub Release upload: dev, like the other non-stable track,
       # is only distributed via dl.breadway.dev/dev/.
       - name: regenerate dev index.json
         env:
@@ -65,7 +65,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${MINISIGN_SEC_KEY:-}" ]; then
-            echo "::error::BAKERY_MINISIGN_SEC_KEY_PATH secret not set — refusing to regenerate dev index.json unsigned (would leave a stale signature mismatched against fresh content and break bakery for everyone on the dev track)"
+            echo "::error::BAKERY_MINISIGN_SEC_KEY_PATH secret not set; refusing to regenerate dev index.json unsigned (would leave a stale signature mismatched against fresh content and break bakery for everyone on the dev track)"
             exit 1
           fi
           rm -rf /tmp/bread-ecosystem-ci-* 2>/dev/null || true

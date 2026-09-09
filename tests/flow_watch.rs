@@ -104,7 +104,7 @@ fn tailscale_json_missing() -> &'static str {
 }
 
 // ---------------------------------------------------------------------
-// flow::run — candidate priority (pass 1 / pass 2)
+// flow::run: candidate priority (pass 1 / pass 2)
 // ---------------------------------------------------------------------
 
 #[test]
@@ -141,7 +141,7 @@ fn flow_run_connects_to_first_visible_candidate_in_priority_order() {
     );
 
     // The password used for the winning connect is now NM's problem, not
-    // breadcrumbs' — cleared and (via clear_password_if_used) persisted.
+    // breadcrumbs': cleared and (via clear_password_if_used) persisted.
     assert_eq!(cfg.network("First").unwrap().password, None);
     // Never touched, so its password is untouched too.
     assert_eq!(
@@ -160,7 +160,7 @@ fn flow_run_pass2_falls_back_to_hidden_candidate_not_in_scan() {
 
     let mut cfg = base_config();
     // "Ghost" is neither visible nor hidden, so pass 1 *and* pass 2 both
-    // skip it outright — it should never be dialed.
+    // skip it outright: it should never be dialed.
     cfg.networks = vec![net("Ghost", Some("pw-ghost")), hidden_net("Shadow", Some("pw-shadow"))];
     cfg.profiles.insert(
         "away".into(),
@@ -205,7 +205,7 @@ fn flow_run_unknown_profile_short_circuits_before_touching_nm() {
 }
 
 // ---------------------------------------------------------------------
-// flow::run — bootstrap + Tailscale gating
+// flow::run: bootstrap + Tailscale gating
 // ---------------------------------------------------------------------
 
 #[test]
@@ -293,7 +293,7 @@ fn flow_run_stays_on_bootstrap_and_never_dials_target_when_tailscale_unhealthy()
 }
 
 // ---------------------------------------------------------------------
-// watch::classify — health-state transitions
+// watch::classify: health-state transitions
 // ---------------------------------------------------------------------
 
 #[test]
@@ -441,7 +441,7 @@ fn classify_reports_up_when_tailscale_healthy() {
 }
 
 // ---------------------------------------------------------------------
-// bread.command.crumbs.set_profile — persists via the same path as the
+// bread.command.crumbs.set_profile: persists via the same path as the
 // CLI, and must not depend on breadd being reachable (`emit` is
 // fire-and-forget).
 // ---------------------------------------------------------------------
@@ -558,7 +558,7 @@ fn handle_command_ignores_events_outside_its_own_command_namespace() {
 #[test]
 fn flow_run_reports_no_exit_node_and_never_clears_selection() {
     // A tailscale profile with no exit node configured must report
-    // TsHealth::NoExitNode — and must never run `tailscale set --exit-node=`
+    // TsHealth::NoExitNode, and must never run `tailscale set --exit-node=`
     // with an empty value, which would clear the user's current selection.
     let _env = EnvSandbox::new();
     let (nm, _dev) = setup_wifi(&[("Corp", 80)]);
@@ -599,7 +599,7 @@ fn flow_run_reports_no_exit_node_and_never_clears_selection() {
 #[test]
 fn classify_reports_down_tailscale_manual_when_no_exit_node_configured() {
     // An unset exit node needs human action (config edit), so it must
-    // classify as DownTailscaleManual — not DownTailscaleOther, which would
+    // classify as DownTailscaleManual, not DownTailscaleOther, which would
     // make the watcher spin auto-recovery forever.
     let _env = EnvSandbox::new();
     let (nm, dev) = setup_wifi(&[]);
@@ -625,7 +625,7 @@ fn ensure_exit_node_attempts_to_start_unreachable_daemon() {
     // `tailscale status --json` with empty stdout is the "daemon not
     // running" signature (the error goes to stderr). ensure_exit_node must
     // try `tailscale up` and re-read instead of bailing out with an opaque
-    // error — the old dead-code path that made the Stopped recovery
+    // error: the old dead-code path that made the Stopped recovery
     // unreachable.
     let _env = EnvSandbox::new();
     let runner = FakeRunner::new()
@@ -768,7 +768,7 @@ fn scan_list_dedups_by_ssid_keeping_strongest_signal() {
 fn flow_run_prefers_strongest_visible_signal_over_priority_order() {
     let _env = EnvSandbox::new();
     // "Weak" is listed first (higher priority), but "Strong" has the better
-    // signal — signal-aware selection must dial Strong first.
+    // signal: signal-aware selection must dial Strong first.
     let (nm, _dev) = setup_wifi(&[("Weak", 40), ("Strong", 90)]);
 
     let mut cfg = base_config();
@@ -923,7 +923,7 @@ fn wifi_interface_preferred_falls_back_to_first_wifi_when_pref_missing() {
 #[test]
 fn wifi_interface_preferred_skips_broken_device_instead_of_aborting_scan() {
     // CRUMB-4 regression: a per-device D-Bus hiccup on one device (property
-    // fetch fails) must not abort the whole scan via `?` — it should just be
+    // fetch fails) must not abort the whole scan via `?`, it should just be
     // skipped, leaving the real Wi-Fi device discoverable.
     let _env = EnvSandbox::new();
     let nm = fake_nm::shared();
@@ -995,7 +995,7 @@ fn connect_verbose_enterprise_creates_8021x_profile() {
     let eap = x1.get("eap").and_then(fake_nm::value_str_list);
     assert_eq!(eap.as_deref(), Some(&["peap".to_string()][..]));
     // ca-cert is a GBytes (`ay`) holding the conventional `file://` URI for
-    // a filesystem path — never a bare string.
+    // a filesystem path, never a bare string.
     let ca = x1.get("ca-cert").and_then(fake_nm::value_bytes);
     assert_eq!(ca.as_deref(), Some(b"file:///etc/ca.pem".as_slice()));
     let sec = settings.get("802-11-wireless-security").expect("security section");

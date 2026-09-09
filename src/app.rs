@@ -46,7 +46,7 @@ struct AddOpts {
     ///
     /// Deprecated: passing it here puts it on breadcrumbs' own argv and in
     /// shell history (visible to co-resident users via `ps`/`/proc/<pid>/
-    /// cmdline`). Kept for backward compatibility only — use
+    /// cmdline`). Kept for backward compatibility only, use
     /// `--password-stdin` or the interactive prompt instead.
     password: Option<String>,
     /// Read the password from stdin (one line) instead of the command line
@@ -123,7 +123,7 @@ enum Cmd {
         opts: AddOpts,
     },
     /// Connect to an already-saved network by SSID, outside of any profile.
-    /// Takes no password — the secret was already persisted by `add`, so
+    /// Takes no password: the secret was already persisted by `add`, so
     /// this command never puts a secret on its own argv. For callers (e.g.
     /// breadbar's "join network" dialog) that just ran `add` and now need
     /// NetworkManager to actually activate the network.
@@ -252,7 +252,7 @@ fn cmd_init(cfg: &mut Config, override_p: &Option<String>, wait: u64) -> Result<
             return Ok(1);
         }
         attempt += 1;
-        println!("{C_DIM}not connected yet — retrying in 3s…{C_RESET}");
+        println!("{C_DIM}not connected yet, retrying in 3s…{C_RESET}");
         std::thread::sleep(Duration::from_secs(3));
     }
 }
@@ -262,7 +262,7 @@ fn print_outcome(profile: &str, o: &flow::Outcome) {
         flow::Outcome::Connected { ssid, note } => {
             print!("{C_GREEN}connected{C_RESET} {C_BOLD}{ssid}{C_RESET} ({profile})");
             match note {
-                Some(n) => println!(" {C_YELLOW}— {n}{C_RESET}"),
+                Some(n) => println!(" {C_YELLOW}: {n}{C_RESET}"),
                 None => println!(),
             }
         }
@@ -274,7 +274,7 @@ fn print_outcome(profile: &str, o: &flow::Outcome) {
             );
         }
         flow::Outcome::NoInterface => {
-            println!("{C_RED}no Wi-Fi adapter{C_RESET} — hardware issue")
+            println!("{C_RED}no Wi-Fi adapter{C_RESET}: hardware issue")
         }
         flow::Outcome::NoNetworks => {
             println!("{C_RED}no known networks in range{C_RESET} (profile {profile})")
@@ -364,7 +364,7 @@ fn cmd_status(cfg: &Config, override_p: &Option<String>, json: bool) -> Result<i
         if healthy {
             format!("{C_GREEN}healthy{C_RESET}")
         } else {
-            format!("{C_YELLOW}needs attention{C_RESET} — run `breadcrumbs init`")
+            format!("{C_YELLOW}needs attention{C_RESET}: run `breadcrumbs init`")
         }
     );
     Ok(if healthy { 0 } else { 1 })
@@ -428,7 +428,7 @@ fn detect_profile(cfg: &Config) -> Option<String> {
     }
 
     best.map(|(p, _)| p).or_else(|| {
-        // Fall back to the default profile if no markers matched — but only
+        // Fall back to the default profile if no markers matched, but only
         // if it actually exists: a stale `default_profile` name is a config
         // error, not a detection result, and persisting it would wedge the
         // watcher in UnknownProfile forever.
@@ -479,7 +479,7 @@ fn prompt_line(msg: &str) -> String {
 }
 
 /// Read a single line from stdin with no prompt printed and no echo
-/// suppression — used by `--password-stdin` for scripted/non-interactive
+/// suppression, used by `--password-stdin` for scripted/non-interactive
 /// callers that pipe the secret in directly.
 fn read_stdin_line() -> String {
     let mut s = String::new();
@@ -488,7 +488,7 @@ fn read_stdin_line() -> String {
 }
 
 /// An empty string entered for a password (CLI arg or a blank prompt
-/// response) means "this network has no password" (open Wi-Fi) — normalize
+/// response) means "this network has no password" (open Wi-Fi): normalize
 /// it to `None` right at the point of entry so it flows the same way a
 /// genuinely absent/cleared password does. Without this, `Some("")` would
 /// make `nm::connect_verbose` send an empty PSK in the settings payload,
@@ -531,7 +531,7 @@ fn cmd_add(cfg: &mut Config, ssid: String, opts: AddOpts) -> Result<i32, String>
     if password.is_some() {
         eprintln!(
             "warning: passing the Wi-Fi password on the command line is deprecated and \
-             leaks it via `ps`/`/proc/<pid>/cmdline` and shell history — use \
+             leaks it via `ps`/`/proc/<pid>/cmdline` and shell history, use \
              --password-stdin or the interactive prompt instead"
         );
     }
@@ -606,7 +606,7 @@ fn cmd_join(cfg: &mut Config, ssid: &str) -> Result<i32, String> {
         .iter()
         .find(|n| n.ssid == ssid)
         .cloned()
-        .ok_or_else(|| format!("no saved network '{ssid}' — run `add` first"))?;
+        .ok_or_else(|| format!("no saved network '{ssid}', run `add` first"))?;
     let iface = nm::wifi_interface_preferred(cfg.settings.interface.as_deref())
         .ok_or_else(|| "no Wi-Fi adapter found".to_string())?;
     nm::radio_on();
@@ -733,7 +733,7 @@ fn cmd_scan(cfg: &mut Config, to: Option<String>) -> Result<i32, String> {
         return Err(format!("failed to connect to {ssid}"));
     }
     // A successful connect means NetworkManager now durably holds the PSK
-    // (either in a freshly created profile, or one whose PSK we just set) —
+    // (either in a freshly created profile, or one whose PSK we just set):
     // breadcrumbs no longer needs to keep its own plaintext copy.
     def.password = None;
     match cfg.networks.iter_mut().find(|n| n.ssid == ssid) {
@@ -774,7 +774,7 @@ fn cmd_list(cfg: &Config, show_pw: bool) -> Result<i32, String> {
             Some(p) if show_pw => p.clone(),
             Some(p) => mask(p),
             // No local secret: NetworkManager already owns the credential for
-            // this SSID, so there is nothing to mask — showing dots here
+            // this SSID, so there is nothing to mask: showing dots here
             // would falsely imply breadcrumbs is still hiding a password.
             None => format!("{C_DIM}managed by NetworkManager{C_RESET}"),
         };
@@ -820,8 +820,8 @@ fn cmd_edit() -> Result<i32, String> {
     let path = config::config_path();
     // EDITOR values routinely carry arguments ("code -w", "subl -w"), so
     // split on whitespace: the first token is the program, the rest are its
-    // arguments. The path stays a separate argument — never interpolated
-    // into a shell string — so it can't be used for injection.
+    // arguments. The path stays a separate argument, never interpolated
+    // into a shell string, so it can't be used for injection.
     let mut parts = editor.split_whitespace();
     let prog = parts.next().unwrap_or("nano");
     let mut cmd = Command::new(prog);
@@ -928,7 +928,7 @@ fn cmd_cd(shell: bool) -> Result<i32, String> {
 
 /// Re-exec into an interactive login shell inside `dir`, replacing the
 /// current process. `dir` is passed as `$1` to the shell script rather than
-/// interpolated into the script text — the config dir can come from
+/// interpolated into the script text: the config dir can come from
 /// `$XDG_CONFIG_HOME`/`$HOME`, and string-formatting an arbitrary path
 /// straight into a `sh -c` command would let shell metacharacters (`$(...)`,
 /// backticks, etc.) in that path execute as commands.
@@ -1014,7 +1014,7 @@ mod tests {
     #[test]
     fn mask_is_fixed_length_regardless_of_secret() {
         // Fixed-length masking: the output must reveal neither the secret's
-        // length nor any character of it — for empty, short, and long
+        // length nor any character of it, for empty, short, and long
         // secrets alike.
         assert_eq!(mask(""), "•".repeat(8));
         assert_eq!(mask("a"), "•".repeat(8));

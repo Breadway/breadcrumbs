@@ -35,7 +35,7 @@ impl State {
 
 /// Persist `name` as the active profile if it exists in `cfg`. Shared by the
 /// CLI `profile set` path and `bread.command.crumbs.set_profile` so they
-/// cannot drift. Does not run [`crate::flow::run`] — the CLI applies
+/// cannot drift. Does not run [`crate::flow::run`]: the CLI applies
 /// afterwards unless `--no-apply`, and the watch daemon picks the new
 /// profile up on its next tick.
 pub fn set_profile(cfg: &Config, name: &str) -> Result<(), String> {
