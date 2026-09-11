@@ -27,9 +27,17 @@ impl State {
     }
 
     pub fn save(&self) -> Result<(), String> {
-        fs::create_dir_all(state_dir()).map_err(|e| format!("creating state dir: {e}"))?;
+        let dir = state_dir();
+        fs::create_dir_all(&dir).map_err(|e| format!("creating state dir: {e}"))?;
+        // Serialise concurrent writers (a `profile set` racing the watch
+        // daemon's own schedule switch) and write atomically so a reader
+        // never sees a half-written state.toml (CRUMB-10). `State::save`
+        // never calls `State::load`, so taking the lock here cannot
+        // deadlock against this process's own state access.
+        let _lock = crate::lock::acquire(&dir).map_err(|e| format!("locking state dir: {e}"))?;
         let text = toml::to_string_pretty(self).map_err(|e| format!("serializing state: {e}"))?;
-        fs::write(state_path(), text).map_err(|e| format!("writing state: {e}"))
+        bread_utils::atomic::write_atomic(&state_path(), &text, None)
+            .map_err(|e| format!("writing state: {e}"))
     }
 }
 

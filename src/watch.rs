@@ -16,6 +16,20 @@ use crate::state::{self, State};
 use crate::status::{self};
 use crate::tailscale::TsHealth;
 
+/// Take the config-dir lock for the working part of a tick. A failure to
+/// lock is logged once and treated as non-fatal: the watch daemon keeps
+/// running (unlocked) rather than stopping, matching how the rest of the
+/// loop degrades.
+fn lock_config_dir() -> Option<crate::lock::Guard> {
+    match crate::lock::acquire(&crate::config::config_dir()) {
+        Ok(g) => Some(g),
+        Err(e) => {
+            log(&format!("watch: proceeding without config lock: {e}"));
+            None
+        }
+    }
+}
+
 const NM_DEST: &str = "org.freedesktop.NetworkManager";
 const NM_PATH: &str = "/org/freedesktop/NetworkManager";
 const NM_IFACE: &str = "org.freedesktop.NetworkManager";
@@ -297,6 +311,10 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
 
     let mut profile = State::load(&cfg.settings.default_profile).profile;
     if run_initial {
+        // Hold the config lock across the initial flow: `flow::run_quiet`
+        // can clear a stored password and save, which must not race a
+        // concurrent one-shot command (CRUMB-10).
+        let _lock = lock_config_dir();
         // Don't churn an already-working connection on (re)start.
         let class = classify(&cfg, &profile);
         if class.health == Health::Up {
@@ -327,6 +345,12 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
     let mut manual_set_at: Option<Instant> = None;
 
     loop {
+        // Hold the config-dir lock for the working part of each tick (the
+        // reload, the schedule switch, and any `flow::run_quiet`), then
+        // release it for the idle wait so one-shot commands are not blocked
+        // between ticks (CRUMB-10).
+        let tick_lock = lock_config_dir();
+
         // Reload config + state so edits and `profile set` take effect live.
         // This always runs *before* `flow::run` below (never after, within
         // the same tick), so a password `flow::run` clears-and-saves this
@@ -536,6 +560,10 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
         }
 
         prev_health = Some(health);
+
+        // Done touching config/state for this tick: release the lock before
+        // the idle wait below.
+        drop(tick_lock);
 
         // Adaptive backoff: healthy -> base; failing -> grow up to ~6x.
         let mult = 1 + fail_streak.min(5);

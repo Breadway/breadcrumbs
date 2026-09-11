@@ -366,10 +366,17 @@ impl Config {
         let dir = config_dir();
         fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
 
+        // Atomic (temp file then rename) so a crash mid-write, or a
+        // concurrent reader that did not take the config lock, never sees a
+        // truncated file. `0o600` is set on the temp file up front so any
+        // still-plaintext Wi-Fi password is never briefly world-readable.
+        // Callers that mutate config (`app::real_main`, the `watch` loop)
+        // hold `lock::acquire(&config_dir())` across their whole load,
+        // modify, save cycle so concurrent cycles serialise (CRUMB-10).
         let text = toml::to_string_pretty(self).map_err(|e| format!("serializing config: {e}"))?;
         let path = config_path();
-        fs::write(&path, text).map_err(|e| format!("writing {}: {e}", path.display()))?;
-        secure_permissions(&path);
+        bread_utils::atomic::write_atomic(&path, &text, Some(0o600))
+            .map_err(|e| format!("writing {}: {e}", path.display()))?;
 
         let nf = NetworksFile {
             networks: self.networks.clone(),
@@ -377,25 +384,12 @@ impl Config {
         let net_text =
             toml::to_string_pretty(&nf).map_err(|e| format!("serializing networks: {e}"))?;
         let net_path = networks_path();
-        fs::write(&net_path, net_text)
+        bread_utils::atomic::write_atomic(&net_path, &net_text, Some(0o600))
             .map_err(|e| format!("writing {}: {e}", net_path.display()))?;
-        secure_permissions(&net_path);
 
         Ok(())
     }
 }
-
-/// Any local Wi-Fi passwords still held (pre-first-connect, or a network
-/// breadcrumbs doesn't yet know NetworkManager owns) live in plaintext on
-/// disk; keep both config files owner-only. Best-effort: a failure here
-/// isn't fatal to saving the config itself.
-#[cfg(unix)]
-fn secure_permissions(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-}
-#[cfg(not(unix))]
-fn secure_permissions(_path: &std::path::Path) {}
 
 /// Initial skeleton networks generated for a brand-new installation.
 /// Passwords are intentionally blank: secrets never live in source.

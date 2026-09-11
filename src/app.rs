@@ -205,17 +205,38 @@ fn active_profile(cfg: &Config, override_p: &Option<String>) -> String {
 fn real_main(cli: Cli) -> Result<i32, String> {
     let cmd = cli.cmd.unwrap_or(Cmd::Status { json: false });
 
-    // `cd` and `install-service` don't need a parsed config first.
+    // `cd` doesn't need a parsed config first.
     if let Cmd::Cd { shell } = &cmd {
         return cmd_cd(*shell);
     }
+    // `edit` opens $EDITOR on the config file: holding the config lock for
+    // an interactive editing session would stall the watch daemon for the
+    // whole time, and the editor does its own write anyway.
+    if let Cmd::Edit = cmd {
+        return cmd_edit();
+    }
+
+    // `watch` runs a long-lived loop and takes the config lock per tick
+    // (see `watch::run`); it must not hold one for its whole lifetime.
+    // Every other command holds an exclusive lock on the config dir for its
+    // whole run, so its load -> modify -> save cannot interleave with a
+    // concurrent breadcrumbs invocation or the watch daemon and silently
+    // lose a write (CRUMB-10). A read-only command holding it briefly is
+    // harmless; a slow one (`init --wait`) can stall the watch daemon's
+    // next tick, which is preferable to a corrupt or dropped write.
+    if let Cmd::Watch { no_initial } = cmd {
+        let cfg = Config::load()?;
+        return Ok(watch::run(cfg, !no_initial));
+    }
+    let _cfg_lock = crate::lock::acquire(&config::config_dir())
+        .map_err(|e| format!("could not lock the config directory: {e}"))?;
 
     let mut cfg = Config::load()?;
 
     match cmd {
         Cmd::Status { json } => cmd_status(&cfg, &cli.profile, json),
         Cmd::Init { wait } => cmd_init(&mut cfg, &cli.profile, wait),
-        Cmd::Watch { no_initial } => Ok(watch::run(cfg, !no_initial)),
+        Cmd::Watch { .. } => unreachable!("Watch is handled before the config lock"),
         Cmd::Profile { action } => cmd_profile(&mut cfg, action),
         Cmd::Detect { apply, json } => cmd_detect(&mut cfg, apply, json),
         Cmd::Add { ssid, opts } => cmd_add(&mut cfg, ssid, opts),
@@ -224,10 +245,9 @@ fn real_main(cli: Cli) -> Result<i32, String> {
         Cmd::Prune { dry_run } => cmd_prune(&cfg, dry_run),
         Cmd::Scan { to } => cmd_scan(&mut cfg, to),
         Cmd::List { show_passwords } => cmd_list(&cfg, show_passwords),
-        Cmd::Edit => cmd_edit(),
         Cmd::Doctor { full } => cmd_doctor(&cfg, &cli.profile, full),
         Cmd::InstallService { no_enable } => cmd_install_service(!no_enable),
-        Cmd::Cd { .. } => unreachable!(),
+        Cmd::Cd { .. } | Cmd::Edit => unreachable!("handled before the config lock"),
     }
 }
 

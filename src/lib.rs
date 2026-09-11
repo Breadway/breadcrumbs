@@ -11,6 +11,7 @@ pub mod app;
 pub mod bread_events;
 pub mod config;
 pub mod flow;
+pub mod lock;
 pub mod nm;
 pub mod notify;
 pub mod state;
