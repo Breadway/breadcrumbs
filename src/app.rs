@@ -674,11 +674,12 @@ fn cmd_prune(cfg: &Config, dry_run: bool) -> Result<i32, String> {
         .networks
         .iter()
         .map(|n| n.ssid.as_str())
-        .chain(
-            cfg.profiles
-                .values()
-                .flat_map(|p| p.networks.iter().map(|s| s.as_str()).chain(p.bootstrap.iter().map(|s| s.as_str()))),
-        )
+        .chain(cfg.profiles.values().flat_map(|p| {
+            p.networks
+                .iter()
+                .map(|s| s.as_str())
+                .chain(p.bootstrap.iter().map(|s| s.as_str()))
+        }))
         .collect();
     let stale: Vec<(String, String)> = nm::wireless_profiles()
         .into_iter()

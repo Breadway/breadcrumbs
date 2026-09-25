@@ -240,7 +240,9 @@ fn profile_list_marks_exactly_the_current_profile() {
     let out = stdout(&o);
     assert!(out.contains("* home"), "out: {out}");
     assert_eq!(
-        out.lines().filter(|l| l.trim_start().starts_with('*')).count(),
+        out.lines()
+            .filter(|l| l.trim_start().starts_with('*'))
+            .count(),
         1,
         "expected exactly one marked profile, got: {out}"
     );
@@ -340,7 +342,10 @@ fn forget_removes_network_from_config() {
     );
     // ...and it should never have been in breadcrumbs.toml to begin with.
     let text = fs::read_to_string(sb.config_file()).unwrap();
-    assert!(!text.contains("CafeWifi"), "network leaked into config: {text}");
+    assert!(
+        !text.contains("CafeWifi"),
+        "network leaked into config: {text}"
+    );
 }
 
 #[test]
@@ -348,7 +353,11 @@ fn detect_without_wifi_adapter_errors() {
     let sb = Sandbox::new();
     let o = sb.cmd(&["detect"]);
     assert!(!o.status.success());
-    assert!(stderr(&o).contains("could not detect"), "stderr: {}", stderr(&o));
+    assert!(
+        stderr(&o).contains("could not detect"),
+        "stderr: {}",
+        stderr(&o)
+    );
 }
 
 #[test]
@@ -447,7 +456,11 @@ fn networks_are_stored_separately_from_settings_and_profiles() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(sb.networks_file()).unwrap().permissions().mode() & 0o777;
+        let mode = fs::metadata(sb.networks_file())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o600, "networks.toml should be owner-only");
     }
 }
@@ -501,7 +514,10 @@ fn password_is_cleared_after_first_connect_and_never_sent_again() {
         !networks.contains("hunter2"),
         "password should have been cleared from networks.toml: {networks}"
     );
-    assert!(networks.contains("TestNet"), "network entry itself should remain");
+    assert!(
+        networks.contains("TestNet"),
+        "network entry itself should remain"
+    );
 
     // The NM profile durably holds the secret.
     let psk = {
@@ -514,7 +530,11 @@ fn password_is_cleared_after_first_connect_and_never_sent_again() {
             })
             .next()
     };
-    assert_eq!(psk.as_deref(), Some("hunter2"), "NM profile must hold the PSK");
+    assert_eq!(
+        psk.as_deref(),
+        Some("hunter2"),
+        "NM profile must hold the PSK"
+    );
 
     // Second connect: breadcrumbs has no local password anymore, so it must
     // reuse the existing profile without creating a duplicate.
@@ -554,7 +574,11 @@ fn join_connects_a_saved_network_without_a_password_argument() {
             })
             .next()
     };
-    assert_eq!(psk.as_deref(), Some("hunter2"), "NM profile must hold the PSK");
+    assert_eq!(
+        psk.as_deref(),
+        Some("hunter2"),
+        "NM profile must hold the PSK"
+    );
 
     let networks = fs::read_to_string(sb.networks_file()).unwrap();
     assert!(
@@ -568,7 +592,11 @@ fn join_unknown_ssid_errors() {
     let sb = Sandbox::new();
     let join = sb.cmd(&["join", "NeverSaved"]);
     assert!(!join.status.success());
-    assert!(stderr(&join).contains("no saved network"), "stderr: {}", stderr(&join));
+    assert!(
+        stderr(&join).contains("no saved network"),
+        "stderr: {}",
+        stderr(&join)
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -648,7 +676,10 @@ fn edit_splits_editor_arguments() {
     assert!(o.status.success(), "stderr: {}", stderr(&o));
     assert!(stdout(&o).contains("config OK"));
     let args = fs::read_to_string(sb.root.join("editor-args")).unwrap();
-    assert!(args.contains("--wait"), "editor args must be split off: {args}");
+    assert!(
+        args.contains("--wait"),
+        "editor args must be split off: {args}"
+    );
     assert!(
         args.contains("breadcrumbs.toml"),
         "config path must be appended as its own argument: {args}"
@@ -709,8 +740,14 @@ fn legacy_inline_networks_merge_with_networks_toml_instead_of_dropping() {
     let o = sb.cmd(&["list"]);
     assert!(o.status.success(), "stderr: {}", stderr(&o));
     let out = stdout(&o);
-    assert!(out.contains("InlineNet"), "inline network must survive the merge: {out}");
-    assert!(out.contains("FileNet"), "networks.toml network must be present: {out}");
+    assert!(
+        out.contains("InlineNet"),
+        "inline network must survive the merge: {out}"
+    );
+    assert!(
+        out.contains("FileNet"),
+        "networks.toml network must be present: {out}"
+    );
 
     // A later save migrates the merged set into networks.toml and drops the
     // inline block from breadcrumbs.toml.

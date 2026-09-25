@@ -56,7 +56,12 @@ pub fn emit_health_changed(client: &BreadClient, ev: HealthChanged<'_>) {
 
 /// `bread.crumbs.network.changed`: the watch loop observed the active SSID
 /// transition. `from` is `null` when there was no previous association.
-pub fn emit_network_changed(client: &BreadClient, from: Option<&str>, to: Option<&str>, profile: &str) {
+pub fn emit_network_changed(
+    client: &BreadClient,
+    from: Option<&str>,
+    to: Option<&str>,
+    profile: &str,
+) {
     client.emit(
         "bread.crumbs.network.changed",
         serde_json::json!({ "from": from, "to": to, "profile": profile }),

@@ -90,14 +90,25 @@ fn learn_ssid(cfg: &mut Config, profile: &str, ssid: &str) {
     }
     p.detect_ssids.push(ssid.to_string());
     if let Err(e) = cfg.save() {
-        log(&format!("failed to persist learned SSID {ssid} for {profile}: {e}"));
+        log(&format!(
+            "failed to persist learned SSID {ssid} for {profile}: {e}"
+        ));
     }
 }
 
 /// Try to connect + confirm the device actually landed on the *requested*
 /// SSID. Returns Ok(()) on success, Err(reason) on failure.
-pub(crate) fn connect_and_verify(iface: &str, def: &NetworkDef, cfg: &Config) -> Result<(), String> {
-    nm::connect_verbose(iface, def, cfg.settings.connect_wait, def.effective_dns(&cfg.settings.dns))?;
+pub(crate) fn connect_and_verify(
+    iface: &str,
+    def: &NetworkDef,
+    cfg: &Config,
+) -> Result<(), String> {
+    nm::connect_verbose(
+        iface,
+        def,
+        cfg.settings.connect_wait,
+        def.effective_dns(&cfg.settings.dns),
+    )?;
     // Confirm the SSID, not just "device connected": NM autoconnect can win
     // a race and leave the device on a different network, and the wifi list
     // can lag activation by a moment, so poll briefly before giving up.
@@ -255,11 +266,7 @@ fn run_inner(cfg: &mut Config, profile_name: &str, notify_user: bool) -> Outcome
         .iter()
         .filter(|d| visible_sig.contains_key(&d.ssid))
         .collect();
-    visible_candidates.sort_by(|a, b| {
-        visible_sig
-            .get(&b.ssid)
-            .cmp(&visible_sig.get(&a.ssid))
-    });
+    visible_candidates.sort_by(|a, b| visible_sig.get(&b.ssid).cmp(&visible_sig.get(&a.ssid)));
     let mut any_attempted = false;
     for def in &visible_candidates {
         any_attempted = true;

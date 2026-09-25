@@ -78,11 +78,14 @@ fn healthy_runner() -> FakeRunner {
 
 /// The runner used by `classify` tests: internet check + optional tailscale.
 fn classify_runner(curl: &str, tailscale_status: Option<&str>) -> FakeRunner {
-    let mut r = FakeRunner::new().with_command("curl").on(|p, _| p == "curl", ok(curl));
+    let mut r = FakeRunner::new()
+        .with_command("curl")
+        .on(|p, _| p == "curl", ok(curl));
     if let Some(json) = tailscale_status {
-        r = r
-            .with_command("tailscale")
-            .on(|p, args| p == "tailscale" && args.contains(&"status"), ok(json));
+        r = r.with_command("tailscale").on(
+            |p, args| p == "tailscale" && args.contains(&"status"),
+            ok(json),
+        );
     }
     r
 }
@@ -161,7 +164,10 @@ fn flow_run_pass2_falls_back_to_hidden_candidate_not_in_scan() {
     let mut cfg = base_config();
     // "Ghost" is neither visible nor hidden, so pass 1 *and* pass 2 both
     // skip it outright: it should never be dialed.
-    cfg.networks = vec![net("Ghost", Some("pw-ghost")), hidden_net("Shadow", Some("pw-shadow"))];
+    cfg.networks = vec![
+        net("Ghost", Some("pw-ghost")),
+        hidden_net("Shadow", Some("pw-shadow")),
+    ];
     cfg.profiles.insert(
         "away".into(),
         Profile {
@@ -269,7 +275,10 @@ fn flow_run_stays_on_bootstrap_and_never_dials_target_when_tailscale_unhealthy()
 
     let runner = healthy_runner()
         .with_command("tailscale")
-        .on(|p, args| p == "tailscale" && args.contains(&"status"), ok(tailscale_json_missing()))
+        .on(
+            |p, args| p == "tailscale" && args.contains(&"status"),
+            ok(tailscale_json_missing()),
+        )
         .on(|p, args| p == "tailscale" && args.contains(&"set"), ok(""));
 
     let outcome = with_runner(runner, || flow::run(&mut cfg, "work"));
@@ -630,7 +639,10 @@ fn ensure_exit_node_attempts_to_start_unreachable_daemon() {
     let _env = EnvSandbox::new();
     let runner = FakeRunner::new()
         .with_command("tailscale")
-        .on(|p, args| p == "tailscale" && args.contains(&"status"), ok(""))
+        .on(
+            |p, args| p == "tailscale" && args.contains(&"status"),
+            ok(""),
+        )
         .on(|p, args| p == "tailscale" && args.contains(&"up"), ok(""));
     let calls = runner.calls_handle();
     let health = with_runner(runner, || {
@@ -719,7 +731,9 @@ fn internet_ok_requires_204_and_falls_back_to_ping() {
     let _env = EnvSandbox::new();
     let cfg = base_config();
 
-    let r = FakeRunner::new().with_command("curl").on(|p, _| p == "curl", ok("204"));
+    let r = FakeRunner::new()
+        .with_command("curl")
+        .on(|p, _| p == "curl", ok("204"));
     assert!(with_runner(r, || breadcrumbs::status::internet_ok(&cfg)));
 
     for code in ["200", "301", "302"] {
@@ -734,7 +748,9 @@ fn internet_ok_requires_204_and_falls_back_to_ping() {
     }
 
     // curl absent → the ping fallback decides.
-    let r = FakeRunner::new().with_command("ping").on(|p, _| p == "ping", ok(""));
+    let r = FakeRunner::new()
+        .with_command("ping")
+        .on(|p, _| p == "ping", ok(""));
     assert!(with_runner(r, || breadcrumbs::status::internet_ok(&cfg)));
 }
 
@@ -893,7 +909,10 @@ fn ensure_exit_node_failover_tries_nodes_in_priority_order() {
         .collect();
     assert_eq!(
         sets,
-        vec!["set --exit-node=nodeA".to_string(), "set --exit-node=nodeB".to_string()],
+        vec![
+            "set --exit-node=nodeA".to_string(),
+            "set --exit-node=nodeB".to_string()
+        ],
         "failover must try nodes in priority order"
     );
 }
@@ -906,7 +925,10 @@ fn wifi_interface_preferred_picks_named_device_over_first_wifi() {
     nm.add_wifi_device("wlan0", 100);
     nm.add_wifi_device("wlan1", 100);
 
-    assert_eq!(breadcrumbs::nm::wifi_interface_preferred(Some("wlan1")).as_deref(), Some("wlan1"));
+    assert_eq!(
+        breadcrumbs::nm::wifi_interface_preferred(Some("wlan1")).as_deref(),
+        Some("wlan1")
+    );
 }
 
 #[test]
@@ -917,7 +939,10 @@ fn wifi_interface_preferred_falls_back_to_first_wifi_when_pref_missing() {
     nm.add_wifi_device("wlan0", 100);
     nm.add_wifi_device("wlan1", 100);
 
-    assert_eq!(breadcrumbs::nm::wifi_interface_preferred(Some("wlan9")).as_deref(), Some("wlan0"));
+    assert_eq!(
+        breadcrumbs::nm::wifi_interface_preferred(Some("wlan9")).as_deref(),
+        Some("wlan0")
+    );
 }
 
 #[test]
@@ -989,7 +1014,9 @@ fn connect_verbose_enterprise_creates_8021x_profile() {
     let (_, settings) = st.connections.iter().next().expect("a profile was saved");
     let x1 = settings.get("802-1x").expect("802-1x section");
     assert_eq!(
-        x1.get("identity").and_then(|v| v.downcast_ref::<String>().ok()).as_deref(),
+        x1.get("identity")
+            .and_then(|v| v.downcast_ref::<String>().ok())
+            .as_deref(),
         Some("user@corp")
     );
     let eap = x1.get("eap").and_then(fake_nm::value_str_list);
@@ -998,9 +1025,13 @@ fn connect_verbose_enterprise_creates_8021x_profile() {
     // a filesystem path, never a bare string.
     let ca = x1.get("ca-cert").and_then(fake_nm::value_bytes);
     assert_eq!(ca.as_deref(), Some(b"file:///etc/ca.pem".as_slice()));
-    let sec = settings.get("802-11-wireless-security").expect("security section");
+    let sec = settings
+        .get("802-11-wireless-security")
+        .expect("security section");
     assert_eq!(
-        sec.get("key-mgmt").and_then(|v| v.downcast_ref::<String>().ok()).as_deref(),
+        sec.get("key-mgmt")
+            .and_then(|v| v.downcast_ref::<String>().ok())
+            .as_deref(),
         Some("wpa-eap")
     );
 }

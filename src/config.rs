@@ -678,12 +678,7 @@ dns = "9.9.9.9""#;
     #[test]
     fn exit_nodes_for_filters_empty_and_whitespace_entries() {
         let mut cfg = build_initial_config();
-        cfg.settings.exit_nodes = vec![
-            "  ".into(),
-            "nodeA".into(),
-            "".into(),
-            " nodeB ".into(),
-        ];
+        cfg.settings.exit_nodes = vec!["  ".into(), "nodeA".into(), "".into(), " nodeB ".into()];
         assert_eq!(
             cfg.exit_nodes_for("home"),
             vec!["nodeA".to_string(), "nodeB".to_string()]
@@ -748,11 +743,17 @@ dns = "9.9.9.9""#;
         };
         assert_eq!(n.effective_dns("1.1.1.1"), "9.9.9.9");
 
-        let n2 = NetworkDef { dns: None, ..n.clone() };
+        let n2 = NetworkDef {
+            dns: None,
+            ..n.clone()
+        };
         assert_eq!(n2.effective_dns("1.1.1.1"), "1.1.1.1");
 
         // An explicit empty string is a valid per-network opt-out.
-        let n3 = NetworkDef { dns: Some(String::new()), ..n.clone() };
+        let n3 = NetworkDef {
+            dns: Some(String::new()),
+            ..n.clone()
+        };
         assert_eq!(n3.effective_dns("1.1.1.1"), "");
     }
 

@@ -258,20 +258,30 @@ impl FakeNm {
         #[zbus(connection)] c: &zbus::Connection,
     ) -> fdo::Result<(OwnedObjectPath, OwnedObjectPath)> {
         let conn_path = self.save_connection(settings, c).await?;
-        let active = self.register_active(c, conn_path.as_str(), dev.as_str()).await?;
+        let active = self
+            .register_active(c, conn_path.as_str(), dev.as_str())
+            .await?;
         Ok((conn_path, active))
     }
 }
 
 impl FakeNm {
-    async fn save_connection(&self, settings: SettingsMap, c: &zbus::Connection) -> fdo::Result<OwnedObjectPath> {
+    async fn save_connection(
+        &self,
+        settings: SettingsMap,
+        c: &zbus::Connection,
+    ) -> fdo::Result<OwnedObjectPath> {
         let path = {
             let mut st = self.shared.state.lock().unwrap();
             st.calls.push("AddAndActivateConnection2".into());
             // Same UUID-exists semantics as real NetworkManager: this call
             // creates a *new* profile, so a duplicate UUID is an error, not
             // an upsert (updates go through Settings.Connection.Update2).
-            if st.connections.values().any(|s| conn_id(s) == conn_id(&settings)) {
+            if st
+                .connections
+                .values()
+                .any(|s| conn_id(s) == conn_id(&settings))
+            {
                 return Err(fdo::Error::Failed(
                     "A connection with this UUID already exists.".into(),
                 ));
@@ -282,10 +292,13 @@ impl FakeNm {
             p
         };
         c.object_server()
-            .at(path.as_str(), FakeConn {
-                shared: self.shared.clone(),
-                path: path.clone(),
-            })
+            .at(
+                path.as_str(),
+                FakeConn {
+                    shared: self.shared.clone(),
+                    path: path.clone(),
+                },
+            )
             .await?;
         Ok(obj(&path))
     }
@@ -332,7 +345,10 @@ impl FakeNm {
                             rsn: SEC_PSK,
                         },
                     );
-                    st.dev_aps.entry(dev.to_string()).or_default().push(ap_path.clone());
+                    st.dev_aps
+                        .entry(dev.to_string())
+                        .or_default()
+                        .push(ap_path.clone());
                     dev_ap = Some(ap_path.clone());
                     new_ap = Some(ap_path);
                 }
@@ -351,17 +367,23 @@ impl FakeNm {
         };
         if let Some(ap) = &new_ap {
             c.object_server()
-                .at(ap.as_str(), FakeAp {
-                    shared: self.shared.clone(),
-                    path: ap.clone(),
-                })
+                .at(
+                    ap.as_str(),
+                    FakeAp {
+                        shared: self.shared.clone(),
+                        path: ap.clone(),
+                    },
+                )
                 .await?;
         }
         c.object_server()
-            .at(active_path.as_str(), FakeActive {
-                shared: self.shared.clone(),
-                path: active_path.clone(),
-            })
+            .at(
+                active_path.as_str(),
+                FakeActive {
+                    shared: self.shared.clone(),
+                    path: active_path.clone(),
+                },
+            )
             .await?;
         Ok(obj(&active_path))
     }
@@ -396,7 +418,11 @@ impl FakeSettings {
             // NM_SETTINGS_ERROR_UUID_EXISTS: it does NOT upsert. Existing
             // profiles must be edited via Settings.Connection.Update2; model
             // that here so a client regression fails loudly.
-            if st.connections.values().any(|s| conn_id(s) == conn_id(&settings)) {
+            if st
+                .connections
+                .values()
+                .any(|s| conn_id(s) == conn_id(&settings))
+            {
                 return Err(fdo::Error::Failed(
                     "A connection with this UUID already exists.".into(),
                 ));
@@ -407,10 +433,13 @@ impl FakeSettings {
             p
         };
         c.object_server()
-            .at(path.as_str(), FakeConn {
-                shared: self.shared.clone(),
-                path: path.clone(),
-            })
+            .at(
+                path.as_str(),
+                FakeConn {
+                    shared: self.shared.clone(),
+                    path: path.clone(),
+                },
+            )
             .await?;
         Ok((obj(&path), HashMap::new()))
     }
@@ -469,7 +498,9 @@ struct FakeAp {
 impl FakeAp {
     #[zbus(property)]
     fn ssid(&self) -> fdo::Result<Vec<u8>> {
-        Ok(self.shared.state.lock().unwrap().aps[&self.path].ssid.clone())
+        Ok(self.shared.state.lock().unwrap().aps[&self.path]
+            .ssid
+            .clone())
     }
 
     #[zbus(property)]
@@ -506,7 +537,9 @@ struct FakeDevice {
 impl FakeDevice {
     #[zbus(property)]
     fn interface(&self) -> fdo::Result<String> {
-        Ok(self.shared.state.lock().unwrap().devices[&self.path].iface.clone())
+        Ok(self.shared.state.lock().unwrap().devices[&self.path]
+            .iface
+            .clone())
     }
 
     #[zbus(property)]
@@ -535,12 +568,7 @@ impl FakeDevice {
         Ok(obj(&st.devices[&self.path].ip4))
     }
 
-    async fn reapply(
-        &self,
-        _settings: SettingsMap,
-        _version: u64,
-        _flags: u32,
-    ) -> fdo::Result<()> {
+    async fn reapply(&self, _settings: SettingsMap, _version: u64, _flags: u32) -> fdo::Result<()> {
         let mut st = self.shared.state.lock().unwrap();
         st.calls.push("Reapply".into());
         Ok(())
@@ -639,11 +667,7 @@ static DBUS_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32
 /// needs NetworkManager to be present.
 pub fn launch_daemon() -> Daemon {
     let n = DBUS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!(
-        "breadcrumbs-dbus-{}-{}",
-        std::process::id(),
-        n
-    ));
+    let dir = std::env::temp_dir().join(format!("breadcrumbs-dbus-{}-{}", std::process::id(), n));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create dbus dir");
     let config = dir.join("bus.conf");
@@ -662,12 +686,7 @@ pub fn launch_daemon() -> Daemon {
     std::io::BufReader::new(child.stdout.take().expect("dbus stdout"))
         .read_line(&mut line)
         .expect("read dbus-daemon address");
-    let addr = line
-        .trim()
-        .split(';')
-        .next()
-        .expect("address")
-        .to_string();
+    let addr = line.trim().split(';').next().expect("address").to_string();
     Daemon { addr, child }
 }
 
@@ -713,14 +732,20 @@ pub fn serve_on(addr: &str) -> FakeNmBus {
     };
 
     conn.object_server()
-        .at(NM_PATH, FakeNm {
-            shared: shared.clone(),
-        })
+        .at(
+            NM_PATH,
+            FakeNm {
+                shared: shared.clone(),
+            },
+        )
         .expect("register fake NM");
     conn.object_server()
-        .at(SETTINGS_PATH, FakeSettings {
-            shared: shared.clone(),
-        })
+        .at(
+            SETTINGS_PATH,
+            FakeSettings {
+                shared: shared.clone(),
+            },
+        )
         .expect("register fake settings");
     conn.request_name(NM_DEST).expect("claim NM name");
 
@@ -853,7 +878,10 @@ impl FakeNmBus {
                     rsn,
                 },
             );
-            st.dev_aps.entry(dev.to_string()).or_default().push(ap_path.clone());
+            st.dev_aps
+                .entry(dev.to_string())
+                .or_default()
+                .push(ap_path.clone());
             (ap_path, flags, wpa, rsn)
         };
         let _ = (flags, wpa, rsn);
@@ -966,13 +994,21 @@ impl FakeNmBus {
     }
 
     pub fn device_state(&self, dev: &str) -> u32 {
-        self.state.lock().unwrap().devices.get(dev).map(|d| d.state).unwrap_or(0)
+        self.state
+            .lock()
+            .unwrap()
+            .devices
+            .get(dev)
+            .map(|d| d.state)
+            .unwrap_or(0)
     }
 
     pub fn active_ssid(&self, dev: &str) -> Option<String> {
         let st = self.state.lock().unwrap();
         let ap = st.devices.get(dev)?.active_ap.clone()?;
-        st.aps.get(&ap).map(|a| String::from_utf8_lossy(&a.ssid).into_owned())
+        st.aps
+            .get(&ap)
+            .map(|a| String::from_utf8_lossy(&a.ssid).into_owned())
     }
 
     /// SSIDs of every connection activated so far, in activation order.
@@ -1017,7 +1053,10 @@ pub fn shared() -> SharedNm {
         let daemon = launch_daemon();
         let bus = serve_on(&daemon.addr);
         std::env::set_var("DBUS_SYSTEM_BUS_ADDRESS", &daemon.addr);
-        Mutex::new(SharedBus { _daemon: daemon, bus })
+        Mutex::new(SharedBus {
+            _daemon: daemon,
+            bus,
+        })
     });
     let guard = bus.lock().unwrap_or_else(|e| e.into_inner());
     SharedNm { guard }

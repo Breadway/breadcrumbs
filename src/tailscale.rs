@@ -344,7 +344,10 @@ pub fn ensure_exit_node(nodes: &[String]) -> TsHealth {
             Duration::from_secs(10),
         );
         if let Some(v2) = status_json() {
-            if matches!(exit_node_health(std::slice::from_ref(node), &v2), TsHealth::Ok) {
+            if matches!(
+                exit_node_health(std::slice::from_ref(node), &v2),
+                TsHealth::Ok
+            ) {
                 return TsHealth::Ok;
             }
         }

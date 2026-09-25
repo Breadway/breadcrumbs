@@ -193,7 +193,8 @@ pub fn available() -> bool {
     };
     // A well-known-name lookup that actually gets a reply proves the real
     // NetworkManager holds the name.
-    p.call::<_, _, Vec<OwnedObjectPath>>("GetDevices", &()).is_ok()
+    p.call::<_, _, Vec<OwnedObjectPath>>("GetDevices", &())
+        .is_ok()
 }
 
 /// Find the Wi-Fi interface. When `pref` is `Some`, that exact device is
@@ -234,7 +235,9 @@ pub fn radio_on() {
 
 pub fn rescan(iface: &str, ssids: &[String]) {
     let Some(conn) = connection() else { return };
-    let Some(dev) = device_path(&conn, iface) else { return };
+    let Some(dev) = device_path(&conn, iface) else {
+        return;
+    };
     let Some(wifi) = proxy(&conn, dev.as_str(), WIFI_IFACE) else {
         return;
     };
@@ -682,7 +685,10 @@ pub fn connect_verbose(iface: &str, net: &NetworkDef, wait: u32, dns: &str) -> R
             let conn_proxy = proxy(&conn, profile.as_str(), CONN_IFACE)
                 .ok_or_else(|| "NetworkManager Settings.Connection unavailable".to_string())?;
             let _: HashMap<String, OwnedValue> = conn_proxy
-                .call("Update2", &(&s, FLAG_TO_DISK, &HashMap::<String, Value>::new()))
+                .call(
+                    "Update2",
+                    &(&s, FLAG_TO_DISK, &HashMap::<String, Value>::new()),
+                )
                 .map_err(err_text)?;
         }
         let nm = nm_proxy(&conn).ok_or_else(|| "NetworkManager unavailable".to_string())?;
@@ -805,7 +811,10 @@ mod tests {
         // WPA2-PSK (RSN PSK set).
         assert_eq!(security_string(AP_FLAG_PRIVACY, 0, SEC_PSK), "WPA2");
         // WPA1+WPA2 (both flag sets carry PSK).
-        assert_eq!(security_string(AP_FLAG_PRIVACY, SEC_PSK, SEC_PSK), "WPA1 WPA2");
+        assert_eq!(
+            security_string(AP_FLAG_PRIVACY, SEC_PSK, SEC_PSK),
+            "WPA1 WPA2"
+        );
         // WPA3 (SAE).
         assert_eq!(security_string(AP_FLAG_PRIVACY, 0, SEC_SAE), "WPA3");
         // Enterprise (802.1x key management).

@@ -173,7 +173,10 @@ enum Wake {
 /// that catches "still connected but lost the internet" (portal, DHCP
 /// failure) without waiting out the poll interval.
 fn props_changed_connectivity(msg: &zbus::Message) -> bool {
-    let Ok(body) = msg.body().deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>() else {
+    let Ok(body) = msg
+        .body()
+        .deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>()
+    else {
         return false;
     };
     body.0 == NM_IFACE && body.1.contains_key("Connectivity")
@@ -183,8 +186,13 @@ fn props_changed_connectivity(msg: &zbus::Message) -> bool {
 /// each matching message, reconnecting on bus/NM restarts. One thread per
 /// subscription (a handful at most); each owns its own connection so a dead
 /// bus can't wedge the others.
-fn spawn_signal_watcher<F>(tx: mpsc::Sender<Wake>, path: String, iface: &'static str, signal: &'static str, mut on_msg: F)
-where
+fn spawn_signal_watcher<F>(
+    tx: mpsc::Sender<Wake>,
+    path: String,
+    iface: &'static str,
+    signal: &'static str,
+    mut on_msg: F,
+) where
     F: FnMut(&zbus::Message) -> bool + Send + 'static,
 {
     thread::spawn(move || loop {
@@ -238,8 +246,20 @@ fn spawn_nm_monitor(tx: mpsc::Sender<Wake>) {
         "PropertiesChanged",
         props_changed_connectivity,
     );
-    spawn_signal_watcher(tx.clone(), NM_PATH.to_string(), NM_IFACE, "DeviceAdded", |_| true);
-    spawn_signal_watcher(tx.clone(), NM_PATH.to_string(), NM_IFACE, "DeviceRemoved", |_| true);
+    spawn_signal_watcher(
+        tx.clone(),
+        NM_PATH.to_string(),
+        NM_IFACE,
+        "DeviceAdded",
+        |_| true,
+    );
+    spawn_signal_watcher(
+        tx.clone(),
+        NM_PATH.to_string(),
+        NM_IFACE,
+        "DeviceRemoved",
+        |_| true,
+    );
     // StateChanged on each Wi-Fi device. Devices added later (USB dongle
     // hotplug) are caught by the DeviceAdded watcher waking the loop; the
     // poll interval covers anything else.
@@ -300,14 +320,16 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
     // thread.
     let bread = BreadClient::connect(bread_events::APP_ID);
     let wake = tx;
-    let _commands = bread.subscribe("bread.command.crumbs.**", move |event| {
-        match bread_events::handle_command(&event) {
-            bread_events::CommandAction::SetProfile(name) => {
-                let _ = wake.send(Wake::SetProfile(name));
-            }
-            bread_events::CommandAction::Ignore => {}
-        }
-    });
+    let _commands =
+        bread.subscribe(
+            "bread.command.crumbs.**",
+            move |event| match bread_events::handle_command(&event) {
+                bread_events::CommandAction::SetProfile(name) => {
+                    let _ = wake.send(Wake::SetProfile(name));
+                }
+                bread_events::CommandAction::Ignore => {}
+            },
+        );
 
     let mut profile = State::load(&cfg.settings.default_profile).profile;
     if run_initial {

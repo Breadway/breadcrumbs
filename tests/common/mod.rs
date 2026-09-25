@@ -118,8 +118,7 @@ impl FakeRunner {
         matcher: impl Fn(&str, &[&str]) -> bool + 'static,
         out: impl Fn(&str, &[&str]) -> Output + 'static,
     ) -> Self {
-        self.dynamic_rules
-            .push((Box::new(matcher), Box::new(out)));
+        self.dynamic_rules.push((Box::new(matcher), Box::new(out)));
         self
     }
 }
