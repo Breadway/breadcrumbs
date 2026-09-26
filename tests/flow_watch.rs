@@ -32,6 +32,7 @@ fn net(ssid: &str, password: Option<&str>) -> NetworkDef {
         identity: None,
         ca_cert: None,
         hidden: false,
+        ..Default::default()
     }
 }
 
@@ -44,6 +45,7 @@ fn hidden_net(ssid: &str, password: Option<&str>) -> NetworkDef {
         identity: None,
         ca_cert: None,
         hidden: true,
+        ..Default::default()
     }
 }
 
@@ -835,11 +837,13 @@ fn flow_run_pins_per_network_dns_override() {
     // global 1.1.1.1.
     let st = nm.state.lock().unwrap();
     let conn = st.connections.values().next().expect("a profile was saved");
+    // `ipv4.dns` is `au` on the wire (network byte order), which every
+    // NetworkManager version accepts.
     let dns = conn
         .get("ipv4")
         .and_then(|m| m.get("dns"))
-        .and_then(fake_nm::value_str_list);
-    assert_eq!(dns, Some(vec!["9.9.9.9".to_string()]));
+        .and_then(fake_nm::value_u32_list);
+    assert_eq!(dns, Some(vec![u32::from_ne_bytes([9, 9, 9, 9])]));
 }
 
 #[test]
@@ -883,11 +887,19 @@ fn classify_reports_captive_portal_when_connectivity_returns_200() {
     assert_eq!(class.ssid, Some("HomeWifi".to_string()));
 }
 
+fn tailscale_sets(calls: &std::cell::RefCell<Vec<common::RecordedCall>>) -> Vec<String> {
+    calls
+        .borrow()
+        .iter()
+        .filter(|c| c.prog == "tailscale" && c.args.iter().any(|a| a == "set"))
+        .map(|c| c.args.join(" "))
+        .collect()
+}
+
 #[test]
-fn ensure_exit_node_failover_tries_nodes_in_priority_order() {
-    // The status never shows nodeA; it always shows nodeB selected + online.
-    // ensure_exit_node must therefore try nodeA (fail), then nodeB (succeed),
-    // in that exact priority order.
+fn ensure_exit_node_keeps_a_healthy_selection_without_touching_it() {
+    // nodeB is already selected and online, and the higher-priority nodeA
+    // is not in the tailnet: nothing to do, so no `tailscale set` churn.
     let _env = EnvSandbox::new();
     let json = r#"{"BackendState":"Running","Peer":{"k1":{"HostName":"nodeB","DNSName":"nodeB.ts.net.","Online":true,"ExitNode":true,"ExitNodeOption":true}}}"#;
     let runner = FakeRunner::new()
@@ -900,21 +912,60 @@ fn ensure_exit_node_failover_tries_nodes_in_priority_order() {
         breadcrumbs::tailscale::ensure_exit_node(&["nodeA".into(), "nodeB".into()])
     });
     assert_eq!(health, breadcrumbs::tailscale::TsHealth::Ok);
-
-    let sets: Vec<String> = calls
-        .borrow()
-        .iter()
-        .filter(|c| c.args.iter().any(|a| a == "set"))
-        .map(|c| c.args.join(" "))
-        .collect();
-    assert_eq!(
-        sets,
-        vec![
-            "set --exit-node=nodeA".to_string(),
-            "set --exit-node=nodeB".to_string()
-        ],
-        "failover must try nodes in priority order"
+    assert!(
+        tailscale_sets(&calls).is_empty(),
+        "{:?}",
+        tailscale_sets(&calls)
     );
+}
+
+#[test]
+fn ensure_exit_node_skips_an_offline_primary_instead_of_selecting_it() {
+    // nodeA is offline, nodeB online but unselected: select nodeB only.
+    // Selecting the dead primary first would blackhole traffic.
+    let _env = EnvSandbox::new();
+    let before = r#"{"BackendState":"Running","Peer":{"a":{"HostName":"nodeA","Online":false,"ExitNode":false,"ExitNodeOption":true},"b":{"HostName":"nodeB","Online":true,"ExitNode":false,"ExitNodeOption":true}}}"#;
+    let after = r#"{"BackendState":"Running","Peer":{"a":{"HostName":"nodeA","Online":false,"ExitNode":false,"ExitNodeOption":true},"b":{"HostName":"nodeB","Online":true,"ExitNode":true,"ExitNodeOption":true}}}"#;
+    let selected = std::rc::Rc::new(std::cell::Cell::new(false));
+    let (sel_set, sel_status) = (selected.clone(), selected.clone());
+    let runner = FakeRunner::new()
+        .with_command("tailscale")
+        .on_dynamic(
+            |p, args| p == "tailscale" && args.contains(&"set"),
+            move |_, _| {
+                sel_set.set(true);
+                ok("")
+            },
+        )
+        .on_dynamic(
+            |p, args| p == "tailscale" && args.contains(&"status"),
+            move |_, _| ok(if sel_status.get() { after } else { before }),
+        );
+    let calls = runner.calls_handle();
+
+    let health = with_runner(runner, || {
+        breadcrumbs::tailscale::ensure_exit_node(&["nodeA".into(), "nodeB".into()])
+    });
+    assert_eq!(health, breadcrumbs::tailscale::TsHealth::Ok);
+    assert_eq!(
+        tailscale_sets(&calls),
+        vec!["set --exit-node=nodeB".to_string()],
+        "the offline primary must be skipped, not selected"
+    );
+}
+
+#[test]
+fn exit_node_can_be_configured_by_tailscale_ip() {
+    let _env = EnvSandbox::new();
+    let json = r#"{"BackendState":"Running","Peer":{"k1":{"HostName":"hestia","TailscaleIPs":["100.66.238.26"],"Online":true,"ExitNode":true,"ExitNodeOption":true}}}"#;
+    let runner =
+        FakeRunner::new()
+            .with_command("tailscale")
+            .on_contains("tailscale", "status", ok(json));
+    let health = with_runner(runner, || {
+        breadcrumbs::tailscale::check(&["100.66.238.26".into()])
+    });
+    assert_eq!(health, breadcrumbs::tailscale::TsHealth::Ok);
 }
 
 #[test]
@@ -1022,9 +1073,17 @@ fn connect_verbose_enterprise_creates_8021x_profile() {
     let eap = x1.get("eap").and_then(fake_nm::value_str_list);
     assert_eq!(eap.as_deref(), Some(&["peap".to_string()][..]));
     // ca-cert is a GBytes (`ay`) holding the conventional `file://` URI for
-    // a filesystem path, never a bare string.
+    // a filesystem path, NUL-terminated (how NM tells a path from an inline
+    // certificate blob), never a bare string.
     let ca = x1.get("ca-cert").and_then(fake_nm::value_bytes);
-    assert_eq!(ca.as_deref(), Some(b"file:///etc/ca.pem".as_slice()));
+    assert_eq!(ca.as_deref(), Some(b"file:///etc/ca.pem\0".as_slice()));
+    // PEAP tunnels an inner method; NM rejects the profile without one.
+    assert_eq!(
+        x1.get("phase2-auth")
+            .and_then(|v| v.downcast_ref::<String>().ok())
+            .as_deref(),
+        Some("mschapv2")
+    );
     let sec = settings
         .get("802-11-wireless-security")
         .expect("security section");
@@ -1034,4 +1093,225 @@ fn connect_verbose_enterprise_creates_8021x_profile() {
             .as_deref(),
         Some("wpa-eap")
     );
+}
+
+// ---------------------------------------------------------------------
+// Regression tests for the 2026-09 audit fixes.
+// ---------------------------------------------------------------------
+
+fn setting_string(s: &fake_nm::SettingsMap, section: &str, key: &str) -> Option<String> {
+    s.get(section)
+        .and_then(|m| m.get(key))
+        .and_then(|v| v.downcast_ref::<String>().ok())
+}
+
+#[test]
+fn flow_run_does_not_reactivate_a_network_it_is_already_on() {
+    // The recovery loop that dropped working links: already associated with
+    // the best candidate, a second flow run must not re-activate it.
+    let _env = EnvSandbox::new();
+    let (nm, _dev) = setup_wifi(&[("Home", 80)]);
+    let mut cfg = base_config();
+    cfg.networks = vec![net("Home", Some("pw"))];
+    cfg.profiles.insert(
+        "home".into(),
+        Profile {
+            networks: vec!["Home".into()],
+            ..Default::default()
+        },
+    );
+
+    let first = with_runner(healthy_runner(), || flow::run(&mut cfg, "home"));
+    assert!(first.ok());
+    assert_eq!(nm.activated_ssids(), vec!["Home".to_string()]);
+
+    let again = with_runner(healthy_runner(), || flow::run_quiet(&mut cfg, "home"));
+    assert!(again.ok(), "{again:?}");
+    assert_eq!(
+        nm.activated_ssids(),
+        vec!["Home".to_string()],
+        "an already-connected network must not be re-activated"
+    );
+}
+
+#[test]
+fn connect_waits_for_the_new_connection_not_the_old_device_state() {
+    // Mid-switch the device still reports ACTIVATED for the network it is
+    // leaving; the connect must wait for the new active connection.
+    let _env = EnvSandbox::new();
+    let (nm, dev) = setup_wifi(&[("New", 80)]);
+    associate(&nm, &dev, "Old");
+    nm.set_activation_polls(5);
+
+    let res = breadcrumbs::nm::connect_verbose("wlan0", &net("New", Some("pw")), 5, "");
+    assert!(res.is_ok(), "{res:?}");
+    assert_eq!(nm.active_ssid(&dev).as_deref(), Some("New"));
+}
+
+#[test]
+fn connect_timeout_cancels_the_pending_activation() {
+    let _env = EnvSandbox::new();
+    let (nm, _dev) = setup_wifi(&[("Slow", 80)]);
+    nm.set_activation_polls(u32::MAX);
+
+    let res = breadcrumbs::nm::connect_verbose("wlan0", &net("Slow", Some("pw")), 1, "");
+    let err = res.expect_err("never-completing activation must time out");
+    assert!(err.contains("timed out"), "{err}");
+    assert!(
+        nm.calls().iter().any(|c| c.starts_with("deactivate ")),
+        "the pending activation must be cancelled: {:?}",
+        nm.calls()
+    );
+}
+
+#[test]
+fn failing_hidden_network_is_backed_off_across_flow_runs() {
+    let _env = EnvSandbox::new();
+    flow::reset_hidden_backoff();
+    let (nm, _dev) = setup_wifi(&[]);
+    nm.fail_next_activations(100);
+    let mut cfg = base_config();
+    cfg.networks = vec![hidden_net("Backoff-Shadow", Some("pw"))];
+    cfg.profiles.insert(
+        "away".into(),
+        Profile {
+            networks: vec!["Backoff-Shadow".into()],
+            ..Default::default()
+        },
+    );
+
+    let activations = |nm: &SharedNm| {
+        nm.calls()
+            .iter()
+            .filter(|c| c == &"AddAndActivateConnection2")
+            .count()
+    };
+    let first = with_runner(healthy_runner(), || flow::run_quiet(&mut cfg, "away"));
+    assert!(!first.ok());
+    let after_first = activations(&nm);
+
+    let second = with_runner(healthy_runner(), || flow::run_quiet(&mut cfg, "away"));
+    assert!(!second.ok());
+    assert_eq!(
+        activations(&nm),
+        after_first,
+        "a hidden network that just failed must be skipped on the next run"
+    );
+    flow::reset_hidden_backoff();
+}
+
+#[test]
+fn flow_run_only_probes_hidden_networks_by_name() {
+    // Directed probes broadcast the SSID: visible networks must not be
+    // named in the scan request, only hidden ones.
+    let _env = EnvSandbox::new();
+    flow::reset_hidden_backoff();
+    let (nm, _dev) = setup_wifi(&[("HomeVisible", 80)]);
+    let mut cfg = base_config();
+    cfg.networks = vec![
+        net("HomeVisible", Some("pw")),
+        hidden_net("SecretHidden", Some("pw")),
+    ];
+    cfg.profiles.insert(
+        "home".into(),
+        Profile {
+            networks: vec!["HomeVisible".into(), "SecretHidden".into()],
+            ..Default::default()
+        },
+    );
+
+    with_runner(healthy_runner(), || flow::run(&mut cfg, "home"));
+    let scans: Vec<String> = nm
+        .calls()
+        .into_iter()
+        .filter(|c| c.starts_with("RequestScan"))
+        .collect();
+    assert!(!scans.is_empty());
+    for scan in &scans {
+        assert!(!scan.contains("HomeVisible"), "visible SSID probed: {scan}");
+    }
+    assert!(
+        scans.iter().any(|s| s.contains("SecretHidden")),
+        "{scans:?}"
+    );
+}
+
+#[test]
+fn wpa3_only_network_is_created_with_sae() {
+    let _env = EnvSandbox::new();
+    let (nm, dev) = setup_wifi(&[]);
+    nm.add_ap(&dev, "W3", 80, Security::Wpa3);
+
+    let res = breadcrumbs::nm::connect_verbose("wlan0", &net("W3", Some("pw")), 5, "");
+    assert!(res.is_ok(), "{res:?}");
+    let st = nm.state.lock().unwrap_or_else(|e| e.into_inner());
+    let (_, s) = st.connections.iter().next().expect("profile created");
+    assert_eq!(
+        setting_string(s, "802-11-wireless-security", "key-mgmt").as_deref(),
+        Some("sae")
+    );
+}
+
+#[test]
+fn hidden_open_network_with_existing_profile_reconnects() {
+    // Updating an open network's profile must not add an empty security
+    // section, which NetworkManager rejects for lacking key-mgmt.
+    let _env = EnvSandbox::new();
+    let (nm, _dev) = setup_wifi(&[]);
+    nm.set_connect_any(true);
+    nm.save_connection("OpenHidden", None);
+
+    let res = breadcrumbs::nm::connect_verbose("wlan0", &hidden_net("OpenHidden", None), 5, "");
+    assert!(res.is_ok(), "{res:?}");
+}
+
+#[test]
+fn ipv4_address_reads_address_data() {
+    let _env = EnvSandbox::new();
+    let (_nm, _dev) = setup_wifi(&[]);
+    assert_eq!(
+        breadcrumbs::nm::ipv4_address("wlan0").as_deref(),
+        Some("192.168.1.42")
+    );
+}
+
+#[test]
+fn deleting_by_ssid_never_touches_wired_or_hotspot_profiles() {
+    let _env = EnvSandbox::new();
+    let (nm, _dev) = setup_wifi(&[]);
+    let wired = nm.save_profile("Cafe", "Cafe", "802-3-ethernet", "", None);
+    let hotspot = nm.save_profile("Cafe-hotspot", "Cafe", "802-11-wireless", "ap", None);
+    let client = nm.save_connection("Cafe", None);
+
+    assert!(breadcrumbs::nm::delete_connections_for_ssid("Cafe"));
+    assert!(
+        nm.has_profile(&wired),
+        "wired profile sharing the name deleted"
+    );
+    assert!(nm.has_profile(&hotspot), "hotspot profile deleted");
+    assert!(!nm.has_profile(&client), "the Wi-Fi client profile must go");
+
+    let listed = breadcrumbs::nm::wireless_profiles();
+    assert!(
+        listed.iter().all(|(name, _)| name != "Cafe-hotspot"),
+        "prune must never see hotspot profiles: {listed:?}"
+    );
+}
+
+#[test]
+fn empty_dns_removes_only_a_pin_breadcrumbs_made() {
+    let _env = EnvSandbox::new();
+    let (nm, _dev) = setup_wifi(&[("Net", 80)]);
+    let mut def = net("Net", Some("pw"));
+
+    breadcrumbs::nm::connect_verbose("wlan0", &def, 5, "1.1.1.1").unwrap();
+    def.password = None;
+    breadcrumbs::nm::connect_verbose("wlan0", &def, 5, "").unwrap();
+
+    let st = nm.state.lock().unwrap_or_else(|e| e.into_inner());
+    let (_, s) = st.connections.iter().next().expect("profile");
+    let ignore = s["ipv4"]["ignore-auto-dns"].downcast_ref::<bool>().unwrap();
+    assert!(!ignore, "the pin must be undone");
+    let dns = fake_nm::value_u32_list(&s["ipv4"]["dns"]).unwrap();
+    assert!(dns.is_empty());
 }

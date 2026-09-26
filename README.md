@@ -51,16 +51,18 @@ Settings and location profiles live in `breadcrumbs.toml`, the file people actua
 
 ```toml
 [settings]
-dns = "1.1.1.1"          # DNS server pinned on every connection
-connect_wait = 8         # seconds to wait for the device to reach the activated state (legacy key: nmcli_wait)
-exit_node = "myhostname" # default Tailscale exit node
+dns = "1.1.1.1"          # DNS pinned on every connection (IPv4 and IPv6; comma-separate
+                         # several servers); "" disables pinning. See "DNS pinning" below
+connect_wait = 8         # seconds to wait for a connection to activate before cancelling it
+                         # (legacy key: nmcli_wait); raise it for slow enterprise/WPA3 networks
+exit_node = "myhostname" # default Tailscale exit node (hostname, MagicDNS name or Tailscale IP)
 exit_nodes = ["a", "b"] # optional priority list; tried in order (fallback nodes)
 interface = "wlan0"      # optional preferred Wi-Fi interface
 schedule = []            # optional time-of-day profile switches, e.g.
                          #   [[settings.schedule]]
                          #   profile = "home"
                          #   from = "18:00"
-                         #   to = "08:00"   # from >= to = overnight window
+                         #   to = "08:00"   # from > to = overnight window, from == to = all day
 default_profile = "away"
 watch_interval = 12      # seconds between health checks (minimum 4)
 connectivity_url = "http://connectivitycheck.gstatic.com/generate_204"
@@ -92,10 +94,13 @@ dns = "1.1.1.1"       # optional per-network DNS override; "" disables pinning
 # WPA-Enterprise (802.1x) networks use these instead of a PSK:
 # [[networks]]
 # ssid = "CorpEAP"
-# eap = "peap"          # or "tls"
+# eap = "peap"          # "peap", "ttls" or "tls"
+# phase2 = "mschapv2"   # inner auth for peap/ttls (default mschapv2)
 # identity = "user@corp"
-# password = "..."       # 802.1x password
+# password = "..."       # 802.1x password (for tls: the private key passphrase)
 # ca_cert = "/etc/ssl/certs/corp-ca.pem"   # optional
+# client_cert = "/path/client.pem"         # tls only
+# private_key = "/path/client.key"         # tls only
 ```
 
 `password` is only needed the first time breadcrumbs connects to a network. Once NetworkManager durably saves the credential, breadcrumbs clears its local copy and omits the key on the next save; an existing config with `password = "..."` still loads fine either way, no migration step needed. A config with `[[networks]]` still written inline in `breadcrumbs.toml` (from before this split) also still loads: it's read once, then migrated into `networks.toml` automatically on the next save.
@@ -129,14 +134,14 @@ breadcrumbs [--profile <name>] <command>
 | `profile set <name>` | Switch profile (and apply it, unless `--no-apply`) |
 | `profile list` | List all profiles |
 | `detect [--apply] [--json]` | Guess profile from visible networks; optionally apply it |
-| `add <ssid> [--password-stdin]` | Add or update a saved network; password is prompted for interactively (no echo) unless `--password-stdin` is given (`--dns`, `--eap`, `--identity`, `--ca-cert`, `--hidden`, `--to`, `--at`) |
+| `add <ssid> [--password-stdin]` | Add or update a saved network; password is prompted for interactively (no echo) unless `--password-stdin` is given (`--dns`, `--eap`, `--identity`, `--ca-cert`, `--phase2`, `--client-cert`, `--private-key`, `--hidden`, `--to`, `--at`) |
 | `join <ssid>` | Connect to an already-saved network right now, outside any profile. Takes no password, for GUI callers that already ran `add` |
 | `forget <ssid>` | Remove a network from config and NetworkManager |
-| `prune [--dry-run]` | Remove NetworkManager wireless profiles whose SSID is no longer in the config |
+| `prune [--dry-run] [--yes]` | Remove NetworkManager Wi-Fi client profiles whose SSID is no longer in the config (lists them and asks first; `--yes` for scripts; hotspot profiles are never touched) |
 | `scan [--to <profile>]` | Interactive scan, pick, connect and save |
 | `list [--show-passwords]` | Show config: settings, networks, profiles |
 | `edit` | Open config in `$EDITOR`, validate on exit |
-| `doctor [--full]` | Quick connectivity and Tailscale diagnostics |
+| `doctor [--full]` | Quick connectivity and Tailscale diagnostics, plus config problems (dangling profile/network references, bad schedule times) |
 | `cd [--shell]` | Print (or `cd` into) the config directory |
 | `install-service [--no-enable]` | Install and optionally enable systemd user unit |
 
@@ -175,16 +180,27 @@ breadcrumbs install-service
 `breadcrumbs watch` is the recommended way to run breadcrumbs for daily use. It:
 
 1. Polls health every `watch_interval` seconds (adaptive backoff on repeated failures)
-2. Reacts immediately to link-state changes via NetworkManager D-Bus signals (`Device.StateChanged`, `Connectivity` property changes, hotplug events)
-3. Runs `flow::run` (the connect state machine) on any detected drop
-4. Handles profile changes live: re-reads config and state on every tick
-5. Distinguishes captive portals from plain no-internet (a 200/301/302 instead
-   of the 204 generate_204 returns) and tells you to sign in instead of
-   pointlessly reconnecting
-6. Applies a `[settings.schedule]` time-of-day profile switch, respecting a
+2. Reacts immediately to link-state changes via NetworkManager D-Bus signals (`Device.StateChanged`, `Connectivity` property changes, hotplug events, including Wi-Fi devices plugged in after it started)
+3. Runs `flow::run` (the connect state machine) on a confirmed drop. While
+   still associated, one failed connectivity probe is not enough: it
+   re-checks a few seconds later and only recovers after two failures in a
+   row. Recovery never re-activates the network you are already on (that
+   drops a working link); it only moves you to a network you are not on
+4. Backs off hidden networks that keep failing (1 min, doubling, up to 30
+   min) instead of dialing them blind on every recovery run
+5. Handles profile changes live: re-reads config and state on every tick
+6. Distinguishes captive portals from plain no-internet (a 200, a redirect,
+   or 511 instead of the 204 generate_204 returns) and tells you to sign in
+   instead of pointlessly reconnecting
+7. Applies a `[settings.schedule]` time-of-day profile switch, respecting a
    30-minute grace window after a manual `profile set`
-7. Detects suspend/resume (a large gap between ticks) and forces an immediate
-   recovery check instead of waiting out the poll interval
+8. Detects suspend/resume (measured on a clock that keeps running while
+   suspended) and forces an immediate recovery check
+
+No breadcrumbs command holds a lock while it waits on the network or on
+you: reads (`status`, `list`, `profile list`, ...) take no lock at all, and
+each change to the config takes the lock only for its own quick load,
+modify, save.
 
 When a Tailscale profile is connected through a bootstrap network and the
 connectivity check is intercepted, the watcher stays put and notifies once;
@@ -204,10 +220,46 @@ For profiles with `tailscale = true`:
 
 1. Connects to the `bootstrap` SSID (if configured)
 2. Ensures the Tailscale daemon is running; opens a browser login if needed
-3. Sets the configured exit node with `tailscale set --exit-node=<node>`
+3. Selects an exit node with `tailscale set --exit-node=<node>`: the first
+   *online* node in `exit_nodes` priority order. A node that is already
+   selected and healthy is left alone, and an offline node is never
+   selected
 4. Only moves to the target network once Tailscale is healthy
 
-If Tailscale needs interactive login, the auth URL is opened automatically and the watch daemon stays on the bootstrap network until authentication completes.
+If Tailscale needs interactive login, the auth URL is opened automatically and the watch daemon stays on the bootstrap network until authentication completes. Login runs `tailscale login` as you, which needs you to be the Tailscale operator (`sudo tailscale set --operator=$USER`, once); failing that it tries `sudo -n tailscale login` (passwordless sudo only, since the daemon has no terminal to ask for a password).
+
+## DNS pinning
+
+With `dns` set (the default is `1.1.1.1`), breadcrumbs pins those servers
+on the NetworkManager profile of every network it connects to, for both
+IPv4 and IPv6, and ignores the DNS servers the network hands out. The pin
+is saved in the profile, so it stays in effect even when breadcrumbs is
+not running, and the profile is marked so breadcrumbs knows it made the
+pin. Setting `dns = ""` for a network (or globally) removes a pin
+breadcrumbs made, restoring the network's own DNS, and never touches DNS
+you set yourself.
+
+Some networks (schools, hotels, corporate networks) block outside DNS
+servers or rely on their own DNS for a captive portal. Use `dns = ""` for
+those networks.
+
+## `status --json`
+
+`breadcrumbs status --json` prints one object and exits 0 when healthy, 1
+otherwise. Other tools (e.g. breadbar) read it:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `profile` | string | Active profile |
+| `iface` | string or null | Wi-Fi interface |
+| `ssid` | string or null | Associated SSID |
+| `ip` | string or null | IPv4 address |
+| `internet` | bool | A 204 from the connectivity check (or a working ping) |
+| `portal` | bool | A captive portal intercepted the check |
+| `tailscale_required` | bool | The profile requires Tailscale |
+| `tailscale` | string or null | Tailscale health: `Ok`, `NeedsLogin`, `Stopped`, `ExitNodeMissing`, `ExitNodeOffline`, `NoExitNode`, `NotInstalled`, `Error`; null when Tailscale is not installed |
+| `exit_node` | string | First configured exit node |
+| `healthy` | bool | Internet up and, if required, Tailscale `Ok` |
 
 ## License
 

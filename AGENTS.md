@@ -36,7 +36,7 @@ of sync.
   `breadcrumbs watch` / the user systemd unit is up.
 
 ## CI
-- `check.yml`: clippy + `cargo test --release` on `feature/**` and `fix/**`.
+- `check.yml`: fmt check + clippy + `cargo test --release` on `feature/**` and `fix/**`.
 - `dev-release.yml`: triggered on push to `main` (dev-track bakery publish).
 - `rc-release.yml`: triggered on any `vX.Y.Z-rc.N` tag push (beta track).
 - `release.yml`: triggered on any other `v*` tag push (signed stable).

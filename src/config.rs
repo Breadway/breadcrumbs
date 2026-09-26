@@ -40,7 +40,8 @@ pub fn hhmm_to_minutes(s: &str) -> Option<u32> {
 }
 
 /// Does the window `[from, to)` (minutes since midnight) contain `now`?
-/// `from >= to` means an overnight window (e.g. 22:00–07:00).
+/// `from > to` means an overnight window (e.g. 22:00–07:00); `from == to`
+/// means the whole day.
 pub fn window_contains(from: u32, to: u32, now: u32) -> bool {
     if from < to {
         now >= from && now < to
@@ -55,7 +56,8 @@ pub struct ScheduleEntry {
     pub profile: String,
     /// "HH:MM", inclusive start.
     pub from: String,
-    /// "HH:MM", exclusive end (`from >= to` means overnight).
+    /// "HH:MM", exclusive end (`from > to` means overnight, `from == to`
+    /// means all day).
     pub to: String,
 }
 
@@ -145,7 +147,7 @@ impl Settings {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NetworkDef {
     pub ssid: String,
     /// A password is only needed once. On first successful connect,
@@ -155,17 +157,18 @@ pub struct NetworkDef {
     /// rather than writing a plaintext copy that's no longer needed. `None`
     /// means either "NetworkManager already owns this secret" or "this is
     /// an open (unsecured) network": both cases behave the same way on
-    /// connect: no PSK is sent to nmcli at all. When `Some`, the PSK is
-    /// fed to `nmcli --ask` on stdin, never as an argv element.
+    /// connect: no secret is sent to NetworkManager at all. When `Some`,
+    /// the secret travels inside a D-Bus settings payload, never on argv.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
     /// Per-network DNS override. `None` falls back to `settings.dns`;
-    /// an explicitly empty string disables DNS pinning for this network.
+    /// an explicitly empty string disables DNS pinning for this network
+    /// (and removes a pin breadcrumbs applied earlier).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns: Option<String>,
     /// WPA-Enterprise (802.1x). When `eap` is set the network is treated as
     /// enterprise: `identity` + `password` (reused) + optional `ca_cert`
-    /// path. `eap` is e.g. "peap" or "tls".
+    /// path. `eap` is "peap", "ttls" or "tls".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eap: Option<String>,
     /// 802.1x identity (e.g. `user@corp`) for enterprise networks.
@@ -174,6 +177,17 @@ pub struct NetworkDef {
     /// Path to a CA certificate for 802.1x (optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_cert: Option<String>,
+    /// Inner (phase 2) authentication for PEAP/TTLS, e.g. "mschapv2"
+    /// (the default when unset) or "pap".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase2: Option<String>,
+    /// Client certificate path for EAP-TLS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_cert: Option<String>,
+    /// Private key path for EAP-TLS. `password` is used as the key's
+    /// passphrase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_key: Option<String>,
     #[serde(default)]
     pub hidden: bool,
 }
@@ -342,21 +356,19 @@ impl Config {
         // fresh config). The next `save()` writes them to networks.toml and
         // stops writing them into breadcrumbs.toml, completing the migration.
 
-        // Enforce the documented minimum so `list` and the watch loop agree
-        // on the poll interval (watch silently clamps to 4 otherwise).
-        if cfg.settings.watch_interval < 4 {
-            cfg.settings.watch_interval = 4;
-        }
-
         ensure_core_profiles(&mut cfg);
         Ok(cfg)
     }
 
     /// Persist settings + profiles to `breadcrumbs.toml` and networks to the
-    /// separate `networks.toml`, both `0600`. Every mutating command (`add`,
-    /// `forget`, `scan`, `profile set`, and `flow::run`'s own credential
-    /// clearing) goes through this single method so the two files never
-    /// drift out of sync with each other.
+    /// separate `networks.toml`, both `0600`. Every mutating path goes
+    /// through this single method so the two files never drift out of sync
+    /// with each other.
+    ///
+    /// This is the raw write: it takes no lock. Code that mutates config
+    /// concurrently with other breadcrumbs processes (the watch daemon,
+    /// one-shot commands) must go through [`Config::update`], which wraps a
+    /// fresh load, the change and this save in the config-dir lock.
     pub fn save(&mut self) -> Result<(), String> {
         // The first save marks the config as user-owned: core profiles are
         // backfilled only for genuinely fresh/legacy configs, never
@@ -366,18 +378,15 @@ impl Config {
         let dir = config_dir();
         fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
 
-        // Atomic (temp file then rename) so a crash mid-write, or a
-        // concurrent reader that did not take the config lock, never sees a
-        // truncated file. `0o600` is set on the temp file up front so any
-        // still-plaintext Wi-Fi password is never briefly world-readable.
-        // Callers that mutate config (`app::real_main`, the `watch` loop)
-        // hold `lock::acquire(&config_dir())` across their whole load,
-        // modify, save cycle so concurrent cycles serialise (CRUMB-10).
-        let text = toml::to_string_pretty(self).map_err(|e| format!("serializing config: {e}"))?;
-        let path = config_path();
-        bread_utils::atomic::write_atomic(&path, &text, Some(0o600))
-            .map_err(|e| format!("writing {}: {e}", path.display()))?;
-
+        // Networks first: during a legacy migration the inline networks are
+        // dropped from breadcrumbs.toml by the second write, so they must
+        // already be safely in networks.toml if that write succeeds and the
+        // process dies (or the disk fills) right after.
+        //
+        // Both writes are atomic (temp file then rename) so a crash
+        // mid-write, or a concurrent reader, never sees a truncated file.
+        // `0o600` is set on the temp file up front so any still-plaintext
+        // Wi-Fi password is never briefly world-readable.
         let nf = NetworksFile {
             networks: self.networks.clone(),
         };
@@ -387,7 +396,130 @@ impl Config {
         bread_utils::atomic::write_atomic(&net_path, &net_text, Some(0o600))
             .map_err(|e| format!("writing {}: {e}", net_path.display()))?;
 
+        let fresh = toml::to_string_pretty(self).map_err(|e| format!("serializing config: {e}"))?;
+        let path = config_path();
+        // breadcrumbs.toml is the hand-edited file: patch the existing
+        // document in place so the user's comments and layout survive a
+        // daemon-initiated save (clearing a password, learning an SSID).
+        let text = match fs::read_to_string(&path) {
+            Ok(existing) => preserve_layout(&existing, &fresh).unwrap_or(fresh),
+            Err(_) => fresh,
+        };
+        bread_utils::atomic::write_atomic(&path, &text, Some(0o600))
+            .map_err(|e| format!("writing {}: {e}", path.display()))?;
+
         Ok(())
+    }
+
+    /// Load the current config, apply `f`, and save it, all while holding
+    /// the config-dir lock, so concurrent load, modify, save cycles (the
+    /// watch daemon, `add`, `forget`, ...) queue instead of one silently
+    /// dropping another's change (CRUMB-10). The lock is held only for this
+    /// short cycle, never across a prompt, a connect or a network probe.
+    ///
+    /// Returns the freshly saved config. Must not be called while this
+    /// process already holds the config lock (`flock` is per open file, so
+    /// a second acquire in the same process would deadlock).
+    pub fn update(f: impl FnOnce(&mut Config) -> Result<(), String>) -> Result<Config, String> {
+        let _lock = crate::lock::acquire(&config_dir())
+            .map_err(|e| format!("could not lock the config directory: {e}"))?;
+        let mut cfg = Config::load()?;
+        f(&mut cfg)?;
+        cfg.save()?;
+        Ok(cfg)
+    }
+
+    /// Human-readable problems with the config that would make automation
+    /// silently do nothing: dangling profile / network references,
+    /// malformed schedule windows, a Tailscale profile with no exit node.
+    /// Reported by `doctor`.
+    pub fn validate(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.profiles.contains_key(&self.settings.default_profile) {
+            out.push(format!(
+                "settings.default_profile '{}' is not a defined profile",
+                self.settings.default_profile
+            ));
+        }
+        for (i, e) in self.settings.schedule.iter().enumerate() {
+            if !self.profiles.contains_key(&e.profile) {
+                out.push(format!(
+                    "schedule[{i}] targets unknown profile '{}'",
+                    e.profile
+                ));
+            }
+            for (field, v) in [("from", &e.from), ("to", &e.to)] {
+                if hhmm_to_minutes(v).is_none() {
+                    out.push(format!(
+                        "schedule[{i}].{field} '{v}' is not a valid HH:MM time"
+                    ));
+                }
+            }
+        }
+        for (name, p) in &self.profiles {
+            for ssid in p.networks.iter().chain(p.bootstrap.iter()) {
+                if self.network(ssid).is_none() {
+                    out.push(format!(
+                        "profile '{name}' references '{ssid}', which is not a saved network"
+                    ));
+                }
+            }
+            if p.tailscale && self.exit_nodes_for(name).is_empty() {
+                out.push(format!(
+                    "profile '{name}' requires Tailscale but no exit node is configured"
+                ));
+            }
+        }
+        out
+    }
+}
+
+impl Settings {
+    /// The watch loop's poll interval, clamped to the documented minimum of
+    /// 4s. Clamped on use rather than rewritten at load, so a save never
+    /// silently changes the value the user wrote.
+    pub fn poll_interval(&self) -> u64 {
+        self.watch_interval.max(4)
+    }
+}
+
+/// Re-render `fresh` (the serialized config) onto the layout of `existing`
+/// (what is on disk): values are updated in place, keeping comments and
+/// formatting attached to them; new keys are appended; keys no longer
+/// present are removed. `None` if `existing` does not parse, in which case
+/// the caller writes `fresh` as is.
+fn preserve_layout(existing: &str, fresh: &str) -> Option<String> {
+    let mut doc: toml_edit::DocumentMut = existing.parse().ok()?;
+    let new: toml_edit::DocumentMut = fresh.parse().ok()?;
+    merge_table(doc.as_table_mut(), new.as_table());
+    Some(doc.to_string())
+}
+
+fn merge_table(old: &mut toml_edit::Table, new: &toml_edit::Table) {
+    use toml_edit::Item;
+    let stale: Vec<String> = old
+        .iter()
+        .map(|(k, _)| k.to_string())
+        .filter(|k| !new.contains_key(k))
+        .collect();
+    for k in stale {
+        old.remove(&k);
+    }
+    for (k, nv) in new.iter() {
+        match (old.get_mut(k), nv) {
+            (Some(Item::Table(ot)), Item::Table(nt)) => merge_table(ot, nt),
+            (Some(Item::Value(ov)), Item::Value(nval)) => {
+                if ov.to_string().trim() != nval.to_string().trim() {
+                    let decor = ov.decor().clone();
+                    *ov = nval.clone();
+                    *ov.decor_mut() = decor;
+                }
+            }
+            (Some(slot), _) => *slot = nv.clone(),
+            (None, _) => {
+                old.insert(k, nv.clone());
+            }
+        }
     }
 }
 
@@ -454,7 +586,12 @@ fn ensure_core_profiles(cfg: &mut Config) {
         return;
     }
     for (name, prof) in core_profiles() {
-        cfg.profiles.entry(name).or_insert(prof);
+        // Case-insensitive: a user's "Home" already is the home profile,
+        // so don't add a confusing lowercase twin next to it.
+        if cfg.profiles.keys().any(|k| k.eq_ignore_ascii_case(&name)) {
+            continue;
+        }
+        cfg.profiles.insert(name, prof);
     }
 }
 
@@ -594,6 +731,7 @@ hidden = false"#;
             identity: None,
             ca_cert: None,
             hidden: false,
+            ..Default::default()
         };
         let text = toml::to_string_pretty(&n).unwrap();
         assert!(!text.contains("password"), "text: {text}");
@@ -609,6 +747,7 @@ hidden = false"#;
             identity: None,
             ca_cert: None,
             hidden: false,
+            ..Default::default()
         };
         let text = toml::to_string_pretty(&n).unwrap();
         assert!(text.contains("hunter2"));
@@ -740,6 +879,7 @@ dns = "9.9.9.9""#;
             identity: None,
             ca_cert: None,
             hidden: false,
+            ..Default::default()
         };
         assert_eq!(n.effective_dns("1.1.1.1"), "9.9.9.9");
 
@@ -767,6 +907,7 @@ dns = "9.9.9.9""#;
             identity: Some("user@corp".into()),
             ca_cert: Some("/etc/ca.pem".into()),
             hidden: false,
+            ..Default::default()
         };
         let text = toml::to_string_pretty(&n).unwrap();
         assert!(text.contains("eap") && text.contains("identity") && text.contains("ca_cert"));

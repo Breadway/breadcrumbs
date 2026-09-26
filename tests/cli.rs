@@ -404,7 +404,8 @@ fn install_service_no_enable_writes_valid_unit_file() {
     assert!(unit_path.exists());
     let text = fs::read_to_string(unit_path).unwrap();
     assert!(text.contains("ExecStart="));
-    assert!(text.contains("breadcrumbs watch"));
+    // Path quoted so a location with spaces stays a single argument.
+    assert!(text.contains("breadcrumbs\" watch"), "unit: {text}");
     assert!(text.contains("[Install]"));
     assert!(text.contains("WantedBy=default.target"));
 }
@@ -933,7 +934,7 @@ fn prune_removes_stale_nm_profiles() {
     nm.save_connection("OldCafe", None);
     sb.cmd(&["list"]);
 
-    let o = sb.cmd(&["prune"]);
+    let o = sb.cmd(&["prune", "--yes"]);
     assert!(o.status.success(), "stderr: {}", stderr(&o));
     let out = stdout(&o);
     assert!(
@@ -963,4 +964,143 @@ fn init_wait_retries_until_connect_succeeds() {
     let o = sb.cmd(&["init", "--wait", "5"]);
     assert!(o.status.success(), "stderr: {}", stderr(&o));
     assert!(stdout(&o).contains("connected"), "out: {}", stdout(&o));
+}
+
+// -----------------------------------------------------------------------
+// Regression tests for the 2026-09 audit fixes.
+// -----------------------------------------------------------------------
+
+#[test]
+fn read_only_commands_do_not_wait_for_the_config_lock() {
+    // The watch daemon (or a `scan` waiting at its prompt) holding the
+    // config lock used to block `status`, which breadbar polls with a
+    // timeout. Reads must not take the lock at all.
+    let sb = Sandbox::new();
+    sb.cmd(&["list"]); // bootstrap the config
+    let _held = breadcrumbs::lock::acquire(&sb.root.join("config/breadcrumbs")).unwrap();
+
+    let mut child = Command::new(BIN)
+        .args(["status", "--json"])
+        .env_clear()
+        .env("HOME", &sb.root)
+        .env("XDG_CONFIG_HOME", sb.root.join("config"))
+        .env("XDG_STATE_HOME", sb.root.join("state"))
+        .env("PATH", sb.root.join("bin"))
+        .env("DBUS_SYSTEM_BUS_ADDRESS", &sb._bus.addr)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    let finished = loop {
+        if child.try_wait().unwrap().is_some() {
+            break true;
+        }
+        if start.elapsed() > std::time::Duration::from_secs(10) {
+            let _ = child.kill();
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert!(finished, "`status` blocked on a held config lock");
+}
+
+#[test]
+fn status_json_reports_the_ipv4_address() {
+    let sb = Sandbox::new();
+    let nm = sb.nm();
+    let dev = nm.add_wifi_device("wlan0", 100);
+    let ap = nm.add_ap(&dev, "HomeWifi", 80, Security::Wpa2);
+    nm.set_active_ap(&dev, &ap);
+
+    let o = sb.cmd(&["status", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).expect("json");
+    assert_eq!(v["ip"], "192.168.1.42", "status: {v}");
+}
+
+#[test]
+fn prune_refuses_without_confirmation_when_not_interactive() {
+    let sb = Sandbox::new();
+    let nm = sb.nm();
+    nm.save_connection("OldCafe", None);
+    sb.cmd(&["list"]);
+
+    let o = sb.cmd(&["prune"]);
+    assert!(!o.status.success());
+    assert!(stderr(&o).contains("--yes"), "stderr: {}", stderr(&o));
+    assert_eq!(nm.connection_count(), 1, "nothing may be deleted");
+}
+
+#[test]
+fn add_to_profile_with_blank_prompt_keeps_the_existing_password() {
+    // `add Net --to home` only means "attach to home": answering the prompt
+    // with nothing must not wipe a password that hasn't been used yet.
+    let sb = Sandbox::new();
+    sb.cmd_stdin(&["add", "Cafe", "--password-stdin"], "secret\n");
+    let o = sb.cmd_stdin(&["add", "Cafe", "--to", "home"], "\n");
+    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    let nets = fs::read_to_string(sb.networks_file()).unwrap();
+    assert!(nets.contains("secret"), "password was dropped: {nets}");
+    let cfg = fs::read_to_string(sb.config_file()).unwrap();
+    assert!(cfg.contains("\"Cafe\""), "not attached to home: {cfg}");
+}
+
+#[test]
+fn saving_keeps_comments_and_the_users_own_values() {
+    let sb = Sandbox::new();
+    fs::create_dir_all(sb.root.join("config/breadcrumbs")).unwrap();
+    fs::write(
+        sb.config_file(),
+        "# my wifi setup\n[settings]\nwatch_interval = 2 # fast polling please\n\n\
+         [profiles.home]\n# the flat\nnetworks = []\n",
+    )
+    .unwrap();
+
+    let o = sb.cmd_stdin(&["add", "Cafe", "--password-stdin", "--to", "home"], "pw\n");
+    assert!(o.status.success(), "stderr: {}", stderr(&o));
+    let text = fs::read_to_string(sb.config_file()).unwrap();
+    assert!(text.contains("# my wifi setup"), "{text}");
+    assert!(text.contains("# fast polling please"), "{text}");
+    assert!(text.contains("# the flat"), "{text}");
+    assert!(
+        text.contains("watch_interval = 2"),
+        "the clamp must not be written back: {text}"
+    );
+}
+
+#[test]
+fn core_profiles_are_not_duplicated_in_another_case() {
+    let sb = Sandbox::new();
+    fs::create_dir_all(sb.root.join("config/breadcrumbs")).unwrap();
+    fs::write(sb.config_file(), "[profiles.Home]\nnetworks = []\n").unwrap();
+
+    let o = sb.cmd(&["profile", "list"]);
+    let out = stdout(&o);
+    assert!(out.contains("Home"), "{out}");
+    assert!(
+        !out.lines()
+            .any(|l| l.trim_start_matches(['*', ' ']) == "home"),
+        "{out}"
+    );
+    assert!(out.contains("work") && out.contains("away"), "{out}");
+}
+
+#[test]
+fn doctor_reports_config_problems() {
+    let sb = Sandbox::new();
+    fs::create_dir_all(sb.root.join("config/breadcrumbs")).unwrap();
+    fs::write(
+        sb.config_file(),
+        "[settings]\ndefault_profile = \"nowhere\"\n\n\
+         [[settings.schedule]]\nprofile = \"ghost\"\nfrom = \"25:00\"\nto = \"07:00\"\n\n\
+         [profiles.home]\nnetworks = [\"Missing\"]\n",
+    )
+    .unwrap();
+
+    let o = sb.cmd(&["doctor"]);
+    let out = stdout(&o);
+    assert!(out.contains("default_profile 'nowhere'"), "{out}");
+    assert!(out.contains("unknown profile 'ghost'"), "{out}");
+    assert!(out.contains("'25:00'"), "{out}");
+    assert!(out.contains("'Missing'"), "{out}");
 }
