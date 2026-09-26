@@ -1,11 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use bread_utils::bread_client::BreadClient;
 use zbus::blocking::{Connection, Proxy};
-use zbus::zvariant::OwnedValue;
+use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
 use crate::bread_events;
 use crate::config::Config;
@@ -15,20 +16,7 @@ use crate::notify::{log, notify, Urgency};
 use crate::state::{self, State};
 use crate::status::{self};
 use crate::tailscale::TsHealth;
-
-/// Take the config-dir lock for the working part of a tick. A failure to
-/// lock is logged once and treated as non-fatal: the watch daemon keeps
-/// running (unlocked) rather than stopping, matching how the rest of the
-/// loop degrades.
-fn lock_config_dir() -> Option<crate::lock::Guard> {
-    match crate::lock::acquire(&crate::config::config_dir()) {
-        Ok(g) => Some(g),
-        Err(e) => {
-            log(&format!("watch: proceeding without config lock: {e}"));
-            None
-        }
-    }
-}
+use crate::util::boot_secs;
 
 const NM_DEST: &str = "org.freedesktop.NetworkManager";
 const NM_PATH: &str = "/org/freedesktop/NetworkManager";
@@ -151,13 +139,26 @@ fn debounce_ready(last: Option<Instant>, gap: Duration) -> bool {
 }
 
 /// Whether the flow-recovery cooldown has elapsed since the last `flow::run`
-/// (or one never ran). Pure so the recovery pacing is unit-testable.
-fn recovery_due(last_flow_at: Option<Instant>, now: Instant, cooldown_secs: u64) -> bool {
-    last_flow_at
-        .map(|t| now.duration_since(t).as_secs())
-        .unwrap_or(u64::MAX)
-        >= cooldown_secs
+/// (or one never ran). Times are [`boot_secs`] readings, so time spent
+/// suspended counts toward the cooldown. Pure so the recovery pacing is
+/// unit-testable.
+fn recovery_due(last_flow_at: Option<f64>, now: f64, cooldown_secs: f64) -> bool {
+    last_flow_at.is_none_or(|t| now - t >= cooldown_secs)
 }
+
+/// Whether a no-internet observation should trigger recovery now. A single
+/// failed probe while the link is associated is not enough: probes fail
+/// transiently (a slow DNS answer, a dropped ICMP), and recovering an
+/// associated link can mean reconnecting it. Require `DOWN_CONFIRMATIONS`
+/// consecutive failures first. With no association at all there is
+/// nothing to lose, so recover at once.
+fn down_confirmed(associated: bool, consecutive_down: u32) -> bool {
+    !associated || consecutive_down >= DOWN_CONFIRMATIONS
+}
+
+const DOWN_CONFIRMATIONS: u32 = 2;
+/// How soon to re-probe after a first unconfirmed failure.
+const CONFIRM_RECHECK: Duration = Duration::from_secs(4);
 
 /// A wake signal for the watch loop. `SetProfile` is an *action* (applied on
 /// the loop thread), `LinkChurn` is just "go look"; the distinction keeps
@@ -173,7 +174,10 @@ enum Wake {
 /// that catches "still connected but lost the internet" (portal, DHCP
 /// failure) without waiting out the poll interval.
 fn props_changed_connectivity(msg: &zbus::Message) -> bool {
-    let Ok(body) = msg.body().deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>() else {
+    let Ok(body) = msg
+        .body()
+        .deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>()
+    else {
         return false;
     };
     body.0 == NM_IFACE && body.1.contains_key("Connectivity")
@@ -183,8 +187,13 @@ fn props_changed_connectivity(msg: &zbus::Message) -> bool {
 /// each matching message, reconnecting on bus/NM restarts. One thread per
 /// subscription (a handful at most); each owns its own connection so a dead
 /// bus can't wedge the others.
-fn spawn_signal_watcher<F>(tx: mpsc::Sender<Wake>, path: String, iface: &'static str, signal: &'static str, mut on_msg: F)
-where
+fn spawn_signal_watcher<F>(
+    tx: mpsc::Sender<Wake>,
+    path: String,
+    iface: &'static str,
+    signal: &'static str,
+    mut on_msg: F,
+) where
     F: FnMut(&zbus::Message) -> bool + Send + 'static,
 {
     thread::spawn(move || loop {
@@ -238,12 +247,44 @@ fn spawn_nm_monitor(tx: mpsc::Sender<Wake>) {
         "PropertiesChanged",
         props_changed_connectivity,
     );
-    spawn_signal_watcher(tx.clone(), NM_PATH.to_string(), NM_IFACE, "DeviceAdded", |_| true);
-    spawn_signal_watcher(tx.clone(), NM_PATH.to_string(), NM_IFACE, "DeviceRemoved", |_| true);
-    // StateChanged on each Wi-Fi device. Devices added later (USB dongle
-    // hotplug) are caught by the DeviceAdded watcher waking the loop; the
-    // poll interval covers anything else.
+    spawn_signal_watcher(
+        tx.clone(),
+        NM_PATH.to_string(),
+        NM_IFACE,
+        "DeviceRemoved",
+        |_| true,
+    );
+    // StateChanged on each Wi-Fi device, including ones that appear later
+    // (USB dongle hotplug, or a driver reload that re-creates the device
+    // under a new object path): the DeviceAdded handler subscribes those.
+    let watched: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     for path in nm::wifi_device_paths() {
+        watch_device(&tx, &watched, path);
+    }
+    let (tx2, watched2) = (tx.clone(), watched);
+    spawn_signal_watcher(
+        tx,
+        NM_PATH.to_string(),
+        NM_IFACE,
+        "DeviceAdded",
+        move |msg| {
+            if let Ok(path) = msg.body().deserialize::<OwnedObjectPath>() {
+                if nm::is_wifi_device(path.as_str()) {
+                    watch_device(&tx2, &watched2, path.as_str().to_string());
+                }
+            }
+            true
+        },
+    );
+}
+
+/// Subscribe to `StateChanged` on one Wi-Fi device, once per path.
+fn watch_device(tx: &mpsc::Sender<Wake>, watched: &Mutex<HashSet<String>>, path: String) {
+    let fresh = watched
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.clone());
+    if fresh {
         spawn_signal_watcher(tx.clone(), path, DEV_IFACE, "StateChanged", |_| true);
     }
 }
@@ -279,7 +320,7 @@ fn wait_for_tick(rx: &Receiver<Wake>, dur: Duration) -> Option<Wake> {
 }
 
 pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
-    let base = cfg.settings.watch_interval.max(4);
+    let base = cfg.settings.poll_interval();
     notify(
         "breadcrumbs watcher started",
         "Monitoring Wi-Fi; will auto-recover drops.",
@@ -300,21 +341,19 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
     // thread.
     let bread = BreadClient::connect(bread_events::APP_ID);
     let wake = tx;
-    let _commands = bread.subscribe("bread.command.crumbs.**", move |event| {
-        match bread_events::handle_command(&event) {
-            bread_events::CommandAction::SetProfile(name) => {
-                let _ = wake.send(Wake::SetProfile(name));
-            }
-            bread_events::CommandAction::Ignore => {}
-        }
-    });
+    let _commands =
+        bread.subscribe(
+            "bread.command.crumbs.**",
+            move |event| match bread_events::handle_command(&event) {
+                bread_events::CommandAction::SetProfile(name) => {
+                    let _ = wake.send(Wake::SetProfile(name));
+                }
+                bread_events::CommandAction::Ignore => {}
+            },
+        );
 
     let mut profile = State::load(&cfg.settings.default_profile).profile;
     if run_initial {
-        // Hold the config lock across the initial flow: `flow::run_quiet`
-        // can clear a stored password and save, which must not race a
-        // concurrent one-shot command (CRUMB-10).
-        let _lock = lock_config_dir();
         // Don't churn an already-working connection on (re)start.
         let class = classify(&cfg, &profile);
         if class.health == Health::Up {
@@ -332,25 +371,33 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
     let mut prev_ssid: Option<String> = None;
     let mut prev_ts: Option<&'static str> = None;
     let mut fail_streak: u32 = 0;
-    let mut last_flow_at: Option<Instant> = None;
-    const FLOW_COOLDOWN: u64 = 20;
-    const RESUME_SLACK: Duration = Duration::from_secs(60);
-    const SCHEDULE_GRACE: Duration = Duration::from_secs(30 * 60);
+    let mut consecutive_down: u32 = 0;
+    // Whether "connection lost" has been shown for the current outage, so
+    // the notification is sent once, and only once the outage is
+    // confirmed.
+    let mut notified_down = false;
+    let mut last_flow_at: Option<f64> = None;
+    const FLOW_COOLDOWN: f64 = 20.0;
+    const RESUME_SLACK: f64 = 60.0;
+    const SCHEDULE_GRACE: f64 = 30.0 * 60.0;
     let mut prev_wait = Duration::from_secs(base);
-    let mut last_tick_at = Instant::now();
+    // Boot clock, not `Instant`: `Instant` stops while suspended, so a
+    // monotonic gap check can never see a suspend/resume.
+    let mut last_tick_at = boot_secs();
+    let mut warned_schedule: HashSet<String> = HashSet::new();
     // Tracks what the *schedule* last applied, so the loop can tell a
     // manual `profile set` (CLI or bus) apart from its own switch and give
     // manual changes a grace window before the schedule overrides them.
     let mut last_schedule_applied: Option<String> = Some(profile.clone());
-    let mut manual_set_at: Option<Instant> = None;
+    let mut manual_set_at: Option<f64> = None;
 
     loop {
-        // Hold the config-dir lock for the working part of each tick (the
-        // reload, the schedule switch, and any `flow::run_quiet`), then
-        // release it for the idle wait so one-shot commands are not blocked
-        // between ticks (CRUMB-10).
-        let tick_lock = lock_config_dir();
-
+        // No lock is held across a tick: reads need none (writes are
+        // atomic), and the few writes a tick can make (clearing a used
+        // password, learning an SSID, a schedule switch) each take the lock
+        // for just their own load, modify, save. Holding it across a
+        // recovery flow used to stall every other breadcrumbs command,
+        // including breadbar's `status` polls, for the whole flow.
         // Reload config + state so edits and `profile set` take effect live.
         // This always runs *before* `flow::run` below (never after, within
         // the same tick), so a password `flow::run` clears-and-saves this
@@ -368,7 +415,7 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
         // machine sleeps, so a large wall-clock gap means the network state
         // may have changed underneath us; allow an immediate recovery run
         // instead of waiting out any remaining flow cooldown.
-        if last_tick_at.elapsed() > prev_wait + RESUME_SLACK {
+        if boot_secs() - last_tick_at > prev_wait.as_secs_f64() + RESUME_SLACK {
             log("watch: large gap since last tick (suspend/resume?), forcing recovery check");
             last_flow_at = None;
         }
@@ -380,14 +427,20 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
             // The persisted profile changed and it wasn't our own schedule
             // switch: a manual set (CLI or bus). Start the grace window.
             if last_schedule_applied.is_some() {
-                manual_set_at = Some(Instant::now());
+                manual_set_at = Some(boot_secs());
             }
             last_schedule_applied = Some(profile.clone());
         }
         if let Some(sched) = scheduled_profile_now(&cfg) {
-            if sched != profile {
+            if !cfg.profiles.contains_key(&sched) {
+                if warned_schedule.insert(sched.clone()) {
+                    log(&format!(
+                        "watch: schedule targets unknown profile '{sched}', ignoring it"
+                    ));
+                }
+            } else if sched != profile {
                 let grace_ok = manual_set_at
-                    .map(|t| t.elapsed() >= SCHEDULE_GRACE)
+                    .map(|t| boot_secs() - t >= SCHEDULE_GRACE)
                     .unwrap_or(true);
                 if grace_ok {
                     if state::set_profile(&cfg, &sched).is_ok() {
@@ -454,9 +507,19 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
             prev_ts = ts_state;
         }
 
+        if health == Health::DownNoNet {
+            consecutive_down = consecutive_down.saturating_add(1);
+        } else {
+            consecutive_down = 0;
+        }
+        let awaiting_confirmation =
+            health == Health::DownNoNet && !down_confirmed(ssid.is_some(), consecutive_down);
+
         match &health {
             Health::Up => {
-                if transition && prev_health.is_some() {
+                // Only after a "connection lost" was actually shown: a
+                // single unconfirmed failed probe is not worth two popups.
+                if transition && prev_health.is_some() && notified_down {
                     notify(
                         "breadcrumbs: back online",
                         &format!(
@@ -467,6 +530,7 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
                     );
                 }
                 fail_streak = 0;
+                notified_down = false;
             }
             Health::NoAdapter => {
                 if transition {
@@ -518,10 +582,11 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
                 // Re-attempt periodically and on the transition into this
                 // state: login may have completed since the last attempt, or
                 // the user may have missed the browser window. Quiet: a
-                // still-broken state must not re-notify on every retry.
-                if recovery_due(last_flow_at, Instant::now(), FLOW_COOLDOWN) {
+                // still-broken state must not re-notify on every retry. Connecting is idempotent, so
+                // this no longer bounces the Wi-Fi link while waiting.
+                if recovery_due(last_flow_at, boot_secs(), FLOW_COOLDOWN) {
                     let outcome = flow::run_quiet(&mut cfg, &profile);
-                    last_flow_at = Some(Instant::now());
+                    last_flow_at = Some(boot_secs());
                     fail_streak = if outcome.ok() {
                         0
                     } else {
@@ -530,21 +595,26 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
                 }
             }
             Health::DownNoNet | Health::DownTailscaleOther => {
-                if transition {
+                if !awaiting_confirmation && !notified_down {
                     notify(
                         "breadcrumbs: connection lost",
                         &format!("Recovering ({profile})…"),
                         Urgency::Normal,
                     );
+                    notified_down = true;
                 }
-                if recovery_due(last_flow_at, Instant::now(), FLOW_COOLDOWN) {
+                if awaiting_confirmation {
+                    log(&format!(
+                        "watch: down ({health:?}) on {ssid:?}, re-checking before recovering"
+                    ));
+                } else if recovery_due(last_flow_at, boot_secs(), FLOW_COOLDOWN) {
                     log(&format!(
                         "watch: down ({:?}) profile={profile} ssid={:?}, running flow",
                         health, ssid
                     ));
                     let outcome = flow::run_quiet(&mut cfg, &profile);
                     log(&format!("watch: recovery outcome = {:?}", outcome));
-                    last_flow_at = Some(Instant::now());
+                    last_flow_at = Some(boot_secs());
                     fail_streak = if outcome.ok() {
                         0
                     } else {
@@ -561,15 +631,16 @@ pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
 
         prev_health = Some(health);
 
-        // Done touching config/state for this tick: release the lock before
-        // the idle wait below.
-        drop(tick_lock);
-
-        // Adaptive backoff: healthy -> base; failing -> grow up to ~6x.
+        // Adaptive backoff: healthy -> base; failing -> grow up to ~6x. A
+        // first unconfirmed failure re-checks quickly instead.
         let mult = 1 + fail_streak.min(5);
-        let dur = Duration::from_secs(base * mult as u64);
+        let dur = if awaiting_confirmation {
+            CONFIRM_RECHECK
+        } else {
+            Duration::from_secs(base * u64::from(mult))
+        };
         prev_wait = dur;
-        last_tick_at = Instant::now();
+        last_tick_at = boot_secs();
         // Apply a queued set_profile on this thread (the single owner of
         // config/state file access) and emit the confirmation. The next
         // iteration's reload sees the new profile and recovers accordingly.
@@ -657,12 +728,22 @@ mod tests {
 
     #[test]
     fn recovery_due_fires_when_never_run_and_after_cooldown() {
-        // Never run → due immediately (the map() to u64::MAX path).
-        assert!(recovery_due(None, Instant::now(), 20));
+        // Never run → due immediately.
+        assert!(recovery_due(None, 100.0, 20.0));
         // Just ran → not due again yet.
-        let now = Instant::now();
-        assert!(!recovery_due(Some(now), now, 20));
+        assert!(!recovery_due(Some(100.0), 100.0, 20.0));
+        assert!(!recovery_due(Some(100.0), 119.9, 20.0));
+        assert!(recovery_due(Some(100.0), 120.0, 20.0));
         // A zero cooldown is always already-elapsed.
-        assert!(recovery_due(Some(now), now, 0));
+        assert!(recovery_due(Some(100.0), 100.0, 0.0));
+    }
+
+    #[test]
+    fn down_confirmed_needs_two_strikes_only_when_associated() {
+        // Associated: one failed probe is not enough to reconnect.
+        assert!(!down_confirmed(true, 1));
+        assert!(down_confirmed(true, 2));
+        // Not associated: nothing to lose, recover at once.
+        assert!(down_confirmed(false, 1));
     }
 }

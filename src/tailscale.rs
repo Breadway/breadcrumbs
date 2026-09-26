@@ -114,7 +114,13 @@ fn exit_node_state(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_lowercase();
-            let matches = host == want || dns.split('.').next() == Some(want.as_str());
+            // Exit nodes can be configured by hostname, MagicDNS name or
+            // Tailscale IP (`tailscale set --exit-node` accepts all three).
+            let by_ip = p
+                .get("TailscaleIPs")
+                .and_then(Value::as_array)
+                .is_some_and(|ips| ips.iter().any(|ip| ip.as_str() == Some(want.as_str())));
+            let matches = host == want || dns.split('.').next() == Some(want.as_str()) || by_ip;
             let advertises = p
                 .get("ExitNodeOption")
                 .and_then(Value::as_bool)
@@ -146,10 +152,10 @@ static LOGIN_INFLIGHT: AtomicBool = AtomicBool::new(false);
 
 /// Kick off browser-based Tailscale login in the background and return
 /// immediately. The watch loop must never block on interactive auth, so the
-/// actual `sudo tailscale login` + browser flow runs on its own thread; the
-/// caller just keeps reporting `NeedsLogin` (→ stay on the bootstrap network)
-/// until a later poll observes the backend come up. The guard collapses
-/// repeated triggers into a single in-flight attempt.
+/// actual login + browser flow runs on its own thread; the caller just
+/// keeps reporting `NeedsLogin` (→ stay on the bootstrap network) until a
+/// later poll observes the backend come up. The guard collapses repeated
+/// triggers into a single in-flight attempt.
 fn login_and_open() {
     if LOGIN_INFLIGHT.swap(true, Ordering::SeqCst) {
         return;
@@ -160,63 +166,121 @@ fn login_and_open() {
     });
 }
 
-/// Run `sudo tailscale login`, open the auth URL in the browser, and block
-/// until login completes (up to 5 minutes). Always called on a worker thread.
+enum LoginAttempt {
+    /// Login ran (URL opened and finished, timed out, or nothing to do).
+    Done,
+    /// The command was refused before producing a URL (not an operator,
+    /// or sudo wants a password): try the next way.
+    Refused(String),
+}
+
+/// Log in to Tailscale. Tries plain `tailscale login` first, which works
+/// without root when the user is the Tailscale operator
+/// (`tailscale set --operator=$USER`), then `sudo -n tailscale login`,
+/// which works with a passwordless sudo rule. `-n` because this runs from
+/// a daemon with no terminal: a sudo that wants a password fails at once
+/// instead of hanging.
 fn run_login() {
-    let mut child = match Command::new("sudo")
-        .args(["tailscale", "login"])
+    let attempts: [(&str, &[&str]); 2] = [
+        ("tailscale", &["login"]),
+        ("sudo", &["-n", "tailscale", "login"]),
+    ];
+    let mut reasons = Vec::new();
+    for (prog, args) in attempts {
+        match attempt_login(prog, args) {
+            LoginAttempt::Done => return,
+            LoginAttempt::Refused(why) => reasons.push(format!("{prog}: {why}")),
+        }
+    }
+    log(&format!(
+        "tailscale login: could not start login ({}); allow it with \
+         `sudo tailscale set --operator=$USER`",
+        reasons.join("; ")
+    ));
+    notify(
+        "Tailscale: login needed",
+        "Run `tailscale login` (breadcrumbs lacks permission to start it).",
+        Urgency::Normal,
+    );
+}
+
+fn attempt_login(prog: &str, args: &[&str]) -> LoginAttempt {
+    let mut child = match Command::new(prog)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
     {
         Ok(c) => c,
-        Err(e) => {
-            log(&format!("tailscale login: spawn failed: {e}"));
-            return;
+        Err(e) => return LoginAttempt::Refused(format!("spawn failed: {e}")),
+    };
+
+    let (tx, rx) = mpsc::channel::<String>();
+    let pipes: [Option<Box<dyn std::io::Read + Send>>; 2] = [
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+    ];
+    for pipe in pipes.into_iter().flatten() {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        });
+    }
+    drop(tx);
+
+    // Wait for the auth URL, noticing an early exit (refused, or already
+    // logged in) instead of sitting out the whole 30s.
+    let start = Instant::now();
+    let mut output = Vec::new();
+    let url = loop {
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(line) => {
+                if let Some(url) = extract_url(&line) {
+                    break Some(url);
+                }
+                output.push(line);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            if status.success() {
+                return LoginAttempt::Done;
+            }
+            // Give the readers a moment to deliver the error text.
+            thread::sleep(Duration::from_millis(100));
+            output.extend(rx.try_iter());
+            return LoginAttempt::Refused(output.join(" ").trim().to_string());
+        }
+        if start.elapsed() >= Duration::from_secs(30) {
+            break None;
         }
     };
 
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-
-    let (tx, rx) = mpsc::channel::<String>();
-    let tx2 = tx.clone();
-
-    thread::spawn(move || {
-        if let Some(r) = stdout {
-            for line in BufReader::new(r).lines().map_while(Result::ok) {
-                if let Some(url) = extract_url(&line) {
-                    let _ = tx.send(url);
-                }
-            }
+    match url {
+        Some(url) => {
+            log(&format!("tailscale login: opening {url}"));
+            notify(
+                "Tailscale: login required",
+                "Opening browser to authenticate.",
+                Urgency::Normal,
+            );
+            let _ = Command::new("xdg-open")
+                .arg(&url)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
         }
-    });
-    thread::spawn(move || {
-        if let Some(r) = stderr {
-            for line in BufReader::new(r).lines().map_while(Result::ok) {
-                if let Some(url) = extract_url(&line) {
-                    let _ = tx2.send(url);
-                }
-            }
-        }
-    });
-
-    if let Ok(url) = rx.recv_timeout(Duration::from_secs(30)) {
-        log(&format!("tailscale login: opening {url}"));
-        notify(
-            "Tailscale: login required",
-            "Opening browser to authenticate.",
-            Urgency::Normal,
-        );
-        let _ = Command::new("xdg-open")
-            .arg(&url)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-    } else {
-        log("tailscale login: no URL received within 30s");
+        None => log("tailscale login: no URL received within 30s"),
     }
 
     // Wait up to 5 min for the user to complete browser auth.
@@ -237,6 +301,7 @@ fn run_login() {
             Err(_) => break,
         }
     }
+    LoginAttempt::Done
 }
 
 /// Strip whitespace and drop empty entries from the acceptable-node list.
@@ -284,8 +349,9 @@ fn exit_node_health(nodes: &[String], v: &Value) -> TsHealth {
 }
 
 /// Bring Tailscale to a state where one of `nodes` (priority order) is the
-/// active, online exit node. Performs at most one bring-up/login, then one
-/// `tailscale set` per node until one takes.
+/// active, online exit node. Performs at most one bring-up/login, then at
+/// most one `tailscale set` per online node until one takes; a healthy
+/// selection is left untouched.
 pub fn ensure_exit_node(nodes: &[String]) -> TsHealth {
     if !installed() {
         return TsHealth::NotInstalled;
@@ -317,35 +383,59 @@ pub fn ensure_exit_node(nodes: &[String]) -> TsHealth {
         }
     };
 
-    match backend_state(&v).as_str() {
+    let v = match backend_state(&v).as_str() {
         "NeedsLogin" | "NoState" => {
             login_and_open();
+            v
         }
         "Stopped" => {
             // Daemon not running: bring it up, then check if it needs auth.
             let _ = run("tailscale", &["up"], Duration::from_secs(20));
-            if let Some(v2) = status_json() {
-                if matches!(backend_state(&v2).as_str(), "NeedsLogin" | "NoState") {
-                    login_and_open();
+            match status_json() {
+                Some(v2) => {
+                    if matches!(backend_state(&v2).as_str(), "NeedsLogin" | "NoState") {
+                        login_and_open();
+                    }
+                    v2
                 }
+                None => v,
             }
         }
-        "Running" => {}
         "" => return TsHealth::Error("empty backend state".into()),
-        _ => {}
-    }
+        _ => v,
+    };
 
-    // Failover: try each acceptable node in priority order until one is
-    // selected and online.
+    // Failover, in priority order. A node that is already selected and
+    // online is kept as is (no `tailscale set` churn on every recovery
+    // run); an offline or unknown node is skipped rather than selected,
+    // since selecting a dead exit node blackholes all traffic until the
+    // next node is tried. A higher-priority node that is online wins over
+    // a lower-priority one that is currently selected (fail-back).
+    let mut current = v;
     for node in &eff {
+        let (exists, online, selected) = exit_node_state(&current, node);
+        if selected && online {
+            return TsHealth::Ok;
+        }
+        if !(exists && online) {
+            continue;
+        }
         let _ = run(
             "tailscale",
             &["set", &format!("--exit-node={node}")],
             Duration::from_secs(10),
         );
-        if let Some(v2) = status_json() {
-            if matches!(exit_node_health(std::slice::from_ref(node), &v2), TsHealth::Ok) {
-                return TsHealth::Ok;
+        // The switch takes a moment to show up in `status`.
+        for attempt in 0..3 {
+            if attempt > 0 {
+                thread::sleep(Duration::from_millis(300));
+            }
+            if let Some(v2) = status_json() {
+                let ok = exit_node_health(std::slice::from_ref(node), &v2).is_ok();
+                current = v2;
+                if ok {
+                    return TsHealth::Ok;
+                }
             }
         }
     }

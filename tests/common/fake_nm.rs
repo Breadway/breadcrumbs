@@ -120,11 +120,26 @@ pub struct FakeState {
     /// When > 0, the next activations fail (simulating a transient NM
     /// failure); each attempted activation decrements the counter.
     pub fail_next_activations: u32,
+    /// How many `State` reads a new active connection reports ACTIVATING
+    /// (1) before ACTIVATED (2). Meanwhile the device keeps reporting
+    /// ACTIVATED, exactly like real NM mid-switch (the device is still up
+    /// on the connection it is leaving). `u32::MAX` never completes.
+    pub activation_polls: u32,
+    /// Per active connection: `State` reads left before ACTIVATED, or the
+    /// terminal state once deactivated.
+    pub active_state: HashMap<String, ActiveState>,
     pub calls: Vec<String>,
     pub next_dev: u32,
     pub next_ap: u32,
     pub next_conn: u32,
     pub next_active: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ActiveState {
+    Activating(u32),
+    Activated,
+    Deactivated,
 }
 
 #[derive(Clone)]
@@ -166,6 +181,61 @@ pub fn value_str_list(v: &OwnedValue) -> Option<Vec<String>> {
         }
         _ => None,
     }
+}
+
+/// Extract an array of u32 (e.g. `ipv4.dns`, which is `au` on the wire).
+pub fn value_u32_list(v: &OwnedValue) -> Option<Vec<u32>> {
+    match v.deref() {
+        Value::Array(a) => {
+            let mut out = Vec::new();
+            for item in a.inner() {
+                match item {
+                    Value::U32(n) => out.push(*n),
+                    _ => return None,
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// The subset of NetworkManager's own settings verification that a client
+/// can get wrong. Real NM rejects these profiles outright, so the fake must
+/// too, or a client bug passes every test and fails on real hardware.
+fn validate_settings(s: &SettingsMap) -> fdo::Result<()> {
+    let bad = |m: &str| Err(fdo::Error::InvalidArgs(m.to_string()));
+    if let Some(sec) = s.get("802-11-wireless-security") {
+        if sec.get("key-mgmt").is_none() {
+            return bad("802-11-wireless-security.key-mgmt: property is missing");
+        }
+    }
+    if let Some(x1) = s.get("802-1x") {
+        let eap = x1.get("eap").and_then(value_str_list).unwrap_or_default();
+        let tunneled = eap.iter().any(|m| m == "peap" || m == "ttls");
+        if tunneled && x1.get("phase2-auth").is_none() && x1.get("phase2-autheap").is_none() {
+            return bad("802-1x.phase2-auth: property is missing");
+        }
+        for key in ["ca-cert", "client-cert", "private-key"] {
+            if let Some(blob) = x1.get(key).and_then(value_bytes) {
+                if blob.starts_with(b"file://") && blob.last() != Some(&0) {
+                    return bad(&format!("802-1x.{key}: certificate is invalid"));
+                }
+            }
+        }
+    }
+    for section in ["ipv4", "ipv6"] {
+        if let Some(dns) = s.get(section).and_then(|m| m.get("dns")) {
+            let sig = dns.value_signature().to_string();
+            let want = if section == "ipv4" { "au" } else { "aay" };
+            if sig != want {
+                return bad(&format!(
+                    "{section}.dns: can't set property of type '{want}' from value of type '{sig}'"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn ov(v: Value<'_>) -> OwnedValue {
@@ -215,13 +285,18 @@ struct FakeNm {
 #[interface(name = "org.freedesktop.NetworkManager")]
 impl FakeNm {
     async fn get_devices(&self) -> fdo::Result<Vec<OwnedObjectPath>> {
-        let st = self.shared.state.lock().unwrap();
+        let st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         Ok(st.device_order.iter().map(|p| obj(p)).collect())
     }
 
     #[zbus(property)]
     fn wireless_enabled(&self) -> fdo::Result<bool> {
-        Ok(self.shared.state.lock().unwrap().wireless_enabled)
+        Ok(self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .wireless_enabled)
     }
 
     // Setters must return `zbus::Error` (not `fdo::Error`): the macro's
@@ -229,13 +304,22 @@ impl FakeNm {
     // dispatch future is typed `Result<(), zbus::Error>`.
     #[zbus(property)]
     fn set_wireless_enabled(&self, v: bool) -> zbus::Result<()> {
-        self.shared.state.lock().unwrap().wireless_enabled = v;
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .wireless_enabled = v;
         Ok(())
     }
 
     #[zbus(property)]
     fn connectivity(&self) -> fdo::Result<u32> {
-        Ok(self.shared.state.lock().unwrap().connectivity)
+        Ok(self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .connectivity)
     }
 
     async fn activate_connection(
@@ -249,6 +333,14 @@ impl FakeNm {
         Ok(active)
     }
 
+    async fn deactivate_connection(&self, active: OwnedObjectPath) -> fdo::Result<()> {
+        let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.calls.push(format!("deactivate {}", active.as_str()));
+        st.active_state
+            .insert(active.as_str().to_string(), ActiveState::Deactivated);
+        Ok(())
+    }
+
     async fn add_and_activate_connection2(
         &self,
         settings: SettingsMap,
@@ -258,20 +350,31 @@ impl FakeNm {
         #[zbus(connection)] c: &zbus::Connection,
     ) -> fdo::Result<(OwnedObjectPath, OwnedObjectPath)> {
         let conn_path = self.save_connection(settings, c).await?;
-        let active = self.register_active(c, conn_path.as_str(), dev.as_str()).await?;
+        let active = self
+            .register_active(c, conn_path.as_str(), dev.as_str())
+            .await?;
         Ok((conn_path, active))
     }
 }
 
 impl FakeNm {
-    async fn save_connection(&self, settings: SettingsMap, c: &zbus::Connection) -> fdo::Result<OwnedObjectPath> {
+    async fn save_connection(
+        &self,
+        settings: SettingsMap,
+        c: &zbus::Connection,
+    ) -> fdo::Result<OwnedObjectPath> {
         let path = {
-            let mut st = self.shared.state.lock().unwrap();
+            validate_settings(&settings)?;
+            let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
             st.calls.push("AddAndActivateConnection2".into());
             // Same UUID-exists semantics as real NetworkManager: this call
             // creates a *new* profile, so a duplicate UUID is an error, not
             // an upsert (updates go through Settings.Connection.Update2).
-            if st.connections.values().any(|s| conn_id(s) == conn_id(&settings)) {
+            if st
+                .connections
+                .values()
+                .any(|s| conn_id(s) == conn_id(&settings))
+            {
                 return Err(fdo::Error::Failed(
                     "A connection with this UUID already exists.".into(),
                 ));
@@ -282,10 +385,13 @@ impl FakeNm {
             p
         };
         c.object_server()
-            .at(path.as_str(), FakeConn {
-                shared: self.shared.clone(),
-                path: path.clone(),
-            })
+            .at(
+                path.as_str(),
+                FakeConn {
+                    shared: self.shared.clone(),
+                    path: path.clone(),
+                },
+            )
             .await?;
         Ok(obj(&path))
     }
@@ -297,7 +403,7 @@ impl FakeNm {
         dev: &str,
     ) -> fdo::Result<OwnedObjectPath> {
         let (active_path, new_ap) = {
-            let mut st = self.shared.state.lock().unwrap();
+            let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
             st.calls.push(format!("activate {conn_path} -> {dev}"));
             if st.fail_next_activations > 0 {
                 st.fail_next_activations -= 1;
@@ -332,7 +438,10 @@ impl FakeNm {
                             rsn: SEC_PSK,
                         },
                     );
-                    st.dev_aps.entry(dev.to_string()).or_default().push(ap_path.clone());
+                    st.dev_aps
+                        .entry(dev.to_string())
+                        .or_default()
+                        .push(ap_path.clone());
                     dev_ap = Some(ap_path.clone());
                     new_ap = Some(ap_path);
                 }
@@ -346,22 +455,37 @@ impl FakeNm {
             let p = format!("{ACTIVE_PREFIX}/{}", st.next_active);
             st.next_active += 1;
             st.active_conns.insert(p.clone(), conn_path.to_string());
+            let polls = st.activation_polls;
+            st.active_state.insert(
+                p.clone(),
+                if polls == 0 {
+                    ActiveState::Activated
+                } else {
+                    ActiveState::Activating(polls)
+                },
+            );
             st.dev_active.insert(dev.to_string(), p.clone());
             (p, new_ap)
         };
         if let Some(ap) = &new_ap {
             c.object_server()
-                .at(ap.as_str(), FakeAp {
-                    shared: self.shared.clone(),
-                    path: ap.clone(),
-                })
+                .at(
+                    ap.as_str(),
+                    FakeAp {
+                        shared: self.shared.clone(),
+                        path: ap.clone(),
+                    },
+                )
                 .await?;
         }
         c.object_server()
-            .at(active_path.as_str(), FakeActive {
-                shared: self.shared.clone(),
-                path: active_path.clone(),
-            })
+            .at(
+                active_path.as_str(),
+                FakeActive {
+                    shared: self.shared.clone(),
+                    path: active_path.clone(),
+                },
+            )
             .await?;
         Ok(obj(&active_path))
     }
@@ -378,7 +502,7 @@ struct FakeSettings {
 #[interface(name = "org.freedesktop.NetworkManager.Settings")]
 impl FakeSettings {
     async fn list_connections(&self) -> fdo::Result<Vec<OwnedObjectPath>> {
-        let st = self.shared.state.lock().unwrap();
+        let st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         Ok(st.connections.keys().map(|p| obj(p)).collect())
     }
 
@@ -390,13 +514,18 @@ impl FakeSettings {
         #[zbus(connection)] c: &zbus::Connection,
     ) -> fdo::Result<(OwnedObjectPath, HashMap<String, OwnedValue>)> {
         let path = {
-            let mut st = self.shared.state.lock().unwrap();
+            validate_settings(&settings)?;
+            let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
             st.calls.push("AddConnection2".into());
             // Real NetworkManager rejects a duplicate UUID with
             // NM_SETTINGS_ERROR_UUID_EXISTS: it does NOT upsert. Existing
             // profiles must be edited via Settings.Connection.Update2; model
             // that here so a client regression fails loudly.
-            if st.connections.values().any(|s| conn_id(s) == conn_id(&settings)) {
+            if st
+                .connections
+                .values()
+                .any(|s| conn_id(s) == conn_id(&settings))
+            {
                 return Err(fdo::Error::Failed(
                     "A connection with this UUID already exists.".into(),
                 ));
@@ -407,10 +536,13 @@ impl FakeSettings {
             p
         };
         c.object_server()
-            .at(path.as_str(), FakeConn {
-                shared: self.shared.clone(),
-                path: path.clone(),
-            })
+            .at(
+                path.as_str(),
+                FakeConn {
+                    shared: self.shared.clone(),
+                    path: path.clone(),
+                },
+            )
             .await?;
         Ok((obj(&path), HashMap::new()))
     }
@@ -428,7 +560,7 @@ struct FakeConn {
 #[interface(name = "org.freedesktop.NetworkManager.Settings.Connection")]
 impl FakeConn {
     async fn get_settings(&self) -> fdo::Result<SettingsMap> {
-        let st = self.shared.state.lock().unwrap();
+        let st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         let settings = st
             .connections
             .get(&self.path)
@@ -437,7 +569,7 @@ impl FakeConn {
     }
 
     async fn delete(&self) -> fdo::Result<()> {
-        let mut st = self.shared.state.lock().unwrap();
+        let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         st.calls.push(format!("delete {}", self.path));
         st.connections.remove(&self.path);
         Ok(())
@@ -449,7 +581,8 @@ impl FakeConn {
         _flags: u32,
         _args: HashMap<String, OwnedValue>,
     ) -> fdo::Result<HashMap<String, OwnedValue>> {
-        let mut st = self.shared.state.lock().unwrap();
+        validate_settings(&settings)?;
+        let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         st.calls.push("Update2".into());
         st.connections.insert(self.path.clone(), settings);
         Ok(HashMap::new())
@@ -469,27 +602,58 @@ struct FakeAp {
 impl FakeAp {
     #[zbus(property)]
     fn ssid(&self) -> fdo::Result<Vec<u8>> {
-        Ok(self.shared.state.lock().unwrap().aps[&self.path].ssid.clone())
+        Ok(self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .aps[&self.path]
+            .ssid
+            .clone())
     }
 
     #[zbus(property)]
     fn strength(&self) -> fdo::Result<u8> {
-        Ok(self.shared.state.lock().unwrap().aps[&self.path].strength)
+        Ok(self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .aps[&self.path]
+            .strength)
     }
 
     #[zbus(property)]
     fn flags(&self) -> fdo::Result<u32> {
-        Ok(self.shared.state.lock().unwrap().aps[&self.path].flags)
+        Ok(self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .aps[&self.path]
+            .flags)
     }
 
     #[zbus(property)]
     fn wpa_flags(&self) -> fdo::Result<u32> {
-        Ok(self.shared.state.lock().unwrap().aps[&self.path].wpa)
+        Ok(self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .aps[&self.path]
+            .wpa)
     }
 
     #[zbus(property)]
     fn rsn_flags(&self) -> fdo::Result<u32> {
-        Ok(self.shared.state.lock().unwrap().aps[&self.path].rsn)
+        Ok(self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .aps[&self.path]
+            .rsn)
     }
 }
 
@@ -506,22 +670,41 @@ struct FakeDevice {
 impl FakeDevice {
     #[zbus(property)]
     fn interface(&self) -> fdo::Result<String> {
-        Ok(self.shared.state.lock().unwrap().devices[&self.path].iface.clone())
+        Ok(self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .devices[&self.path]
+            .iface
+            .clone())
     }
 
     #[zbus(property)]
     fn device_type(&self) -> fdo::Result<u32> {
-        Ok(self.shared.state.lock().unwrap().devices[&self.path].dev_type)
+        Ok(self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .devices[&self.path]
+            .dev_type)
     }
 
     #[zbus(property)]
     fn state(&self) -> fdo::Result<u32> {
-        Ok(self.shared.state.lock().unwrap().devices[&self.path].state)
+        Ok(self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .devices[&self.path]
+            .state)
     }
 
     #[zbus(property)]
     fn active_connection(&self) -> fdo::Result<OwnedObjectPath> {
-        let st = self.shared.state.lock().unwrap();
+        let st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         Ok(st
             .dev_active
             .get(&self.path)
@@ -531,17 +714,12 @@ impl FakeDevice {
 
     #[zbus(property)]
     fn ip4_config(&self) -> fdo::Result<OwnedObjectPath> {
-        let st = self.shared.state.lock().unwrap();
+        let st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         Ok(obj(&st.devices[&self.path].ip4))
     }
 
-    async fn reapply(
-        &self,
-        _settings: SettingsMap,
-        _version: u64,
-        _flags: u32,
-    ) -> fdo::Result<()> {
-        let mut st = self.shared.state.lock().unwrap();
+    async fn reapply(&self, _settings: SettingsMap, _version: u64, _flags: u32) -> fdo::Result<()> {
+        let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         st.calls.push("Reapply".into());
         Ok(())
     }
@@ -556,7 +734,7 @@ struct FakeWireless {
 impl FakeWireless {
     #[zbus(property)]
     fn active_access_point(&self) -> fdo::Result<OwnedObjectPath> {
-        let st = self.shared.state.lock().unwrap();
+        let st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         Ok(st.devices[&self.path]
             .active_ap
             .as_ref()
@@ -565,7 +743,7 @@ impl FakeWireless {
     }
 
     async fn get_all_access_points(&self) -> fdo::Result<Vec<OwnedObjectPath>> {
-        let st = self.shared.state.lock().unwrap();
+        let st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         Ok(st
             .dev_aps
             .get(&self.path)
@@ -573,9 +751,26 @@ impl FakeWireless {
             .unwrap_or_default())
     }
 
-    async fn request_scan(&self, _options: HashMap<String, OwnedValue>) -> fdo::Result<()> {
-        let mut st = self.shared.state.lock().unwrap();
-        st.calls.push("RequestScan".into());
+    async fn request_scan(&self, options: HashMap<String, OwnedValue>) -> fdo::Result<()> {
+        // Record the directed-probe SSIDs: they are broadcast over the air,
+        // so tests assert which names a scan would announce.
+        let ssids: Vec<String> = options
+            .get("ssids")
+            .and_then(|v| match v.deref() {
+                Value::Array(a) => Some(
+                    a.inner()
+                        .iter()
+                        .filter_map(|item| {
+                            let item = OwnedValue::try_from(item.try_clone().ok()?).ok()?;
+                            value_bytes(&item).map(|b| String::from_utf8_lossy(&b).into_owned())
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.calls.push(format!("RequestScan {ssids:?}"));
         Ok(())
     }
 }
@@ -588,12 +783,18 @@ struct FakeIp4 {
 
 #[interface(name = "org.freedesktop.NetworkManager.IP4Config")]
 impl FakeIp4 {
+    /// Real NM's shape: `aa{sv}` with the address as a string. (The
+    /// deprecated `Addresses` property is `aau`, not modelled: the client
+    /// must not use it.)
     #[zbus(property)]
-    fn addresses(&self) -> fdo::Result<Vec<(u32, u32, u32)>> {
-        let st = self.shared.state.lock().unwrap();
-        // A fixed, recognizable address: 192.168.1.42/24, gw .1.
+    fn address_data(&self) -> fdo::Result<Vec<HashMap<String, OwnedValue>>> {
+        let st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        // A fixed, recognizable address: 192.168.1.42/24.
         let _ = &st.devices[&self.dev];
-        Ok(vec![(0xC0A8012A, 24, 0xC0A80101)])
+        let mut entry = HashMap::new();
+        entry.insert("address".to_string(), ov(Value::from("192.168.1.42")));
+        entry.insert("prefix".to_string(), ov(Value::from(24u32)));
+        Ok(vec![entry])
     }
 }
 
@@ -610,8 +811,34 @@ struct FakeActive {
 impl FakeActive {
     #[zbus(property)]
     fn connection(&self) -> fdo::Result<OwnedObjectPath> {
-        let st = self.shared.state.lock().unwrap();
+        let st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         Ok(obj(&st.active_conns[&self.path]))
+    }
+
+    /// NM_ACTIVE_CONNECTION_STATE: 1 activating, 2 activated, 4 deactivated.
+    #[zbus(property)]
+    fn state(&self) -> fdo::Result<u32> {
+        let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let cur = st
+            .active_state
+            .get(&self.path)
+            .copied()
+            .unwrap_or(ActiveState::Activated);
+        Ok(match cur {
+            ActiveState::Activated => 2,
+            ActiveState::Deactivated => 4,
+            ActiveState::Activating(n) => {
+                if n != u32::MAX {
+                    let next = if n <= 1 {
+                        ActiveState::Activated
+                    } else {
+                        ActiveState::Activating(n - 1)
+                    };
+                    st.active_state.insert(self.path.clone(), next);
+                }
+                1
+            }
+        })
     }
 }
 
@@ -639,11 +866,7 @@ static DBUS_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32
 /// needs NetworkManager to be present.
 pub fn launch_daemon() -> Daemon {
     let n = DBUS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!(
-        "breadcrumbs-dbus-{}-{}",
-        std::process::id(),
-        n
-    ));
+    let dir = std::env::temp_dir().join(format!("breadcrumbs-dbus-{}-{}", std::process::id(), n));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create dbus dir");
     let config = dir.join("bus.conf");
@@ -662,12 +885,7 @@ pub fn launch_daemon() -> Daemon {
     std::io::BufReader::new(child.stdout.take().expect("dbus stdout"))
         .read_line(&mut line)
         .expect("read dbus-daemon address");
-    let addr = line
-        .trim()
-        .split(';')
-        .next()
-        .expect("address")
-        .to_string();
+    let addr = line.trim().split(';').next().expect("address").to_string();
     Daemon { addr, child }
 }
 
@@ -713,14 +931,20 @@ pub fn serve_on(addr: &str) -> FakeNmBus {
     };
 
     conn.object_server()
-        .at(NM_PATH, FakeNm {
-            shared: shared.clone(),
-        })
+        .at(
+            NM_PATH,
+            FakeNm {
+                shared: shared.clone(),
+            },
+        )
         .expect("register fake NM");
     conn.object_server()
-        .at(SETTINGS_PATH, FakeSettings {
-            shared: shared.clone(),
-        })
+        .at(
+            SETTINGS_PATH,
+            FakeSettings {
+                shared: shared.clone(),
+            },
+        )
         .expect("register fake settings");
     conn.request_name(NM_DEST).expect("claim NM name");
 
@@ -737,7 +961,7 @@ impl FakeNmBus {
     }
 
     pub fn reset(&self) {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         st.devices.clear();
         st.device_order.clear();
         st.aps.clear();
@@ -750,6 +974,8 @@ impl FakeNmBus {
         st.land_on = None;
         st.connect_any = false;
         st.fail_next_activations = 0;
+        st.activation_polls = 0;
+        st.active_state.clear();
         st.calls.clear();
         st.next_dev = 1;
         st.next_ap = 1;
@@ -761,7 +987,7 @@ impl FakeNmBus {
     /// state (e.g. 100 = ACTIVATED).
     pub fn add_wifi_device(&self, iface: &str, state: u32) -> String {
         let (dev_path, ip4_path) = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let id = st.next_dev;
             st.next_dev += 1;
             let dev_path = format!("{DEVICES_PREFIX}/{id}");
@@ -826,7 +1052,7 @@ impl FakeNmBus {
     /// hits some other per-device D-Bus hiccup) before the follow-up
     /// property reads land. Returns its object path.
     pub fn add_broken_device(&self) -> String {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let id = st.next_dev;
         st.next_dev += 1;
         // D-Bus object path segments allow only [A-Za-z0-9_], no `-`.
@@ -838,7 +1064,7 @@ impl FakeNmBus {
     /// Add an access point to a device; returns its object path.
     pub fn add_ap(&self, dev: &str, ssid: &str, strength: u8, sec: Security) -> String {
         let (ap_path, flags, wpa, rsn) = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let id = st.next_ap;
             st.next_ap += 1;
             let ap_path = format!("{APS_PREFIX}/{id}");
@@ -853,7 +1079,10 @@ impl FakeNmBus {
                     rsn,
                 },
             );
-            st.dev_aps.entry(dev.to_string()).or_default().push(ap_path.clone());
+            st.dev_aps
+                .entry(dev.to_string())
+                .or_default()
+                .push(ap_path.clone());
             (ap_path, flags, wpa, rsn)
         };
         let _ = (flags, wpa, rsn);
@@ -871,7 +1100,7 @@ impl FakeNmBus {
     }
 
     pub fn set_active_ap(&self, dev: &str, ap: &str) {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(d) = st.devices.get_mut(dev) {
             d.active_ap = Some(ap.to_string());
             d.state = DEV_STATE_ACTIVATED;
@@ -881,27 +1110,45 @@ impl FakeNmBus {
     /// When set, any activation lands the device on the AP with this SSID
     /// (simulating an NM autoconnect race).
     pub fn set_land_on(&self, ssid: Option<&str>) {
-        self.state.lock().unwrap().land_on = ssid.map(str::to_string);
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).land_on = ssid.map(str::to_string);
     }
 
     /// When enabled, connecting to a network with no visible AP creates one
     /// (hidden-network semantics).
     pub fn set_connect_any(&self, on: bool) {
-        self.state.lock().unwrap().connect_any = on;
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .connect_any = on;
     }
 
     /// Make the next `n` activation attempts fail (transient-failure
     /// simulation, e.g. for `init --wait` retries).
     pub fn fail_next_activations(&self, n: u32) {
-        self.state.lock().unwrap().fail_next_activations = n;
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .fail_next_activations = n;
+    }
+
+    /// Make new activations report ACTIVATING for `n` state reads before
+    /// ACTIVATED (`u32::MAX`: never complete).
+    pub fn set_activation_polls(&self, n: u32) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .activation_polls = n;
     }
 
     pub fn set_connectivity(&self, c: u32) {
-        self.state.lock().unwrap().connectivity = c;
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .connectivity = c;
     }
 
     pub fn set_device_state(&self, dev: &str, state: u32) {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(d) = st.devices.get_mut(dev) {
             d.state = state;
         }
@@ -910,10 +1157,23 @@ impl FakeNmBus {
     /// Save a wireless connection profile (as `nm` would create one) and
     /// return its path.
     pub fn save_connection(&self, ssid: &str, password: Option<&str>) -> String {
+        self.save_profile(ssid, ssid, "802-11-wireless", "infrastructure", password)
+    }
+
+    /// Save an arbitrary profile: `conn_type` e.g. "802-3-ethernet",
+    /// `mode` e.g. "ap" for a hotspot. Returns its path.
+    pub fn save_profile(
+        &self,
+        id: &str,
+        ssid: &str,
+        conn_type: &str,
+        mode: &str,
+        password: Option<&str>,
+    ) -> String {
         let mut settings: SettingsMap = HashMap::new();
         let mut conn: HashMap<String, OwnedValue> = HashMap::new();
-        conn.insert("id".into(), ov(Value::from(ssid.to_string())));
-        conn.insert("type".into(), ov(Value::from("802-11-wireless")));
+        conn.insert("id".into(), ov(Value::from(id.to_string())));
+        conn.insert("type".into(), ov(Value::from(conn_type.to_string())));
         conn.insert(
             "uuid".into(),
             ov(Value::from("00000000-0000-4000-8000-000000000001")),
@@ -922,8 +1182,10 @@ impl FakeNmBus {
 
         let mut wifi: HashMap<String, OwnedValue> = HashMap::new();
         wifi.insert("ssid".into(), ov(Value::from(ssid.as_bytes().to_vec())));
-        wifi.insert("mode".into(), ov(Value::from("infrastructure")));
-        settings.insert("802-11-wireless".into(), wifi);
+        wifi.insert("mode".into(), ov(Value::from(mode.to_string())));
+        if conn_type == "802-11-wireless" {
+            settings.insert("802-11-wireless".into(), wifi);
+        }
 
         if let Some(pw) = password {
             let mut sec: HashMap<String, OwnedValue> = HashMap::new();
@@ -937,8 +1199,8 @@ impl FakeNmBus {
         settings.insert("ipv4".into(), ipv4);
 
         let path = {
-            let mut st = self.state.lock().unwrap();
-            st.calls.push(format!("save {ssid}"));
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.calls.push(format!("save {id}"));
             let path = format!("{CONNS_PREFIX}/{}", st.next_conn);
             st.next_conn += 1;
             st.connections.insert(path.clone(), settings);
@@ -957,27 +1219,57 @@ impl FakeNmBus {
         path
     }
 
+    /// Settings of the saved profile at `path`.
+    pub fn profile_settings(&self, path: &str) -> Option<SettingsMap> {
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.connections.get(path).map(clone_settings)
+    }
+
+    pub fn has_profile(&self, path: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .connections
+            .contains_key(path)
+    }
+
     pub fn calls(&self) -> Vec<String> {
-        self.state.lock().unwrap().calls.clone()
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .calls
+            .clone()
     }
 
     pub fn connection_count(&self) -> usize {
-        self.state.lock().unwrap().connections.len()
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .connections
+            .len()
     }
 
     pub fn device_state(&self, dev: &str) -> u32 {
-        self.state.lock().unwrap().devices.get(dev).map(|d| d.state).unwrap_or(0)
+        self.state
+            .lock()
+            .unwrap()
+            .devices
+            .get(dev)
+            .map(|d| d.state)
+            .unwrap_or(0)
     }
 
     pub fn active_ssid(&self, dev: &str) -> Option<String> {
-        let st = self.state.lock().unwrap();
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let ap = st.devices.get(dev)?.active_ap.clone()?;
-        st.aps.get(&ap).map(|a| String::from_utf8_lossy(&a.ssid).into_owned())
+        st.aps
+            .get(&ap)
+            .map(|a| String::from_utf8_lossy(&a.ssid).into_owned())
     }
 
     /// SSIDs of every connection activated so far, in activation order.
     pub fn activated_ssids(&self) -> Vec<String> {
-        let st = self.state.lock().unwrap();
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         st.active_conns
             .values()
             .filter_map(|p| st.connections.get(p).and_then(conn_ssid))
@@ -1017,7 +1309,10 @@ pub fn shared() -> SharedNm {
         let daemon = launch_daemon();
         let bus = serve_on(&daemon.addr);
         std::env::set_var("DBUS_SYSTEM_BUS_ADDRESS", &daemon.addr);
-        Mutex::new(SharedBus { _daemon: daemon, bus })
+        Mutex::new(SharedBus {
+            _daemon: daemon,
+            bus,
+        })
     });
     let guard = bus.lock().unwrap_or_else(|e| e.into_inner());
     SharedNm { guard }

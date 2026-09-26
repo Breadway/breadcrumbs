@@ -7,13 +7,19 @@
 //! serialisation two concurrent cycles can interleave and the later write
 //! silently drops the earlier one's change.
 //!
-//! Holding an exclusive `flock(2)` on a sidecar `.lock` file for the whole
-//! cycle makes concurrent cycles queue instead. `Config::load` / `save` and
-//! `State::load` themselves stay lock free: the lock is taken by the small
-//! number of call sites that own a full cycle (`app::real_main`, the
-//! `watch` loop) so the same process never tries to take it twice and
-//! deadlock. Writes are also atomic (temp file then rename), so a reader
-//! that does not take the lock still never sees a half-written file.
+//! Holding an exclusive `flock(2)` on a sidecar `.lock` file for the
+//! cycle makes concurrent cycles queue instead. The lock is taken only
+//! around the short load, modify, save itself ([`crate::config::Config::update`]
+//! and [`crate::state::State::save`]), never across a prompt, a connect
+//! attempt or a network probe: a lock held for those stalls every other
+//! breadcrumbs process (the watch daemon's recovery, breadbar's `status`
+//! polls) for as long as they take. Reads take no lock at all; writes are
+//! atomic (temp file then rename), so a reader never sees a half-written
+//! file.
+//!
+//! `flock` locks belong to the open file description, so a process that
+//! tries to take a lock it already holds deadlocks: callers must never
+//! nest acquisitions of the same lock.
 
 use std::fs::OpenOptions;
 use std::path::Path;
@@ -31,18 +37,25 @@ pub struct Guard {
 /// and the file if needed. Blocks until the lock is free.
 ///
 /// An error here is unusual (a filesystem with no `flock` support, a
-/// permissions problem on the config dir). Callers treat it as non-fatal:
-/// they log and proceed unlocked rather than refuse to run.
+/// permissions problem on the config dir).
 pub fn acquire(dir: &Path) -> Result<Guard, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
-    let path = dir.join(".lock");
+    acquire_file(&dir.join(".lock"))
+}
+
+/// Take an exclusive advisory lock on the file at `path` itself (created
+/// `0600` if missing). Used for locks that must not share the directory's
+/// `.lock`, such as the log file's rotation lock.
+pub fn acquire_file(path: &Path) -> Result<Guard, String> {
+    use std::os::unix::fs::OpenOptionsExt;
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         // The lock file's contents are irrelevant; never truncate it.
         .truncate(false)
-        .open(&path)
+        .mode(0o600)
+        .open(path)
         .map_err(|e| format!("opening {}: {e}", path.display()))?;
     file.lock()
         .map_err(|e| format!("locking {}: {e}", path.display()))?;

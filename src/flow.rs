@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -6,6 +8,7 @@ use crate::nm;
 use crate::notify::{log, notify, Urgency};
 use crate::status::internet_ok;
 use crate::tailscale::{self, TsHealth};
+use crate::util::boot_secs;
 
 #[derive(Debug)]
 pub enum Outcome {
@@ -57,11 +60,12 @@ fn resolve_candidates(cfg: &Config, p: &crate::config::Profile) -> Vec<NetworkDe
 
 /// A network was just connected to using a local password, and NetworkManager
 /// now durably holds that secret: either in a freshly created connection
-/// profile (`device wifi connect --ask`) or an existing one whose PSK we just
-/// supplied via `--ask connection up`. Either way breadcrumbs no longer needs
-/// its own plaintext copy: clear it and persist immediately so it doesn't sit
-/// on disk any longer than necessary. A no-op (no save) if the network has no
-/// local password to begin with.
+/// profile (`AddAndActivateConnection2`) or an existing one whose secret we
+/// just updated (`Update2`). Either way breadcrumbs no longer needs its own
+/// plaintext copy: clear it in memory and persist immediately (through the
+/// locked [`Config::update`], so a concurrent command's change is not
+/// lost) so it doesn't sit on disk any longer than necessary. A no-op (no
+/// save) if the network has no local password to begin with.
 pub(crate) fn clear_password_if_used(cfg: &mut Config, ssid: &str) {
     let Some(def) = cfg.networks.iter_mut().find(|n| n.ssid == ssid) else {
         return;
@@ -70,7 +74,13 @@ pub(crate) fn clear_password_if_used(cfg: &mut Config, ssid: &str) {
         return;
     }
     def.password = None;
-    if let Err(e) = cfg.save() {
+    let res = Config::update(|disk| {
+        if let Some(n) = disk.networks.iter_mut().find(|n| n.ssid == ssid) {
+            n.password = None;
+        }
+        Ok(())
+    });
+    if let Err(e) = res {
         log(&format!(
             "failed to persist cleared password for {ssid}: {e}"
         ));
@@ -82,22 +92,96 @@ pub(crate) fn clear_password_if_used(cfg: &mut Config, ssid: &str) {
 /// hand-editing. Bounded to keep the list sane; never touches an existing
 /// marker.
 fn learn_ssid(cfg: &mut Config, profile: &str, ssid: &str) {
+    fn learn(p: &mut crate::config::Profile, ssid: &str) -> bool {
+        if !p.learn || p.detect_ssids.len() >= 8 || p.detect_ssids.iter().any(|s| s == ssid) {
+            return false;
+        }
+        p.detect_ssids.push(ssid.to_string());
+        true
+    }
     let Some(p) = cfg.profiles.get_mut(profile) else {
         return;
     };
-    if !p.learn || p.detect_ssids.len() >= 8 || p.detect_ssids.iter().any(|s| s == ssid) {
+    if !learn(p, ssid) {
         return;
     }
-    p.detect_ssids.push(ssid.to_string());
-    if let Err(e) = cfg.save() {
-        log(&format!("failed to persist learned SSID {ssid} for {profile}: {e}"));
+    let res = Config::update(|disk| {
+        if let Some(p) = disk.profiles.get_mut(profile) {
+            learn(p, ssid);
+        }
+        Ok(())
+    });
+    if let Err(e) = res {
+        log(&format!(
+            "failed to persist learned SSID {ssid} for {profile}: {e}"
+        ));
     }
+}
+
+/// Per-SSID failure backoff for hidden networks. A hidden network can't be
+/// seen in a scan, so every recovery run used to dial it blind (up to
+/// `connect_wait` seconds each, interrupting whatever the radio was doing)
+/// even when it had failed every previous time. After a failure it is
+/// skipped for `60s * 2^(failures-1)`, capped at 30 minutes; a success
+/// clears it. Process-local: a fresh `breadcrumbs init` always tries.
+struct HiddenBackoff {
+    failures: u32,
+    last: f64,
+}
+
+fn hidden_backoff() -> &'static Mutex<HashMap<String, HiddenBackoff>> {
+    static B: OnceLock<Mutex<HashMap<String, HiddenBackoff>>> = OnceLock::new();
+    B.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn backoff_secs(failures: u32) -> f64 {
+    (60.0 * 2f64.powi(failures.saturating_sub(1).min(5) as i32)).min(1800.0)
+}
+
+fn hidden_due(ssid: &str) -> bool {
+    let map = hidden_backoff().lock().unwrap_or_else(|e| e.into_inner());
+    match map.get(ssid) {
+        None => true,
+        Some(b) => boot_secs() - b.last >= backoff_secs(b.failures),
+    }
+}
+
+fn record_hidden(ssid: &str, ok: bool) {
+    let mut map = hidden_backoff().lock().unwrap_or_else(|e| e.into_inner());
+    if ok {
+        map.remove(ssid);
+    } else {
+        let e = map.entry(ssid.to_string()).or_insert(HiddenBackoff {
+            failures: 0,
+            last: 0.0,
+        });
+        e.failures = e.failures.saturating_add(1);
+        e.last = boot_secs();
+    }
+}
+
+/// Forget all hidden-network backoff state (tests, and a manual `init`
+/// that wants every network tried).
+pub fn reset_hidden_backoff() {
+    hidden_backoff()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 /// Try to connect + confirm the device actually landed on the *requested*
 /// SSID. Returns Ok(()) on success, Err(reason) on failure.
-pub(crate) fn connect_and_verify(iface: &str, def: &NetworkDef, cfg: &Config) -> Result<(), String> {
-    nm::connect_verbose(iface, def, cfg.settings.connect_wait, def.effective_dns(&cfg.settings.dns))?;
+pub(crate) fn connect_and_verify(
+    iface: &str,
+    def: &NetworkDef,
+    cfg: &Config,
+) -> Result<(), String> {
+    nm::connect_verbose(
+        iface,
+        def,
+        cfg.settings.connect_wait,
+        def.effective_dns(&cfg.settings.dns),
+    )?;
     // Confirm the SSID, not just "device connected": NM autoconnect can win
     // a race and leave the device on a different network, and the wifi list
     // can lag activation by a moment, so poll briefly before giving up.
@@ -186,10 +270,19 @@ fn run_inner(cfg: &mut Config, profile_name: &str, notify_user: bool) -> Outcome
             .join(", ")
     ));
 
-    // Pre-scan for everything we might want, including the bootstrap SSID.
-    let mut scan_targets: Vec<String> = candidates.iter().map(|c| c.ssid.clone()).collect();
-    if let Some(bs) = &profile.bootstrap {
-        scan_targets.push(bs.clone());
+    // Pre-scan. Only hidden networks get directed probe requests: a probe
+    // broadcasts the SSID over the air, so probing every known network
+    // would announce the names of home/work networks wherever the laptop
+    // goes. Visible networks turn up in the passive scan anyway.
+    let mut scan_targets: Vec<String> = candidates
+        .iter()
+        .filter(|c| c.hidden)
+        .map(|c| c.ssid.clone())
+        .collect();
+    if let Some(bs) = profile.bootstrap.as_deref().and_then(|b| cfg.network(b)) {
+        if bs.hidden && !scan_targets.contains(&bs.ssid) {
+            scan_targets.push(bs.ssid.clone());
+        }
     }
     nm::rescan(&iface, &scan_targets);
     let visible = nm::visible_ssids(&iface);
@@ -255,11 +348,7 @@ fn run_inner(cfg: &mut Config, profile_name: &str, notify_user: bool) -> Outcome
         .iter()
         .filter(|d| visible_sig.contains_key(&d.ssid))
         .collect();
-    visible_candidates.sort_by(|a, b| {
-        visible_sig
-            .get(&b.ssid)
-            .cmp(&visible_sig.get(&a.ssid))
-    });
+    visible_candidates.sort_by(|a, b| visible_sig.get(&b.ssid).cmp(&visible_sig.get(&a.ssid)));
     let mut any_attempted = false;
     for def in &visible_candidates {
         any_attempted = true;
@@ -284,8 +373,17 @@ fn run_inner(cfg: &mut Config, profile_name: &str, notify_user: bool) -> Outcome
     // Pass 2: hidden networks we couldn't see in the scan.
     for def in &candidates {
         if def.hidden && !visible.contains(&def.ssid) {
+            if !hidden_due(&def.ssid) {
+                log(&format!(
+                    "skipping hidden {} (backing off after repeated failures)",
+                    def.ssid
+                ));
+                continue;
+            }
             any_attempted = true;
-            match connect_and_verify(&iface, def, cfg) {
+            let res = connect_and_verify(&iface, def, cfg);
+            record_hidden(&def.ssid, res.is_ok());
+            match res {
                 Ok(()) => {
                     clear_password_if_used(cfg, &def.ssid);
                     learn_ssid(cfg, profile_name, &def.ssid);
@@ -411,6 +509,7 @@ mod tests {
             identity: None,
             ca_cert: None,
             hidden: false,
+            ..Default::default()
         }
     }
 

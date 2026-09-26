@@ -72,6 +72,15 @@ struct AddOpts {
     /// Path to a CA certificate for 802.1x
     #[arg(long)]
     ca_cert: Option<String>,
+    /// Inner (phase 2) auth for PEAP/TTLS, e.g. "mschapv2" (default) or "pap"
+    #[arg(long)]
+    phase2: Option<String>,
+    /// Client certificate path for EAP-TLS
+    #[arg(long)]
+    client_cert: Option<String>,
+    /// Private key path for EAP-TLS (the password is its passphrase)
+    #[arg(long)]
+    private_key: Option<String>,
     /// Attach this SSID to a profile's priority list
     #[arg(long)]
     to: Option<String>,
@@ -120,7 +129,7 @@ enum Cmd {
     Add {
         ssid: String,
         #[command(flatten)]
-        opts: AddOpts,
+        opts: Box<AddOpts>,
     },
     /// Connect to an already-saved network by SSID, outside of any profile.
     /// Takes no password: the secret was already persisted by `add`, so
@@ -131,11 +140,14 @@ enum Cmd {
     /// Remove a saved network (config + NetworkManager)
     Forget { ssid: String },
     /// Remove NetworkManager wireless profiles whose SSID is no longer in
-    /// the breadcrumbs config
+    /// the breadcrumbs config (asks first; hotspot profiles are never touched)
     Prune {
         /// Only list what would be removed
         #[arg(long)]
         dry_run: bool,
+        /// Don't ask for confirmation
+        #[arg(long, short)]
+        yes: bool,
     },
     /// Scan, pick, connect and save a network interactively
     Scan {
@@ -216,38 +228,34 @@ fn real_main(cli: Cli) -> Result<i32, String> {
         return cmd_edit();
     }
 
-    // `watch` runs a long-lived loop and takes the config lock per tick
-    // (see `watch::run`); it must not hold one for its whole lifetime.
-    // Every other command holds an exclusive lock on the config dir for its
-    // whole run, so its load -> modify -> save cannot interleave with a
-    // concurrent breadcrumbs invocation or the watch daemon and silently
-    // lose a write (CRUMB-10). A read-only command holding it briefly is
-    // harmless; a slow one (`init --wait`) can stall the watch daemon's
-    // next tick, which is preferable to a corrupt or dropped write.
+    // No command holds the config lock for its whole run: reads need no
+    // lock (every write is atomic), and each write takes it only for its
+    // own short load, modify, save via `Config::update` (CRUMB-10). A lock
+    // held across a prompt, a connect or a network probe used to stall the
+    // watch daemon and every other breadcrumbs invocation (breadbar polls
+    // `status`) for as long as that took.
     if let Cmd::Watch { no_initial } = cmd {
         let cfg = Config::load()?;
         return Ok(watch::run(cfg, !no_initial));
     }
-    let _cfg_lock = crate::lock::acquire(&config::config_dir())
-        .map_err(|e| format!("could not lock the config directory: {e}"))?;
 
     let mut cfg = Config::load()?;
 
     match cmd {
         Cmd::Status { json } => cmd_status(&cfg, &cli.profile, json),
         Cmd::Init { wait } => cmd_init(&mut cfg, &cli.profile, wait),
-        Cmd::Watch { .. } => unreachable!("Watch is handled before the config lock"),
+        Cmd::Watch { .. } => unreachable!("Watch is handled above"),
         Cmd::Profile { action } => cmd_profile(&mut cfg, action),
         Cmd::Detect { apply, json } => cmd_detect(&mut cfg, apply, json),
         Cmd::Add { ssid, opts } => cmd_add(&mut cfg, ssid, opts),
         Cmd::Join { ssid } => cmd_join(&mut cfg, &ssid),
         Cmd::Forget { ssid } => cmd_forget(&mut cfg, &ssid),
-        Cmd::Prune { dry_run } => cmd_prune(&cfg, dry_run),
+        Cmd::Prune { dry_run, yes } => cmd_prune(&cfg, dry_run, yes),
         Cmd::Scan { to } => cmd_scan(&mut cfg, to),
         Cmd::List { show_passwords } => cmd_list(&cfg, show_passwords),
         Cmd::Doctor { full } => cmd_doctor(&cfg, &cli.profile, full),
         Cmd::InstallService { no_enable } => cmd_install_service(!no_enable),
-        Cmd::Cd { .. } | Cmd::Edit => unreachable!("handled before the config lock"),
+        Cmd::Cd { .. } | Cmd::Edit => unreachable!("handled above"),
     }
 }
 
@@ -522,21 +530,41 @@ fn non_empty(s: String) -> Option<String> {
     }
 }
 
-fn prompt_secret(msg: &str) -> String {
-    // `util::run` redirects child stdin to /dev/null, so plain `stty -echo`
-    // would target the wrong fd and silently leave echo ON (leaking the
-    // password to the screen). `-F /dev/tty` makes stty act on the controlling
-    // terminal directly. If there is no tty we fall back to visible input.
-    let had_tty = util::run("stty", &["-F", "/dev/tty", "-echo"], Duration::from_secs(2)).success;
+/// Prompt for a secret on the terminal without echo. `Err` if the user
+/// cancelled with Ctrl-C.
+///
+/// Echo is turned off with `stty -F /dev/tty` (`util::run` gives children
+/// `/dev/null` as stdin, so a plain `stty -echo` would act on the wrong fd
+/// and leave echo on). Signal keys are turned off too (`-isig`): a Ctrl-C
+/// that killed the process mid-prompt used to leave the terminal with echo
+/// disabled. Ctrl-C now arrives as a literal `^C` byte in the line and is
+/// treated as a cancel, and the terminal is restored to exactly its saved
+/// state either way. With no tty the input is read visibly.
+fn prompt_secret(msg: &str) -> Result<String, String> {
+    let saved = util::run("stty", &["-F", "/dev/tty", "-g"], Duration::from_secs(2));
+    let had_tty = saved.success
+        && util::run(
+            "stty",
+            &["-F", "/dev/tty", "-echo", "-isig"],
+            Duration::from_secs(2),
+        )
+        .success;
     let val = prompt_line(msg);
     if had_tty {
-        let _ = util::run("stty", &["-F", "/dev/tty", "echo"], Duration::from_secs(2));
+        let _ = util::run(
+            "stty",
+            &["-F", "/dev/tty", saved.stdout.trim()],
+            Duration::from_secs(2),
+        );
         println!();
     }
-    val
+    if val.contains('\u{3}') {
+        return Err("cancelled".into());
+    }
+    Ok(val)
 }
 
-fn cmd_add(cfg: &mut Config, ssid: String, opts: AddOpts) -> Result<i32, String> {
+fn cmd_add(cfg: &mut Config, ssid: String, opts: Box<AddOpts>) -> Result<i32, String> {
     let AddOpts {
         password,
         password_stdin,
@@ -545,9 +573,12 @@ fn cmd_add(cfg: &mut Config, ssid: String, opts: AddOpts) -> Result<i32, String>
         eap,
         identity,
         ca_cert,
+        phase2,
+        client_cert,
+        private_key,
         to,
         at,
-    } = opts;
+    } = *opts;
     if password.is_some() {
         eprintln!(
             "warning: passing the Wi-Fi password on the command line is deprecated and \
@@ -555,63 +586,98 @@ fn cmd_add(cfg: &mut Config, ssid: String, opts: AddOpts) -> Result<i32, String>
              --password-stdin or the interactive prompt instead"
         );
     }
-    // `--dns ""` is the explicit "don't pin DNS" opt-out; normalize an
-    // absent flag to None (use the global setting).
-    let dns = match dns {
-        Some(s) if s.is_empty() => Some(String::new()),
-        Some(s) => Some(s),
-        None => None,
-    };
-    // For enterprise networks, the password is the 802.1x password.
-    let password = match password {
-        Some(p) => p,
-        None if password_stdin => read_stdin_line(),
-        None if eap.is_some() => prompt_secret(&format!("802.1x password for '{ssid}': ")),
-        None => prompt_secret(&format!("Password for '{ssid}': ")),
-    };
-    let password = non_empty(password);
-    match cfg.networks.iter_mut().find(|n| n.ssid == ssid) {
-        Some(n) => {
-            n.password = password;
-            // `--hidden` / `--hidden=false` set the flag explicitly; when
-            // the flag is omitted, leave an existing entry's hidden state
-            // alone (a password-only update must not un-hide a network).
-            if let Some(h) = hidden {
-                n.hidden = h;
-            }
-            if dns.is_some() {
-                n.dns = dns;
-            }
-            if eap.is_some() {
-                n.eap = eap;
-            }
-            if identity.is_some() {
-                n.identity = identity;
-            }
-            if ca_cert.is_some() {
-                n.ca_cert = ca_cert;
+    // Validate `--to` before prompting, so a typo doesn't cost a password
+    // entry.
+    if let Some(prof_name) = &to {
+        if !cfg.profiles.contains_key(prof_name) {
+            return Err(format!("unknown profile '{prof_name}'"));
+        }
+    }
+    let existing = cfg.network(&ssid).is_some();
+    // All input is gathered before the config lock is taken: the lock is
+    // held only for the short load, modify, save below, never while waiting
+    // on a human at a prompt.
+    //
+    // For enterprise networks, the password is the 802.1x password (or the
+    // private key passphrase for EAP-TLS). An explicit password (argument
+    // or `--password-stdin`, even an empty one) always replaces the stored
+    // one; a blank answer at the interactive prompt keeps an existing
+    // entry's password, so e.g. `add Net --to home` can't wipe a password
+    // that hasn't been used yet.
+    let password: Option<Option<String>> = match password {
+        Some(p) => Some(non_empty(p)),
+        None if password_stdin => Some(non_empty(read_stdin_line())),
+        None => {
+            let label = if eap.is_some() {
+                "802.1x password"
+            } else {
+                "Password"
+            };
+            let hint = if existing {
+                " (blank keeps current)"
+            } else {
+                ""
+            };
+            let answer = prompt_secret(&format!("{label} for '{ssid}'{hint}: "))?;
+            match non_empty(answer) {
+                Some(p) => Some(Some(p)),
+                None if existing => None,
+                None => Some(None),
             }
         }
-        None => cfg.networks.push(NetworkDef {
-            ssid: ssid.clone(),
-            password,
-            dns,
-            eap,
-            identity,
-            ca_cert,
-            hidden: hidden.unwrap_or(false),
-        }),
-    }
-    if let Some(prof_name) = to {
-        let prof = cfg
-            .profiles
-            .get_mut(&prof_name)
-            .ok_or_else(|| format!("unknown profile '{prof_name}'"))?;
-        prof.networks.retain(|s| s != &ssid);
-        let idx = at.unwrap_or(prof.networks.len()).min(prof.networks.len());
-        prof.networks.insert(idx, ssid.clone());
-    }
-    cfg.save()?;
+    };
+
+    Config::update(|cfg| {
+        match cfg.networks.iter_mut().find(|n| n.ssid == ssid) {
+            Some(n) => {
+                if let Some(p) = password.clone() {
+                    n.password = p;
+                }
+                // `--hidden` / `--hidden=false` set the flag explicitly;
+                // when the flag is omitted, leave an existing entry's hidden
+                // state alone (a password-only update must not un-hide a
+                // network).
+                if let Some(h) = hidden {
+                    n.hidden = h;
+                }
+                for (slot, val) in [
+                    (&mut n.dns, &dns),
+                    (&mut n.eap, &eap),
+                    (&mut n.identity, &identity),
+                    (&mut n.ca_cert, &ca_cert),
+                    (&mut n.phase2, &phase2),
+                    (&mut n.client_cert, &client_cert),
+                    (&mut n.private_key, &private_key),
+                ] {
+                    if val.is_some() {
+                        slot.clone_from(val);
+                    }
+                }
+            }
+            None => cfg.networks.push(NetworkDef {
+                ssid: ssid.clone(),
+                password: password.clone().flatten(),
+                dns: dns.clone(),
+                eap: eap.clone(),
+                identity: identity.clone(),
+                ca_cert: ca_cert.clone(),
+                phase2: phase2.clone(),
+                client_cert: client_cert.clone(),
+                private_key: private_key.clone(),
+                hidden: hidden.unwrap_or(false),
+            }),
+        }
+        if let Some(prof_name) = &to {
+            let prof = cfg
+                .profiles
+                .get_mut(prof_name)
+                .ok_or_else(|| format!("unknown profile '{prof_name}'"))?;
+            prof.networks.retain(|s| s != &ssid);
+            let idx = at.unwrap_or(prof.networks.len()).min(prof.networks.len());
+            prof.networks.insert(idx, ssid.clone());
+        }
+        Ok(())
+    })?;
     println!("{C_GREEN}saved{C_RESET} {ssid}");
     Ok(0)
 }
@@ -644,19 +710,21 @@ fn cmd_join(cfg: &mut Config, ssid: &str) -> Result<i32, String> {
 }
 
 fn cmd_forget(cfg: &mut Config, ssid: &str) -> Result<i32, String> {
-    let before = cfg.networks.len();
-    cfg.networks.retain(|n| n.ssid != ssid);
-    for p in cfg.profiles.values_mut() {
-        p.networks.retain(|s| s != ssid);
-        if p.bootstrap.as_deref() == Some(ssid) {
-            p.bootstrap = None;
+    let was_present = cfg.network(ssid).is_some();
+    *cfg = Config::update(|cfg| {
+        cfg.networks.retain(|n| n.ssid != ssid);
+        for p in cfg.profiles.values_mut() {
+            p.networks.retain(|s| s != ssid);
+            if p.bootstrap.as_deref() == Some(ssid) {
+                p.bootstrap = None;
+            }
         }
-    }
-    cfg.save()?;
+        Ok(())
+    })?;
     let removed = nm::delete_connections_for_ssid(ssid);
     println!(
         "{C_GREEN}forgot{C_RESET} {ssid} (config: {}, NetworkManager: {})",
-        if cfg.networks.len() < before {
+        if was_present {
             "removed"
         } else {
             "not present"
@@ -666,19 +734,23 @@ fn cmd_forget(cfg: &mut Config, ssid: &str) -> Result<i32, String> {
     Ok(0)
 }
 
-/// Remove NetworkManager wireless profiles whose SSID is no longer known to
-/// breadcrumbs (config `networks`, or any profile's priority list or
-/// bootstrap). `--dry-run` only lists. Returns the number removed.
-fn cmd_prune(cfg: &Config, dry_run: bool) -> Result<i32, String> {
+/// Remove NetworkManager client Wi-Fi profiles whose SSID is no longer known
+/// to breadcrumbs (config `networks`, or any profile's priority list or
+/// bootstrap). Hotspot / ad-hoc profiles are never candidates. `--dry-run`
+/// only lists; otherwise the list is shown and confirmed first (or `--yes`
+/// for scripts, since the profiles NetworkManager holds may be the only
+/// copy of their passwords).
+fn cmd_prune(cfg: &Config, dry_run: bool, yes: bool) -> Result<i32, String> {
     let known: Vec<&str> = cfg
         .networks
         .iter()
         .map(|n| n.ssid.as_str())
-        .chain(
-            cfg.profiles
-                .values()
-                .flat_map(|p| p.networks.iter().map(|s| s.as_str()).chain(p.bootstrap.iter().map(|s| s.as_str()))),
-        )
+        .chain(cfg.profiles.values().flat_map(|p| {
+            p.networks
+                .iter()
+                .map(|s| s.as_str())
+                .chain(p.bootstrap.iter().map(|s| s.as_str()))
+        }))
         .collect();
     let stale: Vec<(String, String)> = nm::wireless_profiles()
         .into_iter()
@@ -689,11 +761,29 @@ fn cmd_prune(cfg: &Config, dry_run: bool) -> Result<i32, String> {
         return Ok(0);
     }
     for (name, ssid) in &stale {
-        if dry_run {
-            println!("{C_DIM}would remove{C_RESET} {name} ({ssid})");
-        } else {
+        let verb = if dry_run { "would remove" } else { "stale" };
+        println!("{C_DIM}{verb}{C_RESET} {name} ({ssid})");
+    }
+    if dry_run {
+        return Ok(0);
+    }
+    if !yes {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            return Err("refusing to delete NetworkManager profiles without --yes".into());
+        }
+        let answer = prompt_line(&format!(
+            "Delete these {} NetworkManager profile(s)? [y/N] ",
+            stale.len()
+        ));
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            println!("nothing removed");
+            return Ok(1);
+        }
+    }
+    for (name, ssid) in &stale {
+        if nm::delete_connections_for_ssid(ssid) {
             println!("{C_GREEN}removed{C_RESET} {name} ({ssid})");
-            let _ = nm::delete_connections_for_ssid(ssid);
         }
     }
     Ok(0)
@@ -735,39 +825,50 @@ fn cmd_scan(cfg: &mut Config, to: Option<String>) -> Result<i32, String> {
         .ok()
         .filter(|n| *n >= 1 && *n <= entries.len())
         .ok_or("invalid selection")?;
-    let ssid = entries[idx - 1].ssid.clone();
+    let entry = &entries[idx - 1];
+    let ssid = entry.ssid.clone();
     if ssid.is_empty() {
         return Err("cannot select a hidden SSID here; use `breadcrumbs add`".into());
     }
-    let password = non_empty(prompt_secret(&format!("Password for '{ssid}': ")));
-    let mut def = NetworkDef {
+    if entry.security == "802.1X" {
+        return Err(format!(
+            "'{ssid}' is an enterprise (802.1X) network; add it with \
+             `breadcrumbs add '{ssid}' --eap peap --identity <user>`"
+        ));
+    }
+    let password = if entry.security == "--" {
+        None
+    } else {
+        non_empty(prompt_secret(&format!("Password for '{ssid}': "))?)
+    };
+    let def = NetworkDef {
         ssid: ssid.clone(),
         password,
-        dns: None,
-        eap: None,
-        identity: None,
-        ca_cert: None,
-        hidden: false,
+        ..Default::default()
     };
-    if !nm::connect(&iface, &def, cfg.settings.connect_wait, &cfg.settings.dns) {
-        return Err(format!("failed to connect to {ssid}"));
+    // Connect without holding the config lock (it can take a while); save
+    // afterwards in one short locked update.
+    if let Err(e) = nm::connect_verbose(&iface, &def, cfg.settings.connect_wait, &cfg.settings.dns)
+    {
+        return Err(format!("failed to connect to {ssid}: {e}"));
     }
-    // A successful connect means NetworkManager now durably holds the PSK
-    // (either in a freshly created profile, or one whose PSK we just set):
-    // breadcrumbs no longer needs to keep its own plaintext copy.
-    def.password = None;
-    match cfg.networks.iter_mut().find(|n| n.ssid == ssid) {
-        Some(n) => n.password = None,
-        None => cfg.networks.push(def),
-    }
-    if let Some(prof_name) = to {
-        if let Some(prof) = cfg.profiles.get_mut(&prof_name) {
+    // A successful connect means NetworkManager now durably holds the
+    // secret: breadcrumbs keeps no plaintext copy.
+    *cfg = Config::update(|cfg| {
+        match cfg.networks.iter_mut().find(|n| n.ssid == ssid) {
+            Some(n) => n.password = None,
+            None => cfg.networks.push(NetworkDef {
+                ssid: ssid.clone(),
+                ..Default::default()
+            }),
+        }
+        if let Some(prof) = to.as_ref().and_then(|t| cfg.profiles.get_mut(t)) {
             if !prof.networks.contains(&ssid) {
                 prof.networks.push(ssid.clone());
             }
         }
-    }
-    cfg.save()?;
+        Ok(())
+    })?;
     println!("{C_GREEN}connected + saved{C_RESET} {ssid}");
     Ok(0)
 }
@@ -786,7 +887,7 @@ fn cmd_list(cfg: &Config, show_pw: bool) -> Result<i32, String> {
     println!("  dns         {}", cfg.settings.dns);
     println!("  exit_node   {}", cfg.settings.exit_node);
     println!("  default     {}", cfg.settings.default_profile);
-    println!("  watch every {}s", cfg.settings.watch_interval);
+    println!("  watch every {}s", cfg.settings.poll_interval());
 
     println!("\n{C_BOLD}networks{C_RESET}");
     for n in &cfg.networks {
@@ -931,6 +1032,18 @@ fn cmd_doctor(cfg: &Config, override_p: &Option<String>, full: bool) -> Result<i
             }
         );
     }
+    let problems = cfg.validate();
+    if problems.is_empty() {
+        println!("  config      ok");
+    } else {
+        println!(
+            "  config      {C_YELLOW}{} problem(s){C_RESET}",
+            problems.len()
+        );
+        for p in &problems {
+            println!("    - {p}");
+        }
+    }
     println!("\nFull report: {C_DIM}breadcrumbs doctor --full{C_RESET}");
     Ok(0)
 }
@@ -980,21 +1093,40 @@ fn cmd_install_service(enable: bool) -> Result<i32, String> {
     // units do not get the login shell's PATH, and the watcher shells out to
     // tailscale/sudo/xdg-open by name (NetworkManager is reached over D-Bus,
     // so no nmcli is needed).
+    // Kept in step with the unit bakery ships (bread-ecosystem), so a
+    // manual install and a bakery install behave the same:
+    // - WantedBy=default.target, not graphical-session.target: breadcrumbs
+    //   is a headless network daemon, and graphical-session.target can only
+    //   be started by a session manager (RefuseManualStart=yes).
+    //   Notifications and the Tailscale login browser-open still reach the
+    //   session through the environment the compositor imports into the
+    //   systemd user manager.
+    // - PATH is pinned because systemd --user units do not get the login
+    //   shell's PATH, and the watcher shells out to tailscale / sudo /
+    //   xdg-open / notify-send by name.
+    // - ExecStart's path is quoted so a path with spaces stays one argument.
     let unit = format!(
         "[Unit]\n\
          Description=breadcrumbs Wi-Fi state machine watcher\n\
-         After=network.target NetworkManager.service graphical-session.target\n\
-         Wants=network.target graphical-session.target\n\n\
+         Documentation=https://git.breadway.dev/Breadway/breadcrumbs\n\
+         After=network.target NetworkManager.service\n\
+         Wants=network.target\n\n\
          [Service]\n\
          Type=simple\n\
-         Environment=PATH=/usr/local/bin:/usr/bin:/bin\n\
-         ExecStart={bin} watch\n\
+         Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\
+         ExecStart=\"{bin}\" watch\n\
          Restart=always\n\
          RestartSec=5\n\
-         Nice=5\n\n\
+         Nice=5\n\
+         StandardOutput=journal\n\
+         StandardError=journal\n\n\
          [Install]\n\
          WantedBy=default.target\n",
-        bin = bin.display()
+        bin = bin
+            .display()
+            .to_string()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
     );
     let unit_path = unit_dir.join("breadcrumbs.service");
     std::fs::write(&unit_path, unit)

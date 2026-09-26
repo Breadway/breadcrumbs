@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -114,12 +115,34 @@ where
     R: Runner + 'static,
 {
     let prev = RUNNER.with(|r| std::mem::replace(&mut *r.borrow_mut(), Box::new(runner)));
+    // The cached UTC offset came from whichever runner was installed when
+    // it was read; never let it leak across a runner swap.
+    UTC_OFFSET.with(|c| *c.borrow_mut() = None);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
     RUNNER.with(|r| *r.borrow_mut() = prev);
+    UTC_OFFSET.with(|c| *c.borrow_mut() = None);
     match result {
         Ok(v) => v,
         Err(payload) => std::panic::resume_unwind(payload),
     }
+}
+
+/// How long to wait for the output reader threads after the child has
+/// exited (or been killed). A grandchild that inherited the pipes keeps
+/// them open after the child is gone; past this grace the readers are
+/// abandoned rather than letting that grandchild wedge the caller.
+const READER_GRACE: Duration = Duration::from_secs(2);
+
+fn spawn_reader(pipe: Option<impl Read + Send + 'static>) -> mpsc::Receiver<String> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut p) = pipe {
+            let _ = p.read_to_string(&mut buf);
+        }
+        let _ = tx.send(buf);
+    });
+    rx
 }
 
 fn spawn_run(prog: &str, args: &[&str], stdin: Option<&str>, timeout: Duration) -> Output {
@@ -139,31 +162,19 @@ fn spawn_run(prog: &str, args: &[&str], stdin: Option<&str>, timeout: Duration) 
         Err(_) => return Output::failed(),
     };
 
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
+    let out_rx = spawn_reader(child.stdout.take());
+    let err_rx = spawn_reader(child.stderr.take());
 
-    let out_handle = thread::spawn(move || {
-        let mut buf = String::new();
-        if let Some(ref mut p) = stdout_pipe {
-            let _ = p.read_to_string(&mut buf);
-        }
-        buf
-    });
-    let err_handle = thread::spawn(move || {
-        let mut buf = String::new();
-        if let Some(ref mut p) = stderr_pipe {
-            let _ = p.read_to_string(&mut buf);
-        }
-        buf
-    });
-
-    // Feed stdin only now that the reader threads are draining stdout and
-    // stderr: a chatty child could otherwise fill its stdout pipe while we
-    // block writing stdin, deadlocking both sides.
+    // Feed stdin on its own thread: a child that never reads its input
+    // would otherwise block this write forever (past the pipe buffer),
+    // before the timeout below ever gets a chance to fire.
     if let Some(data) = stdin {
         if let Some(mut sink) = child.stdin.take() {
-            let _ = sink.write_all(data.as_bytes());
-            // Drop closes the pipe so the child's read sees EOF.
+            let data = data.to_string();
+            thread::spawn(move || {
+                let _ = sink.write_all(data.as_bytes());
+                // Drop closes the pipe so the child's read sees EOF.
+            });
         }
     }
 
@@ -183,8 +194,8 @@ fn spawn_run(prog: &str, args: &[&str], stdin: Option<&str>, timeout: Duration) 
         }
     };
 
-    let stdout = out_handle.join().unwrap_or_default();
-    let stderr = err_handle.join().unwrap_or_default();
+    let stdout = out_rx.recv_timeout(READER_GRACE).unwrap_or_default();
+    let stderr = err_rx.recv_timeout(READER_GRACE).unwrap_or_default();
 
     Output {
         success: status.map(|s| s.success()).unwrap_or(false),
@@ -193,39 +204,84 @@ fn spawn_run(prog: &str, args: &[&str], stdin: Option<&str>, timeout: Duration) 
     }
 }
 
-/// Current local "HH:MM" (24h), for the time-of-day schedule. `None` if the
-/// clock can't be read: the schedule is skipped, never guessed.
-pub fn local_hhmm() -> Option<String> {
-    let o = run("date", &["+%H:%M"], Duration::from_secs(2));
-    if o.success {
-        let t = o.stdout.trim().to_string();
-        if t.len() == 5 && t.as_bytes()[2] == b':' {
-            return Some(t);
-        }
-    }
-    None
+thread_local! {
+    /// Local UTC offset in seconds and when it was read. Re-read every
+    /// [`OFFSET_TTL`] so a DST change or timezone switch is picked up,
+    /// without forking `date` for every log line and every watch tick.
+    static UTC_OFFSET: RefCell<Option<(Instant, Option<i64>)>> = const { RefCell::new(None) };
 }
 
-/// Local "YYYY-MM-DD HH:MM:SS". Uses `date` for correct local time, falling
-/// back to a dependency-free UTC computation if it is unavailable.
-pub fn timestamp() -> String {
-    let o = run("date", &["+%Y-%m-%d %H:%M:%S"], Duration::from_secs(2));
-    if o.success {
-        let t = o.stdout.trim();
-        if !t.is_empty() {
-            return t.to_string();
-        }
+const OFFSET_TTL: Duration = Duration::from_secs(600);
+
+/// Parse `date +%z` output ("+0930", "-0500") into seconds east of UTC.
+fn parse_utc_offset(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.len() != 5 {
+        return None;
     }
-    timestamp_utc()
+    let sign = match &s[..1] {
+        "+" => 1,
+        "-" => -1,
+        _ => return None,
+    };
+    let h: i64 = s[1..3].parse().ok()?;
+    let m: i64 = s[3..5].parse().ok()?;
+    Some(sign * (h * 3600 + m * 60))
 }
 
-/// epoch seconds -> "YYYY-MM-DD HH:MM:SS" (UTC), no external deps.
-fn timestamp_utc() -> String {
-    let secs = SystemTime::now()
+fn utc_offset() -> Option<i64> {
+    if let Some(cached) = UTC_OFFSET.with(|c| {
+        c.borrow()
+            .filter(|(at, _)| at.elapsed() < OFFSET_TTL)
+            .map(|(_, off)| off)
+    }) {
+        return cached;
+    }
+    let o = run("date", &["+%z"], Duration::from_secs(2));
+    let off = if o.success {
+        parse_utc_offset(&o.stdout)
+    } else {
+        None
+    };
+    UTC_OFFSET.with(|c| *c.borrow_mut() = Some((Instant::now(), off)));
+    off
+}
+
+fn epoch_secs() -> i64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0) as i64;
-    fmt_epoch(secs)
+        .unwrap_or(0) as i64
+}
+
+/// Current local "HH:MM" (24h), for the time-of-day schedule. `None` if the
+/// local offset can't be determined: the schedule is skipped, never guessed.
+pub fn local_hhmm() -> Option<String> {
+    let local = epoch_secs() + utc_offset()?;
+    Some(fmt_epoch(local)[11..16].to_string())
+}
+
+/// Local "YYYY-MM-DD HH:MM:SS", falling back to UTC if the local offset
+/// can't be determined.
+pub fn timestamp() -> String {
+    fmt_epoch(epoch_secs() + utc_offset().unwrap_or(0))
+}
+
+/// Seconds on a clock that keeps running while the machine is suspended
+/// (`CLOCK_BOOTTIME`, as exposed by `/proc/uptime`). `Instant` is
+/// `CLOCK_MONOTONIC` on Linux, which stops during suspend, so it can't be
+/// used to notice that the laptop just slept for an hour. Falls back to
+/// wall-clock seconds where `/proc/uptime` is unavailable.
+pub fn boot_secs() -> f64 {
+    std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0)
+        })
 }
 
 /// Format UTC epoch seconds as "YYYY-MM-DD HH:MM:SS" (pure / testable).
@@ -277,6 +333,45 @@ mod tests {
         assert_eq!(fmt_epoch(1_735_689_600), "2025-01-01 00:00:00");
         // Last second of October (non-leap-day month boundary).
         assert_eq!(fmt_epoch(1_730_419_199), "2024-10-31 23:59:59");
+    }
+
+    #[test]
+    fn parse_utc_offset_handles_signs_and_rejects_garbage() {
+        assert_eq!(parse_utc_offset("+0930\n"), Some(9 * 3600 + 30 * 60));
+        assert_eq!(parse_utc_offset("-0500"), Some(-5 * 3600));
+        assert_eq!(parse_utc_offset("+0000"), Some(0));
+        assert_eq!(parse_utc_offset("UTC"), None);
+        assert_eq!(parse_utc_offset("0930"), None);
+    }
+
+    #[test]
+    fn run_does_not_wedge_on_a_grandchild_holding_the_pipe() {
+        // The child exits at once but leaves a background sleeper holding
+        // stdout open. `run` must return after the reader grace period,
+        // not wait for the sleeper.
+        let start = Instant::now();
+        let o = run(
+            "sh",
+            &["-c", "echo hi; sleep 30 & exit 0"],
+            Duration::from_secs(5),
+        );
+        assert!(o.success);
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn run_times_out_a_child_that_never_reads_its_stdin() {
+        // Larger than a pipe buffer: the old in-line write blocked here
+        // forever, before the timeout loop started.
+        let big = "x".repeat(1 << 20);
+        let start = Instant::now();
+        let o = run_with_stdin("sleep", &["30"], Some(&big), Duration::from_millis(300));
+        assert!(!o.success);
+        assert!(start.elapsed() < Duration::from_secs(10));
     }
 
     #[test]

@@ -6,7 +6,7 @@ use crate::tailscale::{self, TsHealth};
 use crate::util::{command_exists, run};
 
 /// Connectivity verdict. `Portal` is the interesting case: an HTTP response
-/// arrived (200/301/302) but it wasn't the 204 the generate_204 endpoint
+/// arrived (200, a redirect, or 511) but it wasn't the 204 the generate_204 endpoint
 /// returns for genuine internet: the classic captive/guest-portal
 /// signature, and the reason `classify` can tell "no internet at all" from
 /// "internet but intercepted".
@@ -34,14 +34,15 @@ pub fn connectivity(cfg: &Config) -> Connectivity {
             Duration::from_secs(6),
         );
         // Only a 204 counts as real internet. Captive/guest portals answer
-        // 200 (a login page) or 302 (a redirect to it). The default endpoint
-        // is generate_204, which returns 204 precisely when traffic isn't
-        // being intercepted.
+        // 200 (a login page), a redirect to it (301/302/303/307/308), or
+        // 511 Network Authentication Required (RFC 6585, the status made
+        // for exactly this). The default endpoint is generate_204, which
+        // returns 204 precisely when traffic isn't being intercepted.
         let code = o.stdout.trim();
         if code == "204" {
             return Connectivity::Online;
         }
-        if code == "200" || code == "301" || code == "302" {
+        if is_portal_status(code) {
             return Connectivity::Portal;
         }
     }
@@ -59,6 +60,11 @@ pub fn connectivity(cfg: &Config) -> Connectivity {
     } else {
         Connectivity::NoNet
     }
+}
+
+/// HTTP status codes that mean "a captive portal intercepted the probe".
+fn is_portal_status(code: &str) -> bool {
+    matches!(code, "200" | "301" | "302" | "303" | "307" | "308" | "511")
 }
 
 pub fn internet_ok(cfg: &Config) -> bool {
@@ -117,5 +123,20 @@ pub fn gather(cfg: &Config, profile_name: &str) -> Status {
         tailscale_required: ts_required,
         tailscale,
         exit_node,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portal_statuses_include_redirects_and_511() {
+        for c in ["200", "301", "302", "303", "307", "308", "511"] {
+            assert!(is_portal_status(c), "{c}");
+        }
+        for c in ["204", "000", "403", "500", ""] {
+            assert!(!is_portal_status(c), "{c}");
+        }
     }
 }
