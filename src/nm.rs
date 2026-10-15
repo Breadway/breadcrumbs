@@ -542,6 +542,49 @@ fn first_profile_for_ssid(conn: &Connection, ssid: &str) -> Option<OwnedObjectPa
         .map(|(c, _)| c)
 }
 
+/// Disable autoconnect on every saved client profile for `ssid` except
+/// `keep` (the one about to be activated). Desktop GUIs clone a numbered
+/// duplicate ("NCC 1", "NCC 2", ...) on some connects; left with autoconnect
+/// on, those stale dupes race the next activation and NM reports "base
+/// network connection was interrupted" (CRUMB-23). Disabling (rather than
+/// deleting) is reversible and preserves any distinct settings a dupe may
+/// hold; the kept profile is never touched. Returns the neutered count.
+fn neuter_duplicate_profiles(conn: &Connection, keep: Option<&str>, ssid: &str) -> usize {
+    let matching: Vec<(OwnedObjectPath, SettingsMap)> = wifi_client_profiles(conn)
+        .into_iter()
+        .filter(|(_, s)| setting_ssid(s).as_deref() == Some(ssid))
+        .collect();
+    if matching.len() <= 1 {
+        return 0;
+    }
+    let mut neutered = 0;
+    for (path, mut s) in matching {
+        if Some(path.as_str()) == keep {
+            continue;
+        }
+        s.entry("connection".into())
+            .or_default()
+            .insert("autoconnect".into(), ov(Value::from(false)));
+        let updated: Result<HashMap<String, OwnedValue>, zbus::Error> =
+            match proxy(conn, path.as_str(), CONN_IFACE) {
+                Some(p) => p.call(
+                    "Update2",
+                    &(&s, FLAG_TO_DISK, &HashMap::<String, Value>::new()),
+                ),
+                None => continue,
+            };
+        if updated.is_ok() {
+            neutered += 1;
+        }
+    }
+    if neutered > 0 {
+        log(&format!(
+            "neutered {neutered} duplicate profile(s) for '{ssid}' (autoconnect off)"
+        ));
+    }
+    neutered
+}
+
 /// A settings file path as the NM blob form: `file://<absolute path>`
 /// followed by a terminating NUL, which is how NetworkManager tells a path
 /// apart from an inline DER/PEM blob.
@@ -890,6 +933,9 @@ pub fn connect_verbose(iface: &str, net: &NetworkDef, wait: u32, dns: &str) -> R
         .ok_or_else(|| format!("no NetworkManager device named '{iface}'"))?;
     let ap = strongest_ap(&conn, iface, &net.ssid);
     let profile = first_profile_for_ssid(&conn, &net.ssid);
+    // Pre-existing numbered dupes must not out-autoconnect the profile we
+    // are about to use (CRUMB-23); a no-op when there is at most one.
+    neuter_duplicate_profiles(&conn, profile.as_ref().map(|p| p.as_str()), &net.ssid);
 
     let needs_update = net.password.is_some() || net.hidden || net.eap.is_some();
     if let (Some(profile), true) = (&profile, needs_update) {

@@ -955,6 +955,107 @@ fn ensure_exit_node_skips_an_offline_primary_instead_of_selecting_it() {
 }
 
 #[test]
+fn ensure_exit_node_falls_back_to_sudo_when_set_is_refused() {
+    // CRUMB-22: with no Tailscale operator, `tailscale set` is refused
+    // ("Access denied"). ensure_exit_node must retry via `sudo -n` instead
+    // of reporting "exit node not selected" forever while the watch holds
+    // the Wi-Fi on the bootstrap network.
+    let _env = EnvSandbox::new();
+    let before = r#"{"BackendState":"Running","Peer":{"b":{"HostName":"nodeB","DNSName":"nodeB.ts.net.","Online":true,"ExitNode":false,"ExitNodeOption":true}}}"#;
+    let after = r#"{"BackendState":"Running","Peer":{"b":{"HostName":"nodeB","DNSName":"nodeB.ts.net.","Online":true,"ExitNode":true,"ExitNodeOption":true}}}"#;
+    let selected = std::rc::Rc::new(std::cell::Cell::new(false));
+    let (sel_set, sel_status) = (selected.clone(), selected.clone());
+    let runner = FakeRunner::new()
+        .with_command("tailscale")
+        .on(
+            |p, args| p == "tailscale" && args.contains(&"set"),
+            fail("Access denied: checkprefs access denied"),
+        )
+        .on_dynamic(
+            |p, args| p == "sudo" && args.contains(&"set"),
+            move |_, _| {
+                sel_set.set(true);
+                ok("")
+            },
+        )
+        .on_dynamic(
+            |p, args| p == "tailscale" && args.contains(&"status"),
+            move |_, _| ok(if sel_status.get() { after } else { before }),
+        );
+    let calls = runner.calls_handle();
+
+    let health = with_runner(runner, || {
+        breadcrumbs::tailscale::ensure_exit_node(&["nodeB".into()])
+    });
+    assert_eq!(health, breadcrumbs::tailscale::TsHealth::Ok);
+    let sudo_sets: Vec<String> = calls
+        .borrow()
+        .iter()
+        .filter(|c| c.prog == "sudo" && c.args.iter().any(|a| a == "set"))
+        .map(|c| c.args.join(" "))
+        .collect();
+    assert_eq!(
+        sudo_sets,
+        vec!["-n tailscale set --exit-node=nodeB".to_string()],
+        "a refused set must be retried via sudo -n"
+    );
+}
+
+fn autoconnect_of(s: &common::fake_nm::SettingsMap) -> Option<bool> {
+    s.get("connection")?
+        .get("autoconnect")?
+        .downcast_ref::<bool>()
+        .ok()
+}
+
+#[test]
+fn connect_disables_autoconnect_on_duplicate_profiles_for_same_ssid() {
+    // CRUMB-23: two saved profiles for one SSID (desktop-GUI numbered-dupe
+    // sprawl). Connecting must silence exactly one spare's autoconnect so it
+    // can't win a later activation race, while leaving the used profile's
+    // connection section alone.
+    let _env = EnvSandbox::new();
+    let (nm, _dev) = setup_wifi(&[("NCC", 80)]);
+    // Same SSID, different profile name: the desktop-GUI numbered-dupe shape.
+    let first = nm.save_connection("NCC", Some("pw"));
+    let second = nm.save_profile(
+        "NCC 1",
+        "NCC",
+        "802-11-wireless",
+        "infrastructure",
+        Some("pw"),
+    );
+
+    let mut cfg = base_config();
+    cfg.networks = vec![net("NCC", Some("pw"))];
+    cfg.profiles.insert(
+        "school".into(),
+        Profile {
+            networks: vec!["NCC".into()],
+            ..Default::default()
+        },
+    );
+
+    let outcome = with_runner(healthy_runner(), || flow::run(&mut cfg, "school"));
+    assert!(outcome.ok(), "expected Connected, got {outcome:?}");
+    assert_eq!(nm.activated_ssids(), vec!["NCC".to_string()]);
+
+    let flags = [
+        autoconnect_of(&nm.profile_settings(&first).expect("first profile")),
+        autoconnect_of(&nm.profile_settings(&second).expect("second profile")),
+    ];
+    assert_eq!(
+        flags.iter().filter(|f| **f == Some(false)).count(),
+        1,
+        "exactly one spare profile must be silenced: {flags:?}"
+    );
+    assert!(
+        !flags.contains(&Some(true)),
+        "nothing may be left auto-connecting: {flags:?}"
+    );
+}
+
+#[test]
 fn exit_node_can_be_configured_by_tailscale_ip() {
     let _env = EnvSandbox::new();
     let json = r#"{"BackendState":"Running","Peer":{"k1":{"HostName":"hestia","TailscaleIPs":["100.66.238.26"],"Online":true,"ExitNode":true,"ExitNodeOption":true}}}"#;
