@@ -348,9 +348,42 @@ fn exit_node_health(nodes: &[String], v: &Value) -> TsHealth {
     }
 }
 
+/// Run `tailscale set --exit-node=<node>`, falling back to `sudo -n` when
+/// the direct call is refused. Without the fallback, a missing operator
+/// (`sudo tailscale set --operator=$USER` never run) makes every recovery
+/// loop report "exit node not selected" forever while holding the Wi-Fi on
+/// the bootstrap network (CRUMB-22): the set is silently refused, the
+/// re-read status still shows unselected, and the watch retries on cooldown.
+fn set_exit_node(node: &str) {
+    let arg = format!("--exit-node={node}");
+    let out = run("tailscale", &["set", arg.as_str()], Duration::from_secs(10));
+    let refused = !out.success
+        || out.stdout.to_lowercase().contains("denied")
+        || out.stderr.to_lowercase().contains("denied");
+    if !refused {
+        return;
+    }
+    log(&format!(
+        "tailscale set refused ({}); retrying via sudo -n (avoid with `sudo tailscale set --operator=$USER`)",
+        out.stderr.trim()
+    ));
+    let sudo_out = run(
+        "sudo",
+        &["-n", "tailscale", "set", arg.as_str()],
+        Duration::from_secs(10),
+    );
+    if !sudo_out.success {
+        log(&format!(
+            "sudo -n tailscale set failed: {}",
+            sudo_out.stderr.trim()
+        ));
+    }
+}
+
 /// Bring Tailscale to a state where one of `nodes` (priority order) is the
 /// active, online exit node. Performs at most one bring-up/login, then at
-/// most one `tailscale set` per online node until one takes; a healthy
+/// most one `tailscale set` per online node until one takes (each set falls
+/// back to `sudo -n` when refused for lack of operator rights); a healthy
 /// selection is left untouched.
 pub fn ensure_exit_node(nodes: &[String]) -> TsHealth {
     if !installed() {
@@ -420,11 +453,7 @@ pub fn ensure_exit_node(nodes: &[String]) -> TsHealth {
         if !(exists && online) {
             continue;
         }
-        let _ = run(
-            "tailscale",
-            &["set", &format!("--exit-node={node}")],
-            Duration::from_secs(10),
-        );
+        set_exit_node(node);
         // The switch takes a moment to show up in `status`.
         for attempt in 0..3 {
             if attempt > 0 {
