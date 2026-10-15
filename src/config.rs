@@ -302,8 +302,17 @@ impl Config {
     /// per-profile `exit_node`, else `settings.exit_nodes`, else
     /// `settings.exit_node`. Empty entries are filtered out.
     pub fn exit_nodes_for(&self, profile: &str) -> Vec<String> {
-        if let Some(p) = self.profiles.get(profile).and_then(|p| p.exit_node.clone()) {
-            return vec![p];
+        if let Some(p) = self
+            .profiles
+            .get(profile)
+            .and_then(|p| p.exit_node.as_ref())
+        {
+            let node = p.trim();
+            return if node.is_empty() {
+                Vec::new()
+            } else {
+                vec![node.to_string()]
+            };
         }
         let list = if self.settings.exit_nodes.is_empty() {
             vec![self.settings.exit_node.clone()]
@@ -822,6 +831,21 @@ dns = "9.9.9.9""#;
             cfg.exit_nodes_for("home"),
             vec!["nodeA".to_string(), "nodeB".to_string()]
         );
+    }
+
+    #[test]
+    fn exit_nodes_for_normalizes_profile_override() {
+        let mut cfg = build_initial_config();
+        cfg.profiles.get_mut("home").unwrap().tailscale = true;
+        cfg.profiles.get_mut("home").unwrap().exit_node = Some("  node.example  ".into());
+        assert_eq!(cfg.exit_nodes_for("home"), vec!["node.example"]);
+
+        cfg.profiles.get_mut("home").unwrap().exit_node = Some("  \t ".into());
+        assert!(cfg.exit_nodes_for("home").is_empty());
+        assert!(cfg
+            .validate()
+            .iter()
+            .any(|e| e.contains("no exit node is configured")));
     }
 
     #[test]
