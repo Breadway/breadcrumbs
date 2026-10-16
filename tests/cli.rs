@@ -190,6 +190,38 @@ fn list_bootstraps_config_with_core_profiles() {
 }
 
 #[test]
+fn list_shows_effective_exit_node_priority_list() {
+    let sb = Sandbox::new();
+    let config_dir = sb.root.join("config/breadcrumbs");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("breadcrumbs.toml"),
+        r#"[settings]
+default_profile = "travel"
+exit_node = "stale-global"
+exit_nodes = ["primary.example", "backup.example"]
+
+[profiles.travel]
+tailscale = true
+"#,
+    )
+    .unwrap();
+
+    let o = sb.cmd(&["list"]);
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let out = stdout(&o);
+    assert!(
+        out.contains("tailscale   required (exit: primary.example > backup.example)"),
+        "list should show the effective prioritized exit nodes, got:\n{out}"
+    );
+    assert!(!out.contains("required (exit: stale-global)"));
+}
+
+#[test]
 fn profile_defaults_to_away_then_persists_set() {
     let sb = Sandbox::new();
 

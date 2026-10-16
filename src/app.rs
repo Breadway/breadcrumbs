@@ -920,11 +920,10 @@ fn cmd_list(cfg: &Config, show_pw: bool) -> Result<i32, String> {
             println!("    bootstrap   {b}");
         }
         if p.tailscale {
+            let exit_nodes = cfg.exit_nodes_for(name);
             println!(
                 "    tailscale   required (exit: {})",
-                p.exit_node
-                    .clone()
-                    .unwrap_or_else(|| cfg.settings.exit_node.clone())
+                exit_nodes.join(" > ")
             );
         }
         let mut order: Vec<String> = p.networks.clone();
