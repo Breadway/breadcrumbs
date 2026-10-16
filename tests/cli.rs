@@ -857,6 +857,48 @@ fn add_with_dns_persists_per_network_override() {
 }
 
 #[test]
+fn doctor_reports_invalid_dns_config_without_touching_network() {
+    let sb = Sandbox::new();
+    fs::create_dir_all(sb.root.join("config/breadcrumbs")).unwrap();
+    fs::write(
+        sb.config_file(),
+        r#"[settings]
+dns = "1.1.1.x"
+"#,
+    )
+    .unwrap();
+
+    let o = sb.cmd(&["doctor"]);
+    assert!(
+        o.status.success(),
+        "doctor remains diagnostic: {}",
+        stderr(&o)
+    );
+    let out = stdout(&o);
+    assert!(
+        out.contains("settings.dns"),
+        "doctor should name invalid DNS: {out}"
+    );
+    assert!(
+        out.contains("invalid DNS server '1.1.1.x'"),
+        "diagnostic should identify token: {out}"
+    );
+}
+
+#[test]
+fn add_rejects_invalid_dns_before_persisting_network() {
+    let sb = Sandbox::new();
+    let o = sb.cmd(&["add", "CafeWifi", "pw", "--dns", "9.9.9.9, invalid"]);
+    assert!(!o.status.success(), "invalid DNS must be rejected");
+    assert!(stderr(&o).contains("invalid DNS server 'invalid'"));
+    let networks = fs::read_to_string(sb.networks_file()).unwrap_or_default();
+    assert!(
+        !networks.contains("CafeWifi"),
+        "invalid DNS should not persist the network entry: {networks}"
+    );
+}
+
+#[test]
 fn add_enterprise_fields_persist() {
     let sb = Sandbox::new();
     let o = sb.cmd(&[

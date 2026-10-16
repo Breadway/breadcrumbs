@@ -16,7 +16,6 @@
 //! private bus, with no test-only code paths in here.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -776,25 +775,6 @@ fn deactivate(conn: &Connection, active: &OwnedObjectPath) {
     }
 }
 
-/// Split a DNS setting ("1.1.1.1", "1.1.1.1, 2606:4700::1111", ...) into
-/// IPv4 and IPv6 servers. Unparseable entries are skipped.
-fn parse_dns(dns: &str) -> (Vec<Ipv4Addr>, Vec<Ipv6Addr>) {
-    let mut v4 = Vec::new();
-    let mut v6 = Vec::new();
-    for part in dns
-        .split([',', ' ', ';'])
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-    {
-        match part.parse::<IpAddr>() {
-            Ok(IpAddr::V4(a)) => v4.push(a),
-            Ok(IpAddr::V6(a)) => v6.push(a),
-            Err(_) => log(&format!("dns: ignoring unparseable server '{part}'")),
-        }
-    }
-    (v4, v6)
-}
-
 fn user_data(s: &SettingsMap) -> HashMap<String, String> {
     s.get("user")
         .and_then(|m| m.get("data"))
@@ -828,14 +808,14 @@ fn set_ip_dns(
 /// the other family are cleared, so no auto DNS leaks around the pin) and
 /// marks the profile in `user.data`. An empty `dns` removes a pin only if
 /// the marker shows breadcrumbs made it, restoring automatic DNS.
-fn apply_dns(s: &mut SettingsMap, dns: &str) -> bool {
+fn apply_dns(s: &mut SettingsMap, dns: &str) -> Result<bool, String> {
     let mut data = user_data(s);
     let pinned_by_us = data.contains_key(DNS_PIN_MARKER);
-    let (v4, v6) = parse_dns(dns);
+    let (v4, v6) = crate::dns::parse_servers(dns)?;
 
     if v4.is_empty() && v6.is_empty() {
         if !pinned_by_us {
-            return false;
+            return Ok(false);
         }
         if let Some(ip4) = s.get_mut("ipv4") {
             set_ip_dns(ip4, false, Value::from(Vec::<u32>::new()), Vec::new());
@@ -847,7 +827,7 @@ fn apply_dns(s: &mut SettingsMap, dns: &str) -> bool {
     } else {
         let want = format!("{v4:?}{v6:?}");
         if data.get(DNS_PIN_MARKER) == Some(&want) {
-            return false;
+            return Ok(false);
         }
         let v4_wire: Vec<u32> = v4.iter().map(|a| u32::from_ne_bytes(a.octets())).collect();
         let v4_str: Vec<String> = v4.iter().map(ToString::to_string).collect();
@@ -862,7 +842,7 @@ fn apply_dns(s: &mut SettingsMap, dns: &str) -> bool {
     }
     let user = s.entry("user".to_string()).or_default();
     user.insert("data".into(), ov(Value::from(data)));
-    true
+    Ok(true)
 }
 
 /// Pin (or unpin, see [`apply_dns`]) DNS on the active connection of `dev`:
@@ -871,7 +851,7 @@ fn apply_dns(s: &mut SettingsMap, dns: &str) -> bool {
 fn enforce_dns(conn: &Connection, dev: &OwnedObjectPath, dns: &str) -> Result<(), String> {
     let active = active_connection_path(conn, dev).ok_or("no active connection")?;
     let mut s = get_settings(conn, active.as_str()).ok_or("could not read profile settings")?;
-    if !apply_dns(&mut s, dns) {
+    if !apply_dns(&mut s, dns)? {
         return Ok(());
     }
 
@@ -928,6 +908,7 @@ pub fn connect(iface: &str, net: &NetworkDef, wait: u32, dns: &str) -> bool {
 /// The secret (when sent) travels inside the D-Bus `Update2`/`AddAndActivate
 /// Connection2` settings payload, never on a process argv line.
 pub fn connect_verbose(iface: &str, net: &NetworkDef, wait: u32, dns: &str) -> Result<(), String> {
+    crate::dns::validate(dns)?;
     let conn = connection().ok_or_else(|| "cannot connect to the D-Bus system bus".to_string())?;
     let dev = device_path(&conn, iface)
         .ok_or_else(|| format!("no NetworkManager device named '{iface}'"))?;
@@ -1031,6 +1012,7 @@ pub fn delete_connections_for_ssid(ssid: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     fn ap(wpa: u32, rsn: u32) -> ApInfo {
         ApInfo {
@@ -1081,14 +1063,59 @@ mod tests {
     }
 
     #[test]
-    fn parse_dns_splits_families_and_skips_garbage() {
-        let (v4, v6) = parse_dns("1.1.1.1, 2606:4700::1111 bogus;9.9.9.9");
+    fn connect_rejects_invalid_dns_before_opening_dbus() {
+        let error = connect_verbose("wlan0", &NetworkDef::default(), 0, "1.1.1.x").unwrap_err();
+        assert!(error.contains("invalid DNS server '1.1.1.x'"));
+    }
+
+    #[test]
+    fn apply_dns_rejects_invalid_nonempty_value_without_mutating_existing_pin() {
+        let mut s = settings_with_ip();
+        assert!(apply_dns(&mut s, "1.1.1.1").unwrap());
+        let before_v4: Vec<u32> = s["ipv4"]["dns"].try_clone().unwrap().try_into().unwrap();
+        let before_data = user_data(&s);
+        assert!(apply_dns(&mut s, "1.1.1.x").is_err());
+        let after_v4: Vec<u32> = s["ipv4"]["dns"].try_clone().unwrap().try_into().unwrap();
+        assert_eq!(after_v4, before_v4);
+        assert_eq!(user_data(&s), before_data);
+        assert!(apply_dns(&mut s, "1.1.1.1, bogus").is_err());
+        let after_v4: Vec<u32> = s["ipv4"]["dns"].try_clone().unwrap().try_into().unwrap();
+        assert_eq!(after_v4, before_v4);
+        assert_eq!(user_data(&s), before_data);
+    }
+
+    #[test]
+    fn failed_parse_cannot_turn_an_invalid_dns_value_into_unpin() {
+        let mut s = settings_with_ip();
+        assert!(apply_dns(&mut s, "1.1.1.1").unwrap());
+        let before_v4: Vec<u32> = s["ipv4"]["dns"].try_clone().unwrap().try_into().unwrap();
+        let before_data = user_data(&s);
+        let attempt = (|| {
+            crate::dns::validate("1.1.1.x")?;
+            apply_dns(&mut s, "1.1.1.x")
+        })();
+        assert!(attempt.is_err());
+        let after_v4: Vec<u32> = s["ipv4"]["dns"].try_clone().unwrap().try_into().unwrap();
+        assert_eq!(after_v4, before_v4);
+        assert_eq!(
+            user_data(&s),
+            before_data,
+            "invalid config preserves pin marker"
+        );
+        assert!(get_bool(&s, "ipv4", "ignore-auto-dns"));
+        assert!(user_data(&s).contains_key(DNS_PIN_MARKER));
+    }
+
+    #[test]
+    fn parse_dns_splits_families_and_rejects_garbage() {
+        let (v4, v6) = crate::dns::parse_servers("1.1.1.1, 2606:4700::1111;9.9.9.9").unwrap();
         assert_eq!(
             v4,
             vec![Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(9, 9, 9, 9)]
         );
         assert_eq!(v6, vec!["2606:4700::1111".parse::<Ipv6Addr>().unwrap()]);
-        assert_eq!(parse_dns(""), (vec![], vec![]));
+        assert_eq!(crate::dns::parse_servers("").unwrap(), (vec![], vec![]));
+        assert!(crate::dns::parse_servers("bogus").is_err());
     }
 
     fn settings_with_ip() -> SettingsMap {
@@ -1110,7 +1137,7 @@ mod tests {
     #[test]
     fn apply_dns_pins_both_families_with_wire_types_and_marks_profile() {
         let mut s = settings_with_ip();
-        assert!(apply_dns(&mut s, "10.0.0.1"));
+        assert!(apply_dns(&mut s, "10.0.0.1").unwrap());
         let dns: Vec<u32> = s["ipv4"]["dns"].try_clone().unwrap().try_into().unwrap();
         // Network byte order: the in-memory bytes are the octets in order.
         assert_eq!(dns, vec![u32::from_ne_bytes([10, 0, 0, 1])]);
@@ -1125,20 +1152,20 @@ mod tests {
         assert!(get_bool(&s, "ipv6", "ignore-auto-dns"));
         assert!(user_data(&s).contains_key(DNS_PIN_MARKER));
         // Re-applying the same pin is a no-op (no disk write).
-        assert!(!apply_dns(&mut s, "10.0.0.1"));
+        assert!(!apply_dns(&mut s, "10.0.0.1").unwrap());
     }
 
     #[test]
     fn apply_dns_empty_unpins_only_our_own_pin() {
         let mut untouched = settings_with_ip();
         assert!(
-            !apply_dns(&mut untouched, ""),
+            !apply_dns(&mut untouched, "").unwrap(),
             "no marker: leave user DNS alone"
         );
 
         let mut s = settings_with_ip();
-        apply_dns(&mut s, "1.1.1.1");
-        assert!(apply_dns(&mut s, ""));
+        apply_dns(&mut s, "1.1.1.1").unwrap();
+        assert!(apply_dns(&mut s, "").unwrap());
         assert!(!get_bool(&s, "ipv4", "ignore-auto-dns"));
         let dns: Vec<u32> = s["ipv4"]["dns"].try_clone().unwrap().try_into().unwrap();
         assert!(dns.is_empty());

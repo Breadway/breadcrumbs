@@ -212,6 +212,33 @@ fn flow_run_unknown_profile_short_circuits_before_touching_nm() {
     );
 }
 
+#[test]
+fn flow_rejects_invalid_dns_before_touching_fake_networkmanager() {
+    let _env = EnvSandbox::new();
+    let nm = fake_nm::shared();
+    nm.reset();
+    let mut cfg = base_config();
+    cfg.settings.dns = "1.1.1.1, invalid".into();
+    cfg.networks.push(net("CafeWifi", None));
+    cfg.profiles.insert(
+        "home".into(),
+        Profile {
+            networks: vec!["CafeWifi".into()],
+            ..Default::default()
+        },
+    );
+
+    let runner = FakeRunner::new();
+    let outcome = with_runner(runner, || flow::run(&mut cfg, "home"));
+
+    assert!(matches!(outcome, flow::Outcome::InvalidDns { ssid, .. } if ssid == "CafeWifi"));
+    assert!(
+        nm.calls().is_empty(),
+        "invalid DNS must be rejected before NM: {:?}",
+        nm.calls()
+    );
+}
+
 // ---------------------------------------------------------------------
 // flow::run: bootstrap + Tailscale gating
 // ---------------------------------------------------------------------

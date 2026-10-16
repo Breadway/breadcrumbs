@@ -10,6 +10,7 @@
 pub mod app;
 pub mod bread_events;
 pub mod config;
+pub mod dns;
 pub mod flow;
 pub mod lock;
 pub mod nm;

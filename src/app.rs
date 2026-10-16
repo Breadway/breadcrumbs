@@ -301,6 +301,9 @@ fn print_outcome(profile: &str, o: &flow::Outcome) {
                 ssid.clone().unwrap_or_else(|| "—".into())
             );
         }
+        flow::Outcome::InvalidDns { ssid, error } => {
+            println!("{C_RED}invalid DNS config{C_RESET} for {ssid}: {error}");
+        }
         flow::Outcome::NoInterface => {
             println!("{C_RED}no Wi-Fi adapter{C_RESET}: hardware issue")
         }
@@ -579,6 +582,9 @@ fn cmd_add(cfg: &mut Config, ssid: String, opts: Box<AddOpts>) -> Result<i32, St
         to,
         at,
     } = *opts;
+    if let Some(value) = dns.as_deref().filter(|value| !value.trim().is_empty()) {
+        crate::dns::validate(value)?;
+    }
     if password.is_some() {
         eprintln!(
             "warning: passing the Wi-Fi password on the command line is deprecated and \
