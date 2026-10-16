@@ -296,14 +296,15 @@ fn wait_for_tick(rx: &Receiver<Wake>, dur: Duration) -> Option<Wake> {
     match rx.recv_timeout(dur) {
         Ok(first) => {
             // Drain any burst of churn signals so we don't re-fire
-            // immediately, but never drop a queued set_profile: it's an
-            // action, not a signal, and the earliest one wins.
+            // immediately. Preserve the newest queued set_profile action:
+            // when commands arrive in one poll burst, the last request is
+            // the user's current intent.
             let mut pending = match &first {
                 Wake::SetProfile(_) => Some(first),
                 Wake::LinkChurn => None,
             };
             while let Ok(w) = rx.try_recv() {
-                if pending.is_none() && matches!(&w, Wake::SetProfile(_)) {
+                if matches!(&w, Wake::SetProfile(_)) {
                     pending = Some(w);
                 }
             }
@@ -706,6 +707,19 @@ mod tests {
         assert!(matches!(wake, Some(Wake::SetProfile(n)) if n == "home"));
         // The burst was fully drained.
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn wait_for_tick_keeps_latest_set_profile_from_burst() {
+        let (tx, rx) = mpsc::channel::<Wake>();
+        let _ = tx.send(Wake::SetProfile("home".into()));
+        let _ = tx.send(Wake::LinkChurn);
+        let _ = tx.send(Wake::SetProfile("work".into()));
+        let _ = tx.send(Wake::LinkChurn);
+
+        let wake = wait_for_tick(&rx, Duration::from_millis(10));
+        assert!(matches!(wake, Some(Wake::SetProfile(name)) if name == "work"));
+        assert!(rx.try_recv().is_err(), "the entire burst should be drained");
     }
 
     #[test]
