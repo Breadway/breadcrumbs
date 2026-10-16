@@ -487,6 +487,29 @@ fn set_profile_command_persists_even_with_no_daemon_reachable() {
 }
 
 #[test]
+fn set_profile_command_trims_name_before_applying() {
+    let _env = EnvSandbox::new();
+    let cfg = Config::load().expect("fresh config");
+    state::set_profile(&cfg, "away").unwrap();
+
+    let action = bread_events::handle_command(&command_event(
+        "bread.command.crumbs.set_profile",
+        serde_json::json!({ "profile": "  home \t" }),
+    ));
+    assert_eq!(
+        action,
+        bread_events::CommandAction::SetProfile("home".to_string())
+    );
+
+    if let bread_events::CommandAction::SetProfile(name) = action {
+        bread_events::apply_set_profile(&name);
+    } else {
+        panic!("valid trimmed profile name should be queued");
+    }
+    assert_eq!(State::load("away").profile, "home");
+}
+
+#[test]
 fn set_profile_command_rejects_unknown_profile() {
     let _env = EnvSandbox::new();
     let cfg = Config::load().expect("fresh config");
@@ -519,6 +542,22 @@ fn set_profile_command_rejects_missing_profile_field() {
     ));
     assert!(matches!(action, bread_events::CommandAction::Ignore));
     assert_eq!(State::load("away").profile, "away");
+}
+
+#[test]
+fn set_profile_command_rejects_empty_or_non_string_profile() {
+    let _env = EnvSandbox::new();
+    let cfg = Config::load().expect("fresh config");
+    state::set_profile(&cfg, "away").unwrap();
+
+    for profile in [serde_json::json!(" \t "), serde_json::json!(42)] {
+        let action = bread_events::handle_command(&command_event(
+            "bread.command.crumbs.set_profile",
+            serde_json::json!({ "profile": profile }),
+        ));
+        assert!(matches!(action, bread_events::CommandAction::Ignore));
+        assert_eq!(State::load("away").profile, "away");
+    }
 }
 
 #[test]

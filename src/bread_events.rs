@@ -114,7 +114,9 @@ pub fn handle_command(event: &BreadEvent) -> CommandAction {
     };
     match verb {
         "set_profile" => match event.data.get("profile").and_then(|v| v.as_str()) {
-            Some(name) if !name.trim().is_empty() => CommandAction::SetProfile(name.to_string()),
+            Some(name) if !name.trim().is_empty() => {
+                CommandAction::SetProfile(name.trim().to_string())
+            }
             _ => {
                 emit_set_profile_failed("missing string \"profile\" in command data");
                 CommandAction::Ignore
