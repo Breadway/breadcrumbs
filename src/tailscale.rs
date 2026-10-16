@@ -113,6 +113,7 @@ fn exit_node_state(
                 .get("DNSName")
                 .and_then(Value::as_str)
                 .unwrap_or("")
+                .trim_end_matches('.')
                 .to_lowercase();
             // Exit nodes can be configured by hostname, MagicDNS name or
             // Tailscale IP (`tailscale set --exit-node` accepts all three).
@@ -120,7 +121,10 @@ fn exit_node_state(
                 .get("TailscaleIPs")
                 .and_then(Value::as_array)
                 .is_some_and(|ips| ips.iter().any(|ip| ip.as_str() == Some(want.as_str())));
-            let matches = host == want || dns.split('.').next() == Some(want.as_str()) || by_ip;
+            let matches = host == want
+                || dns == want.trim_end_matches('.')
+                || dns.split('.').next() == Some(want.as_str())
+                || by_ip;
             let advertises = p
                 .get("ExitNodeOption")
                 .and_then(Value::as_bool)
@@ -589,6 +593,38 @@ mod tests {
             }
         });
         assert_eq!(exit_node_state(&v, "EXITNODE"), (true, true, true));
+    }
+
+    #[test]
+    fn exit_node_matches_full_fqdn_case_insensitively_and_ignores_final_dot() {
+        let v = json!({
+            "Peer": {
+                "k1": { "HostName": "box-1", "DNSName": "ExitNode.Example.TS.NET.",
+                        "Online": true, "ExitNode": true, "ExitNodeOption": true }
+            }
+        });
+        assert_eq!(
+            exit_node_state(&v, "exitnode.example.ts.net"),
+            (true, true, true)
+        );
+        assert_eq!(
+            exit_node_state(&v, "EXITNODE.EXAMPLE.TS.NET."),
+            (true, true, true)
+        );
+    }
+
+    #[test]
+    fn exit_node_fqdn_matching_does_not_match_a_different_domain() {
+        let v = json!({
+            "Peer": {
+                "k1": { "HostName": "box-1", "DNSName": "exitnode.example.ts.net.",
+                        "Online": true, "ExitNode": true, "ExitNodeOption": true }
+            }
+        });
+        assert_eq!(
+            exit_node_state(&v, "exitnode.example.org"),
+            (false, false, false)
+        );
     }
 
     #[test]
