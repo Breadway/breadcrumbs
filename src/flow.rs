@@ -22,6 +22,10 @@ pub enum Outcome {
         ssid: Option<String>,
         health: TsHealth,
     },
+    InvalidDns {
+        ssid: String,
+        error: String,
+    },
     NoInterface,
     NoNetworks,
     UnknownProfile(String),
@@ -240,6 +244,30 @@ fn run_inner(cfg: &mut Config, profile_name: &str, notify_user: bool) -> Outcome
             return Outcome::UnknownProfile(profile_name.to_string());
         }
     };
+
+    // Validate every effective DNS setting before Wi-Fi or NetworkManager
+    // operations. An invalid non-empty setting must never reach the NM
+    // boundary where an empty parsed list could be interpreted as unpin.
+    let mut candidate_networks = resolve_candidates(cfg, &profile);
+    if let Some(bootstrap) = profile.bootstrap.as_deref().and_then(|b| cfg.network(b)) {
+        if !candidate_networks
+            .iter()
+            .any(|network| network.ssid == bootstrap.ssid)
+        {
+            candidate_networks.push(bootstrap.clone());
+        }
+    }
+    if let Some((ssid, error)) = candidate_networks.iter().find_map(|network| {
+        let dns = network.effective_dns(&cfg.settings.dns);
+        crate::dns::validate(dns)
+            .err()
+            .map(|error| (network.ssid.clone(), error))
+    }) {
+        log(&format!(
+            "flow rejected invalid DNS config for {ssid}: {error}"
+        ));
+        return Outcome::InvalidDns { ssid, error };
+    }
 
     let iface = match nm::wifi_interface_preferred(cfg.settings.interface.as_deref()) {
         Some(i) => i,
@@ -622,6 +650,11 @@ mod tests {
         .ok());
         assert!(!Outcome::NoInterface.ok());
         assert!(!Outcome::NoNetworks.ok());
+        assert!(!Outcome::InvalidDns {
+            ssid: "home".into(),
+            error: "bad DNS".into()
+        }
+        .ok());
         assert!(!Outcome::UnknownProfile("ghost".into()).ok());
         assert!(!Outcome::TailscaleError {
             ssid: None,

@@ -632,6 +632,39 @@ fn join_unknown_ssid_errors() {
     );
 }
 
+#[test]
+fn join_rejects_invalid_effective_dns_before_enabling_wifi() {
+    let sb = Sandbox::new();
+    let nm = sb.nm();
+    nm.add_wifi_device("wlan0", 100);
+    assert!(sb
+        .cmd(&["add", "Net", "pw", "--dns", "1.1.1.1"])
+        .status
+        .success());
+    let text = fs::read_to_string(sb.networks_file()).unwrap();
+    fs::write(sb.networks_file(), text.replace("1.1.1.1", "1.1.1.x")).unwrap();
+    nm.state.lock().unwrap().wireless_enabled = false;
+
+    let output = sb.cmd(&["join", "Net"]);
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("1.1.1.x"));
+    assert!(
+        !nm.state.lock().unwrap().wireless_enabled,
+        "join enabled Wi-Fi before rejecting malformed DNS"
+    );
+}
+
+#[test]
+fn add_rejects_delimiter_only_dns_and_names_input_before_persisting() {
+    let sb = Sandbox::new();
+    let output = sb.cmd(&["add", "CafeWifi", "pw", "--dns", ", ; ,"]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains(", ; ,"));
+    let networks = fs::read_to_string(sb.networks_file()).unwrap_or_default();
+    assert!(!networks.contains("CafeWifi"));
+}
+
 // -----------------------------------------------------------------------
 // CLI-level coverage through fake NM + tailscale (item 3)
 // -----------------------------------------------------------------------
@@ -853,6 +886,48 @@ fn add_with_dns_persists_per_network_override() {
     assert!(
         networks.contains("dns = \"9.9.9.9\""),
         "per-network DNS override must be persisted: {networks}"
+    );
+}
+
+#[test]
+fn doctor_reports_invalid_dns_config_without_touching_network() {
+    let sb = Sandbox::new();
+    fs::create_dir_all(sb.root.join("config/breadcrumbs")).unwrap();
+    fs::write(
+        sb.config_file(),
+        r#"[settings]
+dns = "1.1.1.x"
+"#,
+    )
+    .unwrap();
+
+    let o = sb.cmd(&["doctor"]);
+    assert!(
+        o.status.success(),
+        "doctor remains diagnostic: {}",
+        stderr(&o)
+    );
+    let out = stdout(&o);
+    assert!(
+        out.contains("settings.dns"),
+        "doctor should name invalid DNS: {out}"
+    );
+    assert!(
+        out.contains("invalid DNS server '1.1.1.x'"),
+        "diagnostic should identify token: {out}"
+    );
+}
+
+#[test]
+fn add_rejects_invalid_dns_before_persisting_network() {
+    let sb = Sandbox::new();
+    let o = sb.cmd(&["add", "CafeWifi", "pw", "--dns", "9.9.9.9, invalid"]);
+    assert!(!o.status.success(), "invalid DNS must be rejected");
+    assert!(stderr(&o).contains("invalid DNS server 'invalid'"));
+    let networks = fs::read_to_string(sb.networks_file()).unwrap_or_default();
+    assert!(
+        !networks.contains("CafeWifi"),
+        "invalid DNS should not persist the network entry: {networks}"
     );
 }
 

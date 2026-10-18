@@ -444,6 +444,11 @@ impl Config {
     /// Reported by `doctor`.
     pub fn validate(&self) -> Vec<String> {
         let mut out = Vec::new();
+        if !self.settings.dns.trim().is_empty() {
+            if let Err(error) = crate::dns::validate(&self.settings.dns) {
+                out.push(format!("settings.dns: {error}"));
+            }
+        }
         if !self.profiles.contains_key(&self.settings.default_profile) {
             out.push(format!(
                 "settings.default_profile '{}' is not a defined profile",
@@ -477,6 +482,15 @@ impl Config {
                 out.push(format!(
                     "profile '{name}' requires Tailscale but no exit node is configured"
                 ));
+            }
+        }
+        for network in &self.networks {
+            if let Some(dns) = network.dns.as_deref() {
+                if !dns.trim().is_empty() {
+                    if let Err(error) = crate::dns::validate(dns) {
+                        out.push(format!("network '{}' DNS: {error}", network.ssid));
+                    }
+                }
             }
         }
         out
@@ -846,6 +860,41 @@ dns = "9.9.9.9""#;
             .validate()
             .iter()
             .any(|e| e.contains("no exit node is configured")));
+    }
+
+    #[test]
+    fn validate_reports_invalid_global_and_per_network_dns() {
+        let mut cfg = build_initial_config();
+        cfg.settings.dns = "1.1.1.x".into();
+        cfg.networks.push(NetworkDef {
+            ssid: "CafeWifi".into(),
+            dns: Some("9.9.9.9, invalid".into()),
+            ..Default::default()
+        });
+
+        let errors = cfg.validate();
+        assert!(errors.iter().any(|error| error.contains("settings.dns")));
+        assert!(errors.iter().any(|error| error.contains("CafeWifi")));
+
+        cfg.settings.dns.clear();
+        cfg.networks[0].dns = Some(String::new());
+        assert!(cfg.validate().iter().all(|error| !error.contains("DNS")));
+    }
+
+    #[test]
+    fn validate_rejects_delimiter_only_dns_without_treating_it_as_unpin() {
+        let mut cfg = build_initial_config();
+        cfg.settings.dns = ", ; ,".into();
+        let errors = cfg.validate();
+        assert!(errors
+            .iter()
+            .any(|error| { error.contains("settings.dns") && error.contains("', ; ,'") }));
+
+        cfg.settings.dns.clear();
+        assert!(cfg
+            .validate()
+            .iter()
+            .all(|error| !error.contains("settings.dns")));
     }
 
     #[test]
