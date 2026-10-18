@@ -231,33 +231,6 @@ pub fn run_quiet(cfg: &mut Config, profile_name: &str) -> Outcome {
 /// clearing happens for the `init` / `profile set --apply` / `detect --apply`
 /// commands and the watch loop, all of which route through here.
 fn run_inner(cfg: &mut Config, profile_name: &str, notify_user: bool) -> Outcome {
-    // Validate every effective DNS setting before Wi-Fi or NetworkManager
-    // operations. An invalid non-empty setting must never reach the NM
-    // boundary where an empty parsed list could be interpreted as unpin.
-    let candidate_networks = cfg.profiles.get(profile_name).map(|profile| {
-        profile
-            .networks
-            .iter()
-            .chain(profile.bootstrap.iter())
-            .filter_map(|ssid| cfg.network(ssid))
-            .collect::<Vec<_>>()
-    });
-    if let Some((ssid, error)) = candidate_networks
-        .into_iter()
-        .flatten()
-        .find_map(|network| {
-            let dns = network.effective_dns(&cfg.settings.dns);
-            crate::dns::validate(dns)
-                .err()
-                .map(|error| (network.ssid.clone(), error))
-        })
-    {
-        log(&format!(
-            "flow rejected invalid DNS config for {ssid}: {error}"
-        ));
-        return Outcome::InvalidDns { ssid, error };
-    }
-
     let profile = match cfg.profile(profile_name) {
         Some(p) => p.clone(),
         None => {
@@ -271,6 +244,30 @@ fn run_inner(cfg: &mut Config, profile_name: &str, notify_user: bool) -> Outcome
             return Outcome::UnknownProfile(profile_name.to_string());
         }
     };
+
+    // Validate every effective DNS setting before Wi-Fi or NetworkManager
+    // operations. An invalid non-empty setting must never reach the NM
+    // boundary where an empty parsed list could be interpreted as unpin.
+    let mut candidate_networks = resolve_candidates(cfg, &profile);
+    if let Some(bootstrap) = profile.bootstrap.as_deref().and_then(|b| cfg.network(b)) {
+        if !candidate_networks
+            .iter()
+            .any(|network| network.ssid == bootstrap.ssid)
+        {
+            candidate_networks.push(bootstrap.clone());
+        }
+    }
+    if let Some((ssid, error)) = candidate_networks.iter().find_map(|network| {
+        let dns = network.effective_dns(&cfg.settings.dns);
+        crate::dns::validate(dns)
+            .err()
+            .map(|error| (network.ssid.clone(), error))
+    }) {
+        log(&format!(
+            "flow rejected invalid DNS config for {ssid}: {error}"
+        ));
+        return Outcome::InvalidDns { ssid, error };
+    }
 
     let iface = match nm::wifi_interface_preferred(cfg.settings.interface.as_deref()) {
         Some(i) => i,

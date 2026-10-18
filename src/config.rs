@@ -882,6 +882,22 @@ dns = "9.9.9.9""#;
     }
 
     #[test]
+    fn validate_rejects_delimiter_only_dns_without_treating_it_as_unpin() {
+        let mut cfg = build_initial_config();
+        cfg.settings.dns = ", ; ,".into();
+        let errors = cfg.validate();
+        assert!(errors
+            .iter()
+            .any(|error| { error.contains("settings.dns") && error.contains("', ; ,'") }));
+
+        cfg.settings.dns.clear();
+        assert!(cfg
+            .validate()
+            .iter()
+            .all(|error| !error.contains("settings.dns")));
+    }
+
+    #[test]
     fn hhmm_to_minutes_parses_and_rejects_malformed() {
         assert_eq!(hhmm_to_minutes("09:30"), Some(570));
         assert_eq!(hhmm_to_minutes("00:00"), Some(0));

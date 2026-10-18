@@ -699,6 +699,7 @@ fn cmd_join(cfg: &mut Config, ssid: &str) -> Result<i32, String> {
         .find(|n| n.ssid == ssid)
         .cloned()
         .ok_or_else(|| format!("no saved network '{ssid}', run `add` first"))?;
+    crate::dns::validate(net.effective_dns(&cfg.settings.dns))?;
     let iface = nm::wifi_interface_preferred(cfg.settings.interface.as_deref())
         .ok_or_else(|| "no Wi-Fi adapter found".to_string())?;
     nm::radio_on();

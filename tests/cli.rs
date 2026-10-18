@@ -632,6 +632,39 @@ fn join_unknown_ssid_errors() {
     );
 }
 
+#[test]
+fn join_rejects_invalid_effective_dns_before_enabling_wifi() {
+    let sb = Sandbox::new();
+    let nm = sb.nm();
+    nm.add_wifi_device("wlan0", 100);
+    assert!(sb
+        .cmd(&["add", "Net", "pw", "--dns", "1.1.1.1"])
+        .status
+        .success());
+    let text = fs::read_to_string(sb.networks_file()).unwrap();
+    fs::write(sb.networks_file(), text.replace("1.1.1.1", "1.1.1.x")).unwrap();
+    nm.state.lock().unwrap().wireless_enabled = false;
+
+    let output = sb.cmd(&["join", "Net"]);
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("1.1.1.x"));
+    assert!(
+        !nm.state.lock().unwrap().wireless_enabled,
+        "join enabled Wi-Fi before rejecting malformed DNS"
+    );
+}
+
+#[test]
+fn add_rejects_delimiter_only_dns_and_names_input_before_persisting() {
+    let sb = Sandbox::new();
+    let output = sb.cmd(&["add", "CafeWifi", "pw", "--dns", ", ; ,"]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains(", ; ,"));
+    let networks = fs::read_to_string(sb.networks_file()).unwrap_or_default();
+    assert!(!networks.contains("CafeWifi"));
+}
+
 // -----------------------------------------------------------------------
 // CLI-level coverage through fake NM + tailscale (item 3)
 // -----------------------------------------------------------------------

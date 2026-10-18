@@ -239,6 +239,98 @@ fn flow_rejects_invalid_dns_before_touching_fake_networkmanager() {
     );
 }
 
+#[test]
+fn flow_prevalidates_include_all_known_candidates_and_bootstrap_before_nm() {
+    let _env = EnvSandbox::new();
+    let nm = fake_nm::shared();
+    nm.reset();
+    nm.add_wifi_device("wlan0", 100);
+    nm.state.lock().unwrap().wireless_enabled = false;
+    let mut cfg = base_config();
+    cfg.settings.dns = "1.1.1.x".into();
+    let mut inherited = net("Inherited", None);
+    inherited.hidden = true;
+    let mut overridden = net("Override", None);
+    overridden.dns = Some("9.9.9.9, invalid".into());
+    cfg.networks = vec![inherited, overridden];
+    cfg.profiles.insert(
+        "home".into(),
+        Profile {
+            bootstrap: Some("Inherited".into()),
+            include_all_known: true,
+            ..Default::default()
+        },
+    );
+
+    let runner = FakeRunner::new();
+    let outcome = with_runner(runner, || flow::run(&mut cfg, "home"));
+
+    assert!(
+        matches!(outcome, flow::Outcome::InvalidDns { ssid, error } if ssid == "Inherited" && error.contains("1.1.1.x"))
+    );
+    assert!(
+        nm.calls().is_empty(),
+        "invalid effective DNS reached NM: {:?}",
+        nm.calls()
+    );
+    assert!(
+        !nm.state.lock().unwrap().wireless_enabled,
+        "flow enabled Wi-Fi before DNS validation"
+    );
+}
+
+#[test]
+fn flow_prevalidates_include_all_known_dns_override_before_nm() {
+    let _env = EnvSandbox::new();
+    let nm = fake_nm::shared();
+    nm.reset();
+    nm.add_wifi_device("wlan0", 100);
+    nm.state.lock().unwrap().wireless_enabled = false;
+    let mut cfg = base_config();
+    cfg.settings.dns = "9.9.9.9".into();
+    let mut overridden = net("Override", None);
+    overridden.dns = Some("1.1.1.1, invalid".into());
+    cfg.networks.push(overridden);
+    cfg.profiles.insert(
+        "home".into(),
+        Profile {
+            include_all_known: true,
+            ..Default::default()
+        },
+    );
+
+    let outcome = with_runner(FakeRunner::new(), || flow::run(&mut cfg, "home"));
+
+    assert!(
+        matches!(outcome, flow::Outcome::InvalidDns { ssid, error } if ssid == "Override" && error.contains("invalid"))
+    );
+    assert!(
+        nm.calls().is_empty(),
+        "invalid override reached NM: {:?}",
+        nm.calls()
+    );
+    assert!(!nm.state.lock().unwrap().wireless_enabled);
+}
+
+#[test]
+fn separator_only_dns_rejection_preserves_existing_nm_pin() {
+    let _env = EnvSandbox::new();
+    let (nm, _dev) = setup_wifi(&[("Net", 80)]);
+    let def = net("Net", Some("pw"));
+    breadcrumbs::nm::connect_verbose("wlan0", &def, 5, "1.1.1.1").unwrap();
+    let before = format!("{:?}", nm.state.lock().unwrap().connections);
+    let before_calls = nm.calls();
+
+    let error = breadcrumbs::nm::connect_verbose("wlan0", &def, 5, ", ; ,").unwrap_err();
+
+    assert!(error.contains(", ; ,"), "error did not name input: {error}");
+    assert_eq!(
+        format!("{:?}", nm.state.lock().unwrap().connections),
+        before
+    );
+    assert_eq!(nm.calls(), before_calls, "invalid DNS invoked NM");
+}
+
 // ---------------------------------------------------------------------
 // flow::run: bootstrap + Tailscale gating
 // ---------------------------------------------------------------------

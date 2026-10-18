@@ -4,6 +4,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 /// malformed non-empty token rejects the whole setting so it cannot become
 /// an accidental unpin or partial pin.
 pub fn parse_servers(value: &str) -> Result<(Vec<Ipv4Addr>, Vec<Ipv6Addr>), String> {
+    if value.trim().is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
     let mut v4 = Vec::new();
     let mut v6 = Vec::new();
     for token in value
@@ -16,6 +19,11 @@ pub fn parse_servers(value: &str) -> Result<(Vec<Ipv4Addr>, Vec<Ipv6Addr>), Stri
             Ok(IpAddr::V6(addr)) => v6.push(addr),
             Err(_) => return Err(format!("invalid DNS server '{token}'")),
         }
+    }
+    if v4.is_empty() && v6.is_empty() {
+        return Err(format!(
+            "invalid DNS server list '{value}' contains no addresses"
+        ));
     }
     Ok((v4, v6))
 }
@@ -47,5 +55,13 @@ mod tests {
             Err("invalid DNS server '1.1.1.x'".into())
         );
         assert!(parse_servers("1.1.1.1, bogus").is_err());
+    }
+
+    #[test]
+    fn rejects_delimiter_only_nonblank_input_and_names_it() {
+        assert_eq!(
+            parse_servers(", ; ,"),
+            Err("invalid DNS server list ', ; ,' contains no addresses".into())
+        );
     }
 }
