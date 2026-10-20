@@ -316,6 +316,30 @@ fn print_outcome(profile: &str, o: &flow::Outcome) {
     }
 }
 
+/// The `detect --apply --json` result: the detected profile plus what the
+/// connect flow did, as a single JSON object.
+fn detect_apply_json(profile: &str, o: &flow::Outcome) -> serde_json::Value {
+    let outcome = match o {
+        flow::Outcome::Connected { ssid, note } => {
+            serde_json::json!({ "status": "connected", "ssid": ssid, "note": note })
+        }
+        flow::Outcome::TailscaleError { ssid, health } => serde_json::json!({
+            "status": "tailscale_error",
+            "ssid": ssid,
+            "error": health.describe(),
+        }),
+        flow::Outcome::InvalidDns { ssid, error } => {
+            serde_json::json!({ "status": "invalid_dns", "ssid": ssid, "error": error })
+        }
+        flow::Outcome::NoInterface => serde_json::json!({ "status": "no_interface" }),
+        flow::Outcome::NoNetworks => serde_json::json!({ "status": "no_networks" }),
+        flow::Outcome::UnknownProfile(p) => {
+            serde_json::json!({ "status": "unknown_profile", "profile": p })
+        }
+    };
+    serde_json::json!({ "profile": profile, "outcome": outcome, "ok": o.ok() })
+}
+
 fn cmd_status(cfg: &Config, override_p: &Option<String>, json: bool) -> Result<i32, String> {
     let p = active_profile(cfg, override_p);
     let s = crate::status::gather(cfg, &p);
@@ -479,9 +503,7 @@ fn cmd_detect(cfg: &mut Config, apply: bool, json: bool) -> Result<i32, String> 
                 return Ok(0);
             }
             if apply {
-                if json {
-                    println!("{}", serde_json::json!({ "profile": p }));
-                } else {
+                if !json {
                     println!("{p}");
                 }
                 // Route through state::set_profile (like the CLI and the
@@ -489,7 +511,13 @@ fn cmd_detect(cfg: &mut Config, apply: bool, json: bool) -> Result<i32, String> 
                 // proper error instead of being persisted as active.
                 state::set_profile(cfg, &p)?;
                 let outcome = flow::run(cfg, &p);
-                print_outcome(&p, &outcome);
+                if json {
+                    // One object on stdout, so a machine consumer never has
+                    // to skip a human line after the JSON.
+                    println!("{}", detect_apply_json(&p, &outcome));
+                } else {
+                    print_outcome(&p, &outcome);
+                }
                 return Ok(if outcome.ok() { 0 } else { 1 });
             }
             println!("{p}");
@@ -1196,5 +1224,25 @@ mod tests {
     fn mask_emoji_first_character_does_not_panic() {
         let pw = "🔒password123";
         assert_eq!(mask(pw), "•".repeat(8));
+    }
+
+    #[test]
+    fn detect_apply_json_is_one_object_covering_profile_and_outcome() {
+        let ok = detect_apply_json(
+            "home",
+            &flow::Outcome::Connected {
+                ssid: "HomeWifi".into(),
+                note: None,
+            },
+        );
+        assert_eq!(ok["profile"], "home");
+        assert_eq!(ok["ok"], true);
+        assert_eq!(ok["outcome"]["status"], "connected");
+        assert_eq!(ok["outcome"]["ssid"], "HomeWifi");
+        let down = detect_apply_json("home", &flow::Outcome::NoNetworks);
+        assert_eq!(down["ok"], false);
+        assert_eq!(down["outcome"]["status"], "no_networks");
+        // Whatever the outcome, it must serialize as exactly one line.
+        assert!(!serde_json::to_string(&down).unwrap().contains('\n'));
     }
 }
