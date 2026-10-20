@@ -19,11 +19,25 @@ jobs:
     runs-on: [self-hosted]
     steps:
       - name: checkout
+        shell: bash
         run: |
           set -euo pipefail
-          rm -rf src && mkdir src
-          git clone --branch "${GITHUB_REF_NAME}" --depth 1 \
-            "https://git.breadway.dev/${GITHUB_REPOSITORY}.git" src
+          # Inline bootstrap of bread-ecosystem scripts/ci-checkout.sh (see
+          # its docs/ci-checkout.md); keep this block in sync with that helper.
+          # Checks out the exact event commit into a directory this job owns.
+          if ! [[ "${GITHUB_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "checkout: GITHUB_SHA is not a full commit id" >&2
+              exit 1
+          fi
+          checkout=$(mktemp -d "${RUNNER_TEMP:-/tmp}/bread-ci.XXXXXX")
+          printf 'BREAD_CI_JOB_DIR=%s\n' "$checkout" >> "$GITHUB_ENV"
+          git clone --no-checkout "https://git.breadway.dev/${GITHUB_REPOSITORY}.git" "$checkout/src"
+          git -C "$checkout/src" -c advice.detachedHead=false checkout --quiet --detach "$GITHUB_SHA"
+          actual="$(git -C "$checkout/src" rev-parse HEAD)"
+          if [ "$actual" != "$GITHUB_SHA" ]; then
+              echo "checkout: HEAD is $actual, expected $GITHUB_SHA" >&2
+              exit 1
+          fi
 
       - name: clone bread-ecosystem (main)
         run: |
@@ -37,20 +51,31 @@ jobs:
       # tag-pinned; dev-mode resolution to main happens only at build time,
       # below, never by editing the manifest.
       - name: lint git.breadway.dev dependency pins
-        run: bash "${ECOSYSTEM_CI_DIR}/scripts/lint-pins.sh" --root src
+        run: bash "${ECOSYSTEM_CI_DIR}/scripts/lint-pins.sh" --root "$BREAD_CI_JOB_DIR/src"
 
       - name: resolve dev dependencies to main
         run: |
           set -euo pipefail
-          cd src
+          cd "$BREAD_CI_JOB_DIR/src"
           bash "${ECOSYSTEM_CI_DIR}/scripts/dev-deps.sh" --root .
           rm -rf "${ECOSYSTEM_CI_DIR}"
 
       - name: fmt
-        run: cd src && bash ci/build.sh cargo fmt --all -- --check
+        run: cd "$BREAD_CI_JOB_DIR/src" && bash ci/build.sh cargo fmt --all -- --check
 
       - name: clippy
-        run: cd src && bash ci/build.sh cargo clippy --all-targets -- -D warnings
+        run: cd "$BREAD_CI_JOB_DIR/src" && bash ci/build.sh cargo clippy --all-targets -- -D warnings
 
       - name: test
-        run: cd src && bash ci/build.sh cargo test --release
+        run: cd "$BREAD_CI_JOB_DIR/src" && bash ci/build.sh cargo test --release
+
+      # Runs last so no earlier step loses its tree. Removes only this job's
+      # own checkout directory, and only under RUNNER_TEMP.
+      - name: clean owned checkout
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${BREAD_CI_JOB_DIR:-}" == "${RUNNER_TEMP:-/tmp}"/bread-ci.* && -d "$BREAD_CI_JOB_DIR" ]]; then
+            rm -rf -- "$BREAD_CI_JOB_DIR"
+          fi
