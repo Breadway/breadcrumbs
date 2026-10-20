@@ -18,6 +18,7 @@ pub enum Connectivity {
 }
 
 pub fn connectivity(cfg: &Config) -> Connectivity {
+    let mut answered = false;
     if command_exists("curl") {
         let o = run(
             "curl",
@@ -45,6 +46,7 @@ pub fn connectivity(cfg: &Config) -> Connectivity {
         if is_portal_status(code) {
             return Connectivity::Portal;
         }
+        answered = is_unexpected_http_answer(code);
     }
     // Fallback: ICMP to the configured host. A working ping overrides a
     // non-204 curl answer that wasn't portal-shaped (e.g. a 403 from an
@@ -57,9 +59,22 @@ pub fn connectivity(cfg: &Config) -> Connectivity {
     );
     if ping.success {
         Connectivity::Online
+    } else if answered {
+        // Something answered the HTTP probe with a page that is not the
+        // expected 204, and ICMP is blocked too. That is an intercepting
+        // network (a portal answering 403/404 with a login page), so tell
+        // the user to sign in instead of reconnecting pointlessly.
+        Connectivity::Portal
     } else {
         Connectivity::NoNet
     }
+}
+
+/// An HTTP answer that is not the expected 204 and not a server error. `000`
+/// (no response at all) and 5xx do not count: those look like an outage, not
+/// an interception.
+fn is_unexpected_http_answer(code: &str) -> bool {
+    matches!(code.parse::<u16>(), Ok(c) if (200..=499).contains(&c) && c != 204)
 }
 
 /// HTTP status codes that mean "a captive portal intercepted the probe".
@@ -137,6 +152,16 @@ mod tests {
         }
         for c in ["204", "000", "403", "500", ""] {
             assert!(!is_portal_status(c), "{c}");
+        }
+    }
+
+    #[test]
+    fn a_non_204_http_answer_is_a_portal_candidate_but_an_outage_is_not() {
+        for c in ["200", "301", "403", "404", "451"] {
+            assert!(is_unexpected_http_answer(c), "{c}");
+        }
+        for c in ["204", "000", "500", "502", "", "abc"] {
+            assert!(!is_unexpected_http_answer(c), "{c}");
         }
     }
 }
