@@ -595,6 +595,29 @@ fn prompt_secret(msg: &str) -> Result<String, String> {
     Ok(val)
 }
 
+/// Where a password for `add` came from. `Explicit` is `--password` or
+/// `--password-stdin` (an empty value still counts as an explicit choice);
+/// `Prompt` is the interactive answer, where blank means "keep if present".
+#[derive(Debug, PartialEq)]
+enum PasswordAnswer {
+    Explicit(Option<String>),
+    Prompt(Option<String>),
+}
+
+/// The password write for `add`, decided against the config as it is inside
+/// the locked update (`network_exists` comes from that fresh config, not from
+/// the startup load, since the network may have been created meanwhile).
+/// `None` leaves the stored password alone; `Some(None)` clears it;
+/// `Some(Some(p))` sets it.
+fn password_to_write(network_exists: bool, answer: &PasswordAnswer) -> Option<Option<String>> {
+    match answer {
+        PasswordAnswer::Explicit(p) => Some(p.clone()),
+        PasswordAnswer::Prompt(Some(p)) => Some(Some(p.clone())),
+        PasswordAnswer::Prompt(None) if network_exists => None,
+        PasswordAnswer::Prompt(None) => Some(None),
+    }
+}
+
 fn cmd_add(cfg: &mut Config, ssid: String, opts: Box<AddOpts>) -> Result<i32, String> {
     let AddOpts {
         password,
@@ -627,7 +650,11 @@ fn cmd_add(cfg: &mut Config, ssid: String, opts: Box<AddOpts>) -> Result<i32, St
             return Err(format!("unknown profile '{prof_name}'"));
         }
     }
-    let existing = cfg.network(&ssid).is_some();
+    // The startup `cfg` can be stale by the time the user answers the
+    // prompt: another process may create this network meanwhile. So the
+    // existence check happens again inside the locked update, against the
+    // fresh config, and the prompt's hint is only advisory.
+    let existing_at_prompt = cfg.network(&ssid).is_some();
     // All input is gathered before the config lock is taken: the lock is
     // held only for the short load, modify, save below, never while waiting
     // on a human at a prompt.
@@ -638,30 +665,28 @@ fn cmd_add(cfg: &mut Config, ssid: String, opts: Box<AddOpts>) -> Result<i32, St
     // one; a blank answer at the interactive prompt keeps an existing
     // entry's password, so e.g. `add Net --to home` can't wipe a password
     // that hasn't been used yet.
-    let password: Option<Option<String>> = match password {
-        Some(p) => Some(non_empty(p)),
-        None if password_stdin => Some(non_empty(read_stdin_line())),
+    let answer = match password {
+        Some(p) => PasswordAnswer::Explicit(non_empty(p)),
+        None if password_stdin => PasswordAnswer::Explicit(non_empty(read_stdin_line())),
         None => {
             let label = if eap.is_some() {
                 "802.1x password"
             } else {
                 "Password"
             };
-            let hint = if existing {
+            let hint = if existing_at_prompt {
                 " (blank keeps current)"
             } else {
                 ""
             };
             let answer = prompt_secret(&format!("{label} for '{ssid}'{hint}: "))?;
-            match non_empty(answer) {
-                Some(p) => Some(Some(p)),
-                None if existing => None,
-                None => Some(None),
-            }
+            PasswordAnswer::Prompt(non_empty(answer))
         }
     };
 
     Config::update(|cfg| {
+        let network_exists = cfg.networks.iter().any(|n| n.ssid == ssid);
+        let password = password_to_write(network_exists, &answer);
         match cfg.networks.iter_mut().find(|n| n.ssid == ssid) {
             Some(n) => {
                 if let Some(p) = password.clone() {
@@ -1196,6 +1221,52 @@ fn cmd_install_service(enable: bool) -> Result<i32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blank_prompt_keeps_password_when_network_exists_in_fresh_config() {
+        // The network may have been created after the prompt started: the
+        // fresh config decides, so a blank answer keeps its password.
+        assert_eq!(password_to_write(true, &PasswordAnswer::Prompt(None)), None);
+    }
+
+    #[test]
+    fn blank_prompt_sets_no_password_for_a_new_network() {
+        assert_eq!(
+            password_to_write(false, &PasswordAnswer::Prompt(None)),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn non_blank_prompt_sets_password_for_existing_and_new_networks() {
+        let answer = PasswordAnswer::Prompt(Some("hunter22".into()));
+        assert_eq!(
+            password_to_write(true, &answer),
+            Some(Some("hunter22".into()))
+        );
+        assert_eq!(
+            password_to_write(false, &answer),
+            Some(Some("hunter22".into()))
+        );
+    }
+
+    #[test]
+    fn explicit_password_always_replaces_even_when_empty() {
+        // `--password` or `--password-stdin` is an explicit choice: it
+        // replaces the stored password, including clearing it.
+        assert_eq!(
+            password_to_write(true, &PasswordAnswer::Explicit(None)),
+            Some(None)
+        );
+        assert_eq!(
+            password_to_write(true, &PasswordAnswer::Explicit(Some("new".into()))),
+            Some(Some("new".into()))
+        );
+        assert_eq!(
+            password_to_write(false, &PasswordAnswer::Explicit(None)),
+            Some(None)
+        );
+    }
 
     #[test]
     fn mask_is_fixed_length_regardless_of_secret() {
