@@ -800,6 +800,13 @@ fn user_data(s: &SettingsMap) -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
+/// A new ipv4 or ipv6 section with `method = auto`, the NetworkManager default.
+fn auto_ip_section() -> HashMap<String, OwnedValue> {
+    let mut section = HashMap::new();
+    section.insert("method".into(), ov(Value::from("auto")));
+    section
+}
+
 /// Rewrite the DNS keys of one IP section. `dns` is the typed `dns` value
 /// (`au` for IPv4, `aay` for IPv6, which every NetworkManager version
 /// accepts); `dns-data` (`as`, newer NM) is kept in sync when the profile
@@ -850,11 +857,14 @@ fn apply_dns(s: &mut SettingsMap, dns: &str) -> Result<bool, String> {
         let v4_str: Vec<String> = v4.iter().map(ToString::to_string).collect();
         let v6_wire: Vec<Vec<u8>> = v6.iter().map(|a| a.octets().to_vec()).collect();
         let v6_str: Vec<String> = v6.iter().map(ToString::to_string).collect();
-        let ip4 = s.entry("ipv4".to_string()).or_default();
+        // A created section gets `method = auto`: NetworkManager rejects an
+        // ipv4/ipv6 section with no method ("ipv6.method: property is
+        // missing"), and `auto` is the default it applies to a profile with
+        // no section at all. Existing sections keep their method.
+        let ip4 = s.entry("ipv4".to_string()).or_insert_with(auto_ip_section);
         set_ip_dns(ip4, true, Value::from(v4_wire), v4_str);
         // Create the ipv6 section too, so auto DNS cannot leak around the pin.
-        // Only DNS keys are written; no ipv6 `method`, so NM keeps its default.
-        let ip6 = s.entry("ipv6".to_string()).or_default();
+        let ip6 = s.entry("ipv6".to_string()).or_insert_with(auto_ip_section);
         set_ip_dns(ip6, true, Value::from(v6_wire), v6_str);
         data.insert(DNS_PIN_MARKER.to_string(), want);
     }
@@ -1222,8 +1232,11 @@ mod tests {
                 .octets()
                 .to_vec()]
         );
-        // Only DNS keys are added: no ipv6 method, so NM keeps its default.
-        assert!(!s["ipv6"].contains_key("method"));
+        // A created ipv6 section carries method auto (NM rejects it without one).
+        assert_eq!(
+            s["ipv6"]["method"].downcast_ref::<String>().unwrap(),
+            "auto"
+        );
         assert!(user_data(&s).contains_key(DNS_PIN_MARKER));
     }
 
@@ -1234,7 +1247,37 @@ mod tests {
         let v6: Vec<Vec<u8>> = s["ipv6"]["dns"].try_clone().unwrap().try_into().unwrap();
         assert!(v6.is_empty(), "no v6 servers: nothing to pin on ipv6");
         assert!(get_bool(&s, "ipv6", "ignore-auto-dns"));
-        assert!(!s["ipv6"].contains_key("method"));
+        assert_eq!(
+            s["ipv6"]["method"].downcast_ref::<String>().unwrap(),
+            "auto"
+        );
+    }
+
+    #[test]
+    fn apply_dns_pin_created_ipv4_section_carries_method() {
+        let mut s: SettingsMap = HashMap::new();
+        assert!(apply_dns(&mut s, "10.0.0.1").unwrap());
+        assert_eq!(
+            s["ipv4"]["method"].downcast_ref::<String>().unwrap(),
+            "auto"
+        );
+        assert_eq!(
+            s["ipv6"]["method"].downcast_ref::<String>().unwrap(),
+            "auto"
+        );
+    }
+
+    #[test]
+    fn apply_dns_pin_keeps_existing_ipv6_method() {
+        let mut s = settings_with_ip();
+        s.get_mut("ipv6")
+            .unwrap()
+            .insert("method".into(), ov(Value::from("manual")));
+        assert!(apply_dns(&mut s, "10.0.0.1").unwrap());
+        assert_eq!(
+            s["ipv6"]["method"].downcast_ref::<String>().unwrap(),
+            "manual"
+        );
     }
 
     #[test]

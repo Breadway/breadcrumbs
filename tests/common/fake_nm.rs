@@ -225,6 +225,14 @@ fn validate_settings(s: &SettingsMap) -> fdo::Result<()> {
         }
     }
     for section in ["ipv4", "ipv6"] {
+        // A present IP section must name its method: NetworkManager reports
+        // "ipv6.method: property is missing" otherwise. Only a wholly absent
+        // section falls back to NM's default.
+        if let Some(ip) = s.get(section) {
+            if ip.get("method").is_none() {
+                return bad(&format!("{section}.method: property is missing"));
+            }
+        }
         if let Some(dns) = s.get(section).and_then(|m| m.get("dns")) {
             let sig = dns.value_signature().to_string();
             let want = if section == "ipv4" { "au" } else { "aay" };
@@ -240,6 +248,47 @@ fn validate_settings(s: &SettingsMap) -> fdo::Result<()> {
 
 fn ov(v: Value<'_>) -> OwnedValue {
     OwnedValue::try_from(v).expect("settings value is ownable")
+}
+
+#[cfg(test)]
+mod validate_tests {
+    use super::*;
+
+    fn with_section(section: &str, keys: &[&str]) -> SettingsMap {
+        let mut s: SettingsMap = HashMap::new();
+        let mut m = HashMap::new();
+        for k in keys {
+            m.insert((*k).to_string(), ov(Value::from("auto")));
+        }
+        s.insert(section.to_string(), m);
+        s
+    }
+
+    #[test]
+    fn ipv4_or_ipv6_section_without_method_is_rejected() {
+        for section in ["ipv4", "ipv6"] {
+            let s = with_section(section, &["dns-search"]);
+            let err = validate_settings(&s).expect_err("missing method must be rejected");
+            assert!(
+                err.to_string()
+                    .contains(&format!("{section}.method: property is missing")),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn ipv4_or_ipv6_section_with_method_is_accepted() {
+        for section in ["ipv4", "ipv6"] {
+            let s = with_section(section, &["method"]);
+            assert!(validate_settings(&s).is_ok(), "{section}");
+        }
+    }
+
+    #[test]
+    fn absent_ip_sections_are_accepted() {
+        assert!(validate_settings(&HashMap::new()).is_ok());
+    }
 }
 
 /// OwnedValue isn't `Clone` (only `try_clone`), so settings dicts must be
