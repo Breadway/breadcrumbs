@@ -606,24 +606,26 @@ fn set_profile_command_persists_even_with_no_daemon_reachable() {
 }
 
 #[test]
-fn set_profile_command_trims_name_before_applying() {
+fn set_profile_command_falls_back_to_trimmed_name_when_applying() {
     let _env = EnvSandbox::new();
     let cfg = Config::load().expect("fresh config");
     state::set_profile(&cfg, "away").unwrap();
 
+    // The payload is forwarded untrimmed so an exact key can match; the
+    // trimmed name is only the fallback, applied on the loop thread.
     let action = bread_events::handle_command(&command_event(
         "bread.command.crumbs.set_profile",
         serde_json::json!({ "profile": "  home \t" }),
     ));
     assert_eq!(
         action,
-        bread_events::CommandAction::SetProfile("home".to_string())
+        bread_events::CommandAction::SetProfile("  home \t".to_string())
     );
 
     if let bread_events::CommandAction::SetProfile(name) = action {
         bread_events::apply_set_profile(&name);
     } else {
-        panic!("valid trimmed profile name should be queued");
+        panic!("valid profile payload should be queued");
     }
     assert_eq!(State::load("away").profile, "home");
 }
