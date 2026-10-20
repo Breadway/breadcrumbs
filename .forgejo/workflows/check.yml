@@ -22,22 +22,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Inline bootstrap of bread-ecosystem scripts/ci-checkout.sh (see
-          # its docs/ci-checkout.md); keep this block in sync with that helper.
-          # Checks out the exact event commit into a directory this job owns.
-          if ! [[ "${GITHUB_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
-              echo "checkout: GITHUB_SHA is not a full commit id" >&2
-              exit 1
-          fi
+          # Pinned, SHA-verified helper from bread-ecosystem (reviewed on main,
+          # see its dev-bread-theme.yml). The digest is checked before the
+          # helper runs. It checks out the event SHA into a per-job directory.
+          helper_commit=c6442cabb6c02acd1380dcd0d17189c4e22def03
+          helper_sha256=39d07ff4efe2336fe5eac1f1099590d5427e04111e0f51fc3f905df2cfbd205f
+          helper=$(mktemp "${RUNNER_TEMP:-/tmp}/ci-checkout.XXXXXX")
+          trap 'rm -f -- "$helper"' EXIT
+          curl -fsSL "https://git.breadway.dev/Breadway/bread-ecosystem/raw/commit/${helper_commit}/scripts/ci-checkout.sh" -o "$helper"
+          printf '%s  %s\n' "$helper_sha256" "$helper" | sha256sum --check
           checkout=$(mktemp -d "${RUNNER_TEMP:-/tmp}/bread-ci.XXXXXX")
           printf 'BREAD_CI_JOB_DIR=%s\n' "$checkout" >> "$GITHUB_ENV"
-          git clone --no-checkout "https://git.breadway.dev/${GITHUB_REPOSITORY}.git" "$checkout/src"
-          git -C "$checkout/src" -c advice.detachedHead=false checkout --quiet --detach "$GITHUB_SHA"
-          actual="$(git -C "$checkout/src" rev-parse HEAD)"
-          if [ "$actual" != "$GITHUB_SHA" ]; then
-              echo "checkout: HEAD is $actual, expected $GITHUB_SHA" >&2
-              exit 1
-          fi
+          bash "$helper" "https://git.breadway.dev/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA" "$checkout/src"
 
       - name: clone bread-ecosystem (main)
         run: |
@@ -77,5 +73,9 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "${BREAD_CI_JOB_DIR:-}" == "${RUNNER_TEMP:-/tmp}"/bread-ci.* && -d "$BREAD_CI_JOB_DIR" ]]; then
+            if [[ "${BREAD_CI_JOB_DIR}" == *"/../"* ]]; then
+              echo "clean owned checkout: refusing BREAD_CI_JOB_DIR with a .. segment" >&2
+              exit 1
+            fi
             rm -rf -- "$BREAD_CI_JOB_DIR"
           fi
