@@ -1,8 +1,11 @@
 name: release
 
+# Manual only. Forgejo's .forgejo/workflows/release.yml is the authoritative
+# tag publisher (GitHub auto-mirrors from origin). Triggering this on `v*`
+# tags as well made one tag push run two publishers writing the same
+# /srv/breadway-dl path and running `gh release upload --clobber`.
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write

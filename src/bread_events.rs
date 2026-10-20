@@ -113,12 +113,10 @@ pub fn handle_command(event: &BreadEvent) -> CommandAction {
         return CommandAction::Ignore;
     };
     match verb {
-        "set_profile" => match event.data.get("profile").and_then(|v| v.as_str()) {
-            Some(name) if !name.trim().is_empty() => {
-                CommandAction::SetProfile(name.trim().to_string())
-            }
-            _ => {
-                emit_set_profile_failed("missing string \"profile\" in command data");
+        "set_profile" => match set_profile_payload(&event.data) {
+            Ok(raw) => CommandAction::SetProfile(raw),
+            Err(msg) => {
+                emit_set_profile_failed(msg);
                 CommandAction::Ignore
             }
         },
@@ -136,7 +134,10 @@ pub fn handle_command(event: &BreadEvent) -> CommandAction {
 /// the bread subscription thread never touches config/state files
 /// concurrently with the loop.
 pub fn apply_set_profile(name: &str) {
-    match Config::load().and_then(|cfg| state::set_profile(&cfg, name)) {
+    match Config::load().and_then(|cfg| {
+        let key = resolve_profile_key(&cfg, name);
+        state::set_profile(&cfg, &key)
+    }) {
         Ok(()) => {
             crate::notify::log(&format!(
                 "watch: profile set via bread.command.crumbs.set_profile -> {name}"
@@ -152,6 +153,34 @@ pub fn apply_set_profile(name: &str) {
     }
 }
 
+const MISSING_PROFILE_ERROR: &str = "missing string \"profile\" in command data";
+const EMPTY_PROFILE_ERROR: &str = "empty \"profile\" in command data";
+
+/// The raw `profile` payload of a `set_profile` command. Not trimmed here:
+/// a configured key such as `" home "` must stay selectable, so trimming is
+/// a fallback applied by [`resolve_profile_key`]. A whitespace-only payload
+/// is an empty profile, reported as such rather than as a missing field.
+fn set_profile_payload(data: &serde_json::Value) -> Result<String, &'static str> {
+    let raw = data
+        .get("profile")
+        .and_then(|v| v.as_str())
+        .ok_or(MISSING_PROFILE_ERROR)?;
+    if raw.trim().is_empty() {
+        return Err(EMPTY_PROFILE_ERROR);
+    }
+    Ok(raw.to_string())
+}
+
+/// The config key to activate for a raw payload: an exact match on the
+/// configured profile name wins; otherwise the trimmed payload is used.
+fn resolve_profile_key(cfg: &Config, raw: &str) -> String {
+    if cfg.profiles.contains_key(raw) {
+        raw.to_string()
+    } else {
+        raw.trim().to_string()
+    }
+}
+
 fn emit_set_profile_failed(error: &str) {
     crate::notify::log(&format!(
         "watch: bread.command.crumbs.set_profile failed: {error}"
@@ -160,4 +189,73 @@ fn emit_set_profile_failed(error: &str) {
         "bread.crumbs.set_profile.failed",
         serde_json::json!({ "error": error }),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(data: serde_json::Value) -> BreadEvent {
+        BreadEvent {
+            event: "bread.command.crumbs.set_profile".to_string(),
+            timestamp: 0,
+            data,
+        }
+    }
+
+    fn cfg_with_profiles(names: &[&str]) -> Config {
+        let mut profiles = std::collections::BTreeMap::new();
+        for name in names {
+            profiles.insert((*name).to_string(), crate::config::Profile::default());
+        }
+        Config {
+            settings: Default::default(),
+            networks: vec![],
+            profiles,
+        }
+    }
+
+    #[test]
+    fn payload_reaches_the_watch_loop_untrimmed_so_exact_keys_stay_selectable() {
+        // A configured key " home " must be selectable: the payload is not
+        // trimmed before the exact-key lookup.
+        let action = handle_command(&event(serde_json::json!({ "profile": " home " })));
+        assert_eq!(action, CommandAction::SetProfile(" home ".to_string()));
+    }
+
+    #[test]
+    fn exact_profile_key_with_spaces_resolves_to_itself() {
+        let cfg = cfg_with_profiles(&[" home "]);
+        assert_eq!(resolve_profile_key(&cfg, " home "), " home ");
+    }
+
+    #[test]
+    fn padded_payload_falls_back_to_trimmed_key() {
+        let cfg = cfg_with_profiles(&["home"]);
+        assert_eq!(resolve_profile_key(&cfg, "  home \t"), "home");
+    }
+
+    #[test]
+    fn exact_key_wins_over_trimmed_key_when_both_exist() {
+        let cfg = cfg_with_profiles(&["home", " home "]);
+        assert_eq!(resolve_profile_key(&cfg, " home "), " home ");
+        assert_eq!(resolve_profile_key(&cfg, "home"), "home");
+    }
+
+    #[test]
+    fn whitespace_only_payload_reports_empty_profile_not_missing_field() {
+        let err = set_profile_payload(&serde_json::json!({ "profile": " \t " })).unwrap_err();
+        assert_eq!(err, EMPTY_PROFILE_ERROR);
+        assert_ne!(err, MISSING_PROFILE_ERROR);
+    }
+
+    #[test]
+    fn absent_or_non_string_payload_reports_missing_field() {
+        for data in [serde_json::json!({}), serde_json::json!({ "profile": 42 })] {
+            assert_eq!(
+                set_profile_payload(&data).unwrap_err(),
+                MISSING_PROFILE_ERROR
+            );
+        }
+    }
 }

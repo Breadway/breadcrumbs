@@ -316,6 +316,30 @@ fn print_outcome(profile: &str, o: &flow::Outcome) {
     }
 }
 
+/// The `detect --apply --json` result: the detected profile plus what the
+/// connect flow did, as a single JSON object.
+fn detect_apply_json(profile: &str, o: &flow::Outcome) -> serde_json::Value {
+    let outcome = match o {
+        flow::Outcome::Connected { ssid, note } => {
+            serde_json::json!({ "status": "connected", "ssid": ssid, "note": note })
+        }
+        flow::Outcome::TailscaleError { ssid, health } => serde_json::json!({
+            "status": "tailscale_error",
+            "ssid": ssid,
+            "error": health.describe(),
+        }),
+        flow::Outcome::InvalidDns { ssid, error } => {
+            serde_json::json!({ "status": "invalid_dns", "ssid": ssid, "error": error })
+        }
+        flow::Outcome::NoInterface => serde_json::json!({ "status": "no_interface" }),
+        flow::Outcome::NoNetworks => serde_json::json!({ "status": "no_networks" }),
+        flow::Outcome::UnknownProfile(p) => {
+            serde_json::json!({ "status": "unknown_profile", "profile": p })
+        }
+    };
+    serde_json::json!({ "profile": profile, "outcome": outcome, "ok": o.ok() })
+}
+
 fn cmd_status(cfg: &Config, override_p: &Option<String>, json: bool) -> Result<i32, String> {
     let p = active_profile(cfg, override_p);
     let s = crate::status::gather(cfg, &p);
@@ -479,9 +503,7 @@ fn cmd_detect(cfg: &mut Config, apply: bool, json: bool) -> Result<i32, String> 
                 return Ok(0);
             }
             if apply {
-                if json {
-                    println!("{}", serde_json::json!({ "profile": p }));
-                } else {
+                if !json {
                     println!("{p}");
                 }
                 // Route through state::set_profile (like the CLI and the
@@ -489,7 +511,13 @@ fn cmd_detect(cfg: &mut Config, apply: bool, json: bool) -> Result<i32, String> 
                 // proper error instead of being persisted as active.
                 state::set_profile(cfg, &p)?;
                 let outcome = flow::run(cfg, &p);
-                print_outcome(&p, &outcome);
+                if json {
+                    // One object on stdout, so a machine consumer never has
+                    // to skip a human line after the JSON.
+                    println!("{}", detect_apply_json(&p, &outcome));
+                } else {
+                    print_outcome(&p, &outcome);
+                }
                 return Ok(if outcome.ok() { 0 } else { 1 });
             }
             println!("{p}");
@@ -567,6 +595,29 @@ fn prompt_secret(msg: &str) -> Result<String, String> {
     Ok(val)
 }
 
+/// Where a password for `add` came from. `Explicit` is `--password` or
+/// `--password-stdin` (an empty value still counts as an explicit choice);
+/// `Prompt` is the interactive answer, where blank means "keep if present".
+#[derive(Debug, PartialEq)]
+enum PasswordAnswer {
+    Explicit(Option<String>),
+    Prompt(Option<String>),
+}
+
+/// The password write for `add`, decided against the config as it is inside
+/// the locked update (`network_exists` comes from that fresh config, not from
+/// the startup load, since the network may have been created meanwhile).
+/// `None` leaves the stored password alone; `Some(None)` clears it;
+/// `Some(Some(p))` sets it.
+fn password_to_write(network_exists: bool, answer: &PasswordAnswer) -> Option<Option<String>> {
+    match answer {
+        PasswordAnswer::Explicit(p) => Some(p.clone()),
+        PasswordAnswer::Prompt(Some(p)) => Some(Some(p.clone())),
+        PasswordAnswer::Prompt(None) if network_exists => None,
+        PasswordAnswer::Prompt(None) => Some(None),
+    }
+}
+
 fn cmd_add(cfg: &mut Config, ssid: String, opts: Box<AddOpts>) -> Result<i32, String> {
     let AddOpts {
         password,
@@ -599,7 +650,11 @@ fn cmd_add(cfg: &mut Config, ssid: String, opts: Box<AddOpts>) -> Result<i32, St
             return Err(format!("unknown profile '{prof_name}'"));
         }
     }
-    let existing = cfg.network(&ssid).is_some();
+    // The startup `cfg` can be stale by the time the user answers the
+    // prompt: another process may create this network meanwhile. So the
+    // existence check happens again inside the locked update, against the
+    // fresh config, and the prompt's hint is only advisory.
+    let existing_at_prompt = cfg.network(&ssid).is_some();
     // All input is gathered before the config lock is taken: the lock is
     // held only for the short load, modify, save below, never while waiting
     // on a human at a prompt.
@@ -610,30 +665,28 @@ fn cmd_add(cfg: &mut Config, ssid: String, opts: Box<AddOpts>) -> Result<i32, St
     // one; a blank answer at the interactive prompt keeps an existing
     // entry's password, so e.g. `add Net --to home` can't wipe a password
     // that hasn't been used yet.
-    let password: Option<Option<String>> = match password {
-        Some(p) => Some(non_empty(p)),
-        None if password_stdin => Some(non_empty(read_stdin_line())),
+    let answer = match password {
+        Some(p) => PasswordAnswer::Explicit(non_empty(p)),
+        None if password_stdin => PasswordAnswer::Explicit(non_empty(read_stdin_line())),
         None => {
             let label = if eap.is_some() {
                 "802.1x password"
             } else {
                 "Password"
             };
-            let hint = if existing {
+            let hint = if existing_at_prompt {
                 " (blank keeps current)"
             } else {
                 ""
             };
             let answer = prompt_secret(&format!("{label} for '{ssid}'{hint}: "))?;
-            match non_empty(answer) {
-                Some(p) => Some(Some(p)),
-                None if existing => None,
-                None => Some(None),
-            }
+            PasswordAnswer::Prompt(non_empty(answer))
         }
     };
 
     Config::update(|cfg| {
+        let network_exists = cfg.networks.iter().any(|n| n.ssid == ssid);
+        let password = password_to_write(network_exists, &answer);
         match cfg.networks.iter_mut().find(|n| n.ssid == ssid) {
             Some(n) => {
                 if let Some(p) = password.clone() {
@@ -1170,6 +1223,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn blank_prompt_keeps_password_when_network_exists_in_fresh_config() {
+        // The network may have been created after the prompt started: the
+        // fresh config decides, so a blank answer keeps its password.
+        assert_eq!(password_to_write(true, &PasswordAnswer::Prompt(None)), None);
+    }
+
+    #[test]
+    fn blank_prompt_sets_no_password_for_a_new_network() {
+        assert_eq!(
+            password_to_write(false, &PasswordAnswer::Prompt(None)),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn non_blank_prompt_sets_password_for_existing_and_new_networks() {
+        let answer = PasswordAnswer::Prompt(Some("hunter22".into()));
+        assert_eq!(
+            password_to_write(true, &answer),
+            Some(Some("hunter22".into()))
+        );
+        assert_eq!(
+            password_to_write(false, &answer),
+            Some(Some("hunter22".into()))
+        );
+    }
+
+    #[test]
+    fn explicit_password_always_replaces_even_when_empty() {
+        // `--password` or `--password-stdin` is an explicit choice: it
+        // replaces the stored password, including clearing it.
+        assert_eq!(
+            password_to_write(true, &PasswordAnswer::Explicit(None)),
+            Some(None)
+        );
+        assert_eq!(
+            password_to_write(true, &PasswordAnswer::Explicit(Some("new".into()))),
+            Some(Some("new".into()))
+        );
+        assert_eq!(
+            password_to_write(false, &PasswordAnswer::Explicit(None)),
+            Some(None)
+        );
+    }
+
+    #[test]
     fn mask_is_fixed_length_regardless_of_secret() {
         // Fixed-length masking: the output must reveal neither the secret's
         // length nor any character of it, for empty, short, and long
@@ -1196,5 +1295,25 @@ mod tests {
     fn mask_emoji_first_character_does_not_panic() {
         let pw = "🔒password123";
         assert_eq!(mask(pw), "•".repeat(8));
+    }
+
+    #[test]
+    fn detect_apply_json_is_one_object_covering_profile_and_outcome() {
+        let ok = detect_apply_json(
+            "home",
+            &flow::Outcome::Connected {
+                ssid: "HomeWifi".into(),
+                note: None,
+            },
+        );
+        assert_eq!(ok["profile"], "home");
+        assert_eq!(ok["ok"], true);
+        assert_eq!(ok["outcome"]["status"], "connected");
+        assert_eq!(ok["outcome"]["ssid"], "HomeWifi");
+        let down = detect_apply_json("home", &flow::Outcome::NoNetworks);
+        assert_eq!(down["ok"], false);
+        assert_eq!(down["outcome"]["status"], "no_networks");
+        // Whatever the outcome, it must serialize as exactly one line.
+        assert!(!serde_json::to_string(&down).unwrap().contains('\n'));
     }
 }

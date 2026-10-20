@@ -606,24 +606,26 @@ fn set_profile_command_persists_even_with_no_daemon_reachable() {
 }
 
 #[test]
-fn set_profile_command_trims_name_before_applying() {
+fn set_profile_command_falls_back_to_trimmed_name_when_applying() {
     let _env = EnvSandbox::new();
     let cfg = Config::load().expect("fresh config");
     state::set_profile(&cfg, "away").unwrap();
 
+    // The payload is forwarded untrimmed so an exact key can match; the
+    // trimmed name is only the fallback, applied on the loop thread.
     let action = bread_events::handle_command(&command_event(
         "bread.command.crumbs.set_profile",
         serde_json::json!({ "profile": "  home \t" }),
     ));
     assert_eq!(
         action,
-        bread_events::CommandAction::SetProfile("home".to_string())
+        bread_events::CommandAction::SetProfile("  home \t".to_string())
     );
 
     if let bread_events::CommandAction::SetProfile(name) = action {
         bread_events::apply_set_profile(&name);
     } else {
-        panic!("valid trimmed profile name should be queued");
+        panic!("valid profile payload should be queued");
     }
     assert_eq!(State::load("away").profile, "home");
 }
@@ -1573,4 +1575,57 @@ fn empty_dns_removes_only_a_pin_breadcrumbs_made() {
     assert!(!ignore, "the pin must be undone");
     let dns = fake_nm::value_u32_list(&s["ipv4"]["dns"]).unwrap();
     assert!(dns.is_empty());
+}
+
+// ---------------------------------------------------------------------
+// status::connectivity: HTTP answer versus ICMP fallback
+// ---------------------------------------------------------------------
+
+/// A runner where curl's HTTP probe answers with `http_code` and ping
+/// succeeds or fails as `ping_ok` says.
+fn connectivity_runner(http_code: &'static str, ping_ok: bool) -> FakeRunner {
+    let ping = if ping_ok { ok("") } else { fail("") };
+    FakeRunner::new()
+        .with_command("curl")
+        .on(|prog, _| prog == "curl", ok(http_code))
+        .on(move |prog, _| prog == "ping", ping)
+}
+
+#[test]
+fn connectivity_403_with_ping_blocked_is_portal() {
+    for code in ["403", "404"] {
+        let cfg = base_config();
+        let verdict = with_runner(connectivity_runner(code, false), || {
+            breadcrumbs::status::connectivity(&cfg)
+        });
+        assert_eq!(
+            verdict,
+            breadcrumbs::status::Connectivity::Portal,
+            "HTTP {code}"
+        );
+    }
+}
+
+#[test]
+fn connectivity_no_http_answer_or_5xx_with_ping_blocked_is_no_net() {
+    for code in ["000", "500"] {
+        let cfg = base_config();
+        let verdict = with_runner(connectivity_runner(code, false), || {
+            breadcrumbs::status::connectivity(&cfg)
+        });
+        assert_eq!(
+            verdict,
+            breadcrumbs::status::Connectivity::NoNet,
+            "HTTP {code}"
+        );
+    }
+}
+
+#[test]
+fn connectivity_403_with_ping_working_is_online() {
+    let cfg = base_config();
+    let verdict = with_runner(connectivity_runner("403", true), || {
+        breadcrumbs::status::connectivity(&cfg)
+    });
+    assert_eq!(verdict, breadcrumbs::status::Connectivity::Online);
 }

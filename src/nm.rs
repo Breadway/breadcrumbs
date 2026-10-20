@@ -490,6 +490,23 @@ fn setting_str(s: &SettingsMap, section: &str, key: &str) -> Option<String> {
         .and_then(|v| value_string(v))
 }
 
+/// The saved profile's `802-11-wireless.hidden`. NetworkManager omits the key
+/// when it is false, so a missing key reads as `false`.
+fn saved_hidden(s: &SettingsMap) -> bool {
+    s.get("802-11-wireless")
+        .and_then(|m| m.get("hidden"))
+        .and_then(|v| v.downcast_ref::<bool>().ok())
+        .unwrap_or(false)
+}
+
+/// Whether connecting needs to rewrite the saved profile. Credentials always
+/// do; the hidden flag does when it differs from what is saved, in either
+/// direction, so un-hiding a network reaches the profile instead of leaving
+/// `hidden=true` behind forever.
+fn profile_needs_update(net: &NetworkDef, saved: &SettingsMap) -> bool {
+    net.password.is_some() || net.eap.is_some() || net.hidden != saved_hidden(saved)
+}
+
 fn setting_ssid(s: &SettingsMap) -> Option<String> {
     s.get("802-11-wireless")
         .and_then(|m| m.get("ssid"))
@@ -783,6 +800,13 @@ fn user_data(s: &SettingsMap) -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
+/// A new ipv4 or ipv6 section with `method = auto`, the NetworkManager default.
+fn auto_ip_section() -> HashMap<String, OwnedValue> {
+    let mut section = HashMap::new();
+    section.insert("method".into(), ov(Value::from("auto")));
+    section
+}
+
 /// Rewrite the DNS keys of one IP section. `dns` is the typed `dns` value
 /// (`au` for IPv4, `aay` for IPv6, which every NetworkManager version
 /// accepts); `dns-data` (`as`, newer NM) is kept in sync when the profile
@@ -833,11 +857,15 @@ fn apply_dns(s: &mut SettingsMap, dns: &str) -> Result<bool, String> {
         let v4_str: Vec<String> = v4.iter().map(ToString::to_string).collect();
         let v6_wire: Vec<Vec<u8>> = v6.iter().map(|a| a.octets().to_vec()).collect();
         let v6_str: Vec<String> = v6.iter().map(ToString::to_string).collect();
-        let ip4 = s.entry("ipv4".to_string()).or_default();
+        // A created section gets `method = auto`: NetworkManager rejects an
+        // ipv4/ipv6 section with no method ("ipv6.method: property is
+        // missing"), and `auto` is the default it applies to a profile with
+        // no section at all. Existing sections keep their method.
+        let ip4 = s.entry("ipv4".to_string()).or_insert_with(auto_ip_section);
         set_ip_dns(ip4, true, Value::from(v4_wire), v4_str);
-        if let Some(ip6) = s.get_mut("ipv6") {
-            set_ip_dns(ip6, true, Value::from(v6_wire), v6_str);
-        }
+        // Create the ipv6 section too, so auto DNS cannot leak around the pin.
+        let ip6 = s.entry("ipv6".to_string()).or_insert_with(auto_ip_section);
+        set_ip_dns(ip6, true, Value::from(v6_wire), v6_str);
         data.insert(DNS_PIN_MARKER.to_string(), want);
     }
     let user = s.entry("user".to_string()).or_default();
@@ -918,23 +946,24 @@ pub fn connect_verbose(iface: &str, net: &NetworkDef, wait: u32, dns: &str) -> R
     // are about to use (CRUMB-23); a no-op when there is at most one.
     neuter_duplicate_profiles(&conn, profile.as_ref().map(|p| p.as_str()), &net.ssid);
 
-    let needs_update = net.password.is_some() || net.hidden || net.eap.is_some();
-    if let (Some(profile), true) = (&profile, needs_update) {
+    if let Some(profile) = &profile {
         let mut s = get_settings(&conn, profile.as_str())
             .ok_or_else(|| "failed to read saved profile settings".to_string())?;
-        updated_settings_for(net, &mut s, ap.as_ref());
-        // Update the existing profile in place via `Settings.Connection
-        // .Update2`. `Settings.AddConnection2` with the profile's own
-        // UUID would be rejected by real NetworkManager
-        // (NM_SETTINGS_ERROR_UUID_EXISTS: duplicates are not upserted).
-        let conn_proxy = proxy(&conn, profile.as_str(), CONN_IFACE)
-            .ok_or_else(|| "NetworkManager Settings.Connection unavailable".to_string())?;
-        let _: HashMap<String, OwnedValue> = conn_proxy
-            .call(
-                "Update2",
-                &(&s, FLAG_TO_DISK, &HashMap::<String, Value>::new()),
-            )
-            .map_err(err_text)?;
+        if profile_needs_update(net, &s) {
+            updated_settings_for(net, &mut s, ap.as_ref());
+            // Update the existing profile in place via `Settings.Connection
+            // .Update2`. `Settings.AddConnection2` with the profile's own
+            // UUID would be rejected by real NetworkManager
+            // (NM_SETTINGS_ERROR_UUID_EXISTS: duplicates are not upserted).
+            let conn_proxy = proxy(&conn, profile.as_str(), CONN_IFACE)
+                .ok_or_else(|| "NetworkManager Settings.Connection unavailable".to_string())?;
+            let _: HashMap<String, OwnedValue> = conn_proxy
+                .call(
+                    "Update2",
+                    &(&s, FLAG_TO_DISK, &HashMap::<String, Value>::new()),
+                )
+                .map_err(err_text)?;
+        }
     }
 
     if device_activated(&conn, &dev) && active_ssid_on(&conn, &dev).as_deref() == Some(&net.ssid) {
@@ -1172,6 +1201,111 @@ mod tests {
         assert!(!user_data(&s).contains_key(DNS_PIN_MARKER));
     }
 
+    fn settings_without_ipv6() -> SettingsMap {
+        let mut s: SettingsMap = HashMap::new();
+        let mut ip4 = HashMap::new();
+        ip4.insert("method".into(), ov(Value::from("auto")));
+        s.insert("ipv4".into(), ip4);
+        s
+    }
+
+    #[test]
+    fn apply_dns_pin_creates_ipv6_section_when_profile_has_none() {
+        // Without an ipv6 section, DHCP/RA DNS would leak around the pin.
+        let mut s = settings_without_ipv6();
+        assert!(apply_dns(&mut s, "10.0.0.1, 2606:4700:4700::1111").unwrap());
+        assert!(get_bool(&s, "ipv4", "ignore-auto-dns"));
+        assert!(
+            s.contains_key("ipv6"),
+            "pin must create the ipv6 section like ipv4"
+        );
+        assert!(get_bool(&s, "ipv6", "ignore-auto-dns"));
+        let v4: Vec<u32> = s["ipv4"]["dns"].try_clone().unwrap().try_into().unwrap();
+        assert_eq!(v4, vec![u32::from_ne_bytes([10, 0, 0, 1])]);
+        // IPv6 DNS uses the byte-array wire type (aay).
+        let v6: Vec<Vec<u8>> = s["ipv6"]["dns"].try_clone().unwrap().try_into().unwrap();
+        assert_eq!(
+            v6,
+            vec!["2606:4700:4700::1111"
+                .parse::<Ipv6Addr>()
+                .unwrap()
+                .octets()
+                .to_vec()]
+        );
+        // A created ipv6 section carries method auto (NM rejects it without one).
+        assert_eq!(
+            s["ipv6"]["method"].downcast_ref::<String>().unwrap(),
+            "auto"
+        );
+        assert!(user_data(&s).contains_key(DNS_PIN_MARKER));
+    }
+
+    #[test]
+    fn apply_dns_pin_v4_only_still_clears_ipv6_auto_dns_on_created_section() {
+        let mut s = settings_without_ipv6();
+        assert!(apply_dns(&mut s, "9.9.9.9").unwrap());
+        let v6: Vec<Vec<u8>> = s["ipv6"]["dns"].try_clone().unwrap().try_into().unwrap();
+        assert!(v6.is_empty(), "no v6 servers: nothing to pin on ipv6");
+        assert!(get_bool(&s, "ipv6", "ignore-auto-dns"));
+        assert_eq!(
+            s["ipv6"]["method"].downcast_ref::<String>().unwrap(),
+            "auto"
+        );
+    }
+
+    #[test]
+    fn apply_dns_pin_created_ipv4_section_carries_method() {
+        let mut s: SettingsMap = HashMap::new();
+        assert!(apply_dns(&mut s, "10.0.0.1").unwrap());
+        assert_eq!(
+            s["ipv4"]["method"].downcast_ref::<String>().unwrap(),
+            "auto"
+        );
+        assert_eq!(
+            s["ipv6"]["method"].downcast_ref::<String>().unwrap(),
+            "auto"
+        );
+    }
+
+    #[test]
+    fn apply_dns_pin_keeps_existing_ipv6_method() {
+        let mut s = settings_with_ip();
+        s.get_mut("ipv6")
+            .unwrap()
+            .insert("method".into(), ov(Value::from("manual")));
+        assert!(apply_dns(&mut s, "10.0.0.1").unwrap());
+        assert_eq!(
+            s["ipv6"]["method"].downcast_ref::<String>().unwrap(),
+            "manual"
+        );
+    }
+
+    #[test]
+    fn apply_dns_unpin_does_not_invent_ipv6_section() {
+        let mut s = settings_without_ipv6();
+        apply_dns(&mut s, "1.1.1.1").unwrap();
+        // Remove the ipv6 section to simulate a profile that never had one.
+        s.remove("ipv6");
+        assert!(apply_dns(&mut s, "").unwrap());
+        assert!(!s.contains_key("ipv6"), "unpin must not create ipv6");
+        assert!(!get_bool(&s, "ipv4", "ignore-auto-dns"));
+        assert!(!user_data(&s).contains_key(DNS_PIN_MARKER));
+    }
+
+    #[test]
+    fn apply_dns_unpin_without_ipv6_section_leaves_no_ipv6_when_pinned_before() {
+        // A profile pinned before this fix has no ipv6 section at all.
+        let mut s = settings_without_ipv6();
+        let mut data = HashMap::new();
+        data.insert(DNS_PIN_MARKER.to_string(), "[1]".to_string());
+        s.insert(
+            "user".into(),
+            HashMap::from([("data".into(), ov(Value::from(data)))]),
+        );
+        assert!(apply_dns(&mut s, "").unwrap());
+        assert!(!s.contains_key("ipv6"));
+    }
+
     #[test]
     fn updated_settings_for_open_hidden_network_adds_no_security_section() {
         let mut s: SettingsMap = HashMap::new();
@@ -1183,6 +1317,46 @@ mod tests {
         updated_settings_for(&net, &mut s, None);
         assert!(!s.contains_key("802-11-wireless-security"));
         assert!(get_bool(&s, "802-11-wireless", "hidden"));
+    }
+
+    #[test]
+    fn unhiding_a_network_triggers_a_profile_update_and_clears_the_flag() {
+        let mut saved: SettingsMap = HashMap::new();
+        let mut wifi = HashMap::new();
+        wifi.insert("hidden".into(), ov(Value::from(true)));
+        saved.insert("802-11-wireless".into(), wifi);
+        let visible = NetworkDef {
+            ssid: "Net".into(),
+            hidden: false,
+            ..Default::default()
+        };
+        // No password, no eap: only the hidden flag differs.
+        assert!(profile_needs_update(&visible, &saved));
+        updated_settings_for(&visible, &mut saved, None);
+        assert!(!get_bool(&saved, "802-11-wireless", "hidden"));
+        // Once saved matches the config there is nothing left to rewrite.
+        assert!(!profile_needs_update(&visible, &saved));
+    }
+
+    #[test]
+    fn hidden_flag_matching_the_saved_profile_does_not_force_a_rewrite() {
+        // NetworkManager omits `hidden` when false.
+        let saved: SettingsMap = HashMap::new();
+        let visible = NetworkDef {
+            ssid: "Net".into(),
+            ..Default::default()
+        };
+        assert!(!profile_needs_update(&visible, &saved));
+        let hidden = NetworkDef {
+            hidden: true,
+            ..visible.clone()
+        };
+        assert!(profile_needs_update(&hidden, &saved));
+        let with_pw = NetworkDef {
+            password: Some("x".into()),
+            ..visible
+        };
+        assert!(profile_needs_update(&with_pw, &saved));
     }
 
     #[test]
