@@ -439,7 +439,10 @@ fn run_inner(cfg: &mut Config, profile_name: &str, notify_user: bool) -> Outcome
             .bootstrap
             .clone()
             .unwrap_or_else(|| "bootstrap".into());
-        if !nm::device_connected(&iface) {
+        // Being associated is not enough: autoconnect can land on a third
+        // network while the device still reports activated. Only claim
+        // bootstrap when the active SSID is actually bootstrap.
+        if !bootstrap_still_active(nm::active_ssid(&iface).as_deref(), &bs_ssid) {
             // Owned clone (not a borrow of `cfg`) so a successful reconnect
             // is free to mutate `cfg` to clear the used password.
             if let Some(bdef) = profile
@@ -495,6 +498,15 @@ fn run_inner(cfg: &mut Config, profile_name: &str, notify_user: bool) -> Outcome
     Outcome::NoNetworks
 }
 
+/// Whether the fallback may claim `Connected { ssid: bootstrap }`.
+///
+/// `device_connected` only means the radio is activated, so an autoconnect
+/// onto a different SSID must not count. A missing reading is not bootstrap
+/// either: the claim has to name the network that is actually up.
+pub(crate) fn bootstrap_still_active(active: Option<&str>, bootstrap: &str) -> bool {
+    active == Some(bootstrap)
+}
+
 fn finish_connected(ssid: &str, profile: &str, note: &Option<String>, notify_user: bool) {
     match note {
         None => {
@@ -527,6 +539,15 @@ mod tests {
     use super::*;
     use crate::config::{Profile, Settings};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn bootstrap_claim_requires_the_active_ssid() {
+        assert!(bootstrap_still_active(Some("school"), "school"));
+        // Autoconnect landed somewhere else while the device stayed up.
+        assert!(!bootstrap_still_active(Some("OtherWifi"), "school"));
+        // No reading at all is not evidence of being on bootstrap.
+        assert!(!bootstrap_still_active(None, "school"));
+    }
 
     fn net(ssid: &str) -> NetworkDef {
         NetworkDef {
