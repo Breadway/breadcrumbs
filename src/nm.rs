@@ -852,9 +852,10 @@ fn apply_dns(s: &mut SettingsMap, dns: &str) -> Result<bool, String> {
         let v6_str: Vec<String> = v6.iter().map(ToString::to_string).collect();
         let ip4 = s.entry("ipv4".to_string()).or_default();
         set_ip_dns(ip4, true, Value::from(v4_wire), v4_str);
-        if let Some(ip6) = s.get_mut("ipv6") {
-            set_ip_dns(ip6, true, Value::from(v6_wire), v6_str);
-        }
+        // Create the ipv6 section too, so auto DNS cannot leak around the pin.
+        // Only DNS keys are written; no ipv6 `method`, so NM keeps its default.
+        let ip6 = s.entry("ipv6".to_string()).or_default();
+        set_ip_dns(ip6, true, Value::from(v6_wire), v6_str);
         data.insert(DNS_PIN_MARKER.to_string(), want);
     }
     let user = s.entry("user".to_string()).or_default();
@@ -1188,6 +1189,78 @@ mod tests {
         let dns: Vec<u32> = s["ipv4"]["dns"].try_clone().unwrap().try_into().unwrap();
         assert!(dns.is_empty());
         assert!(!user_data(&s).contains_key(DNS_PIN_MARKER));
+    }
+
+    fn settings_without_ipv6() -> SettingsMap {
+        let mut s: SettingsMap = HashMap::new();
+        let mut ip4 = HashMap::new();
+        ip4.insert("method".into(), ov(Value::from("auto")));
+        s.insert("ipv4".into(), ip4);
+        s
+    }
+
+    #[test]
+    fn apply_dns_pin_creates_ipv6_section_when_profile_has_none() {
+        // Without an ipv6 section, DHCP/RA DNS would leak around the pin.
+        let mut s = settings_without_ipv6();
+        assert!(apply_dns(&mut s, "10.0.0.1, 2606:4700:4700::1111").unwrap());
+        assert!(get_bool(&s, "ipv4", "ignore-auto-dns"));
+        assert!(
+            s.contains_key("ipv6"),
+            "pin must create the ipv6 section like ipv4"
+        );
+        assert!(get_bool(&s, "ipv6", "ignore-auto-dns"));
+        let v4: Vec<u32> = s["ipv4"]["dns"].try_clone().unwrap().try_into().unwrap();
+        assert_eq!(v4, vec![u32::from_ne_bytes([10, 0, 0, 1])]);
+        // IPv6 DNS uses the byte-array wire type (aay).
+        let v6: Vec<Vec<u8>> = s["ipv6"]["dns"].try_clone().unwrap().try_into().unwrap();
+        assert_eq!(
+            v6,
+            vec!["2606:4700:4700::1111"
+                .parse::<Ipv6Addr>()
+                .unwrap()
+                .octets()
+                .to_vec()]
+        );
+        // Only DNS keys are added: no ipv6 method, so NM keeps its default.
+        assert!(!s["ipv6"].contains_key("method"));
+        assert!(user_data(&s).contains_key(DNS_PIN_MARKER));
+    }
+
+    #[test]
+    fn apply_dns_pin_v4_only_still_clears_ipv6_auto_dns_on_created_section() {
+        let mut s = settings_without_ipv6();
+        assert!(apply_dns(&mut s, "9.9.9.9").unwrap());
+        let v6: Vec<Vec<u8>> = s["ipv6"]["dns"].try_clone().unwrap().try_into().unwrap();
+        assert!(v6.is_empty(), "no v6 servers: nothing to pin on ipv6");
+        assert!(get_bool(&s, "ipv6", "ignore-auto-dns"));
+        assert!(!s["ipv6"].contains_key("method"));
+    }
+
+    #[test]
+    fn apply_dns_unpin_does_not_invent_ipv6_section() {
+        let mut s = settings_without_ipv6();
+        apply_dns(&mut s, "1.1.1.1").unwrap();
+        // Remove the ipv6 section to simulate a profile that never had one.
+        s.remove("ipv6");
+        assert!(apply_dns(&mut s, "").unwrap());
+        assert!(!s.contains_key("ipv6"), "unpin must not create ipv6");
+        assert!(!get_bool(&s, "ipv4", "ignore-auto-dns"));
+        assert!(!user_data(&s).contains_key(DNS_PIN_MARKER));
+    }
+
+    #[test]
+    fn apply_dns_unpin_without_ipv6_section_leaves_no_ipv6_when_pinned_before() {
+        // A profile pinned before this fix has no ipv6 section at all.
+        let mut s = settings_without_ipv6();
+        let mut data = HashMap::new();
+        data.insert(DNS_PIN_MARKER.to_string(), "[1]".to_string());
+        s.insert(
+            "user".into(),
+            HashMap::from([("data".into(), ov(Value::from(data)))]),
+        );
+        assert!(apply_dns(&mut s, "").unwrap());
+        assert!(!s.contains_key("ipv6"));
     }
 
     #[test]
