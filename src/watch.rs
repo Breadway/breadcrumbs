@@ -322,11 +322,8 @@ fn wait_for_tick(rx: &Receiver<Wake>, dur: Duration) -> Option<Wake> {
 
 pub fn run(mut cfg: Config, run_initial: bool) -> i32 {
     let base = cfg.settings.poll_interval();
-    notify(
-        "breadcrumbs watcher started",
-        "Monitoring Wi-Fi; will auto-recover drops.",
-        Urgency::Low,
-    );
+    // Routine service starts belong in the log. A restart loop must not
+    // repeatedly interrupt the desktop before health monitoring begins.
     log("watch: started");
 
     let (tx, rx) = mpsc::channel::<Wake>();
