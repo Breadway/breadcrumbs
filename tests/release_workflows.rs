@@ -56,3 +56,37 @@ fn forgejo_release_workflow_still_triggers_on_version_tags() {
         "Forgejo must stay the tag publisher:\n{on}"
     );
 }
+
+/// CRUMB-49: a manual dispatch must name an existing stable tag. The dispatch
+/// ref (main, a feature branch) must never become the published version or
+/// reach a build/publish step.
+#[test]
+fn github_release_dispatch_requires_an_existing_tag() {
+    let yml = read(".github/workflows/release.yml");
+    for line in yml.lines().filter(|l| !l.trim_start().starts_with('#')) {
+        assert!(
+            !line.contains("GITHUB_REF_NAME"),
+            "the dispatch ref must never be used as the published version: {line}"
+        );
+    }
+    assert!(
+        yml.contains("  version:") && yml.contains("required: true"),
+        "workflow_dispatch must require an explicit version input"
+    );
+    assert!(
+        yml.contains("git ls-remote --exit-code --tags origin"),
+        "the version input must be checked against an existing tag"
+    );
+    assert!(
+        yml.contains("needs: validate"),
+        "the publishing job must depend on the validation job"
+    );
+    assert!(
+        yml.contains("needs.validate.outputs.version != ''"),
+        "the publishing job must be gated on the validated version"
+    );
+    assert!(
+        yml.contains("refs/tags/${{ needs.validate.outputs.version }}"),
+        "the build must check out the validated tag, not the dispatch ref"
+    );
+}
