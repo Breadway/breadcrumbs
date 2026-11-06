@@ -239,14 +239,17 @@ fn validate_settings(s: &SettingsMap) -> fdo::Result<()> {
             if ip.get("method").is_none() {
                 return bad(&format!("{section}.method: property is missing"));
             }
-            // libnm rejects dns/dns-data outright on the methods that carry
-            // no explicit servers, even for an empty list: "ipv6.dns: this
-            // property is not allowed for method=ignore". This is the rule
-            // CRUMB-48 hit on real NetworkManager 1.46.
+            // libnm rejects dns/dns-data on the methods that carry no
+            // explicit servers. The reject set is family-specific: ipv4
+            // rejects shared/link-local/disabled (verified against libnm
+            // 1.58.1), while ipv6 rejects ignore/disabled/link-local and
+            // accepts shared. This is the rule CRUMB-48 and CRUMB-55 hit.
             if let Some(method) = ip.get("method").and_then(value_string) {
-                if matches!(method.as_str(), "ignore" | "disabled" | "link-local")
-                    && (ip.contains_key("dns") || ip.contains_key("dns-data"))
-                {
+                let rejects_dns = match section {
+                    "ipv4" => matches!(method.as_str(), "shared" | "link-local" | "disabled"),
+                    _ => matches!(method.as_str(), "ignore" | "disabled" | "link-local"),
+                };
+                if rejects_dns && (ip.contains_key("dns") || ip.contains_key("dns-data")) {
                     return bad(&format!(
                         "{section}.dns: this property is not allowed for method={method}"
                     ));
@@ -320,8 +323,11 @@ mod validate_tests {
 
     #[test]
     fn dns_on_a_method_that_rejects_it_is_rejected() {
-        for section in ["ipv4", "ipv6"] {
-            for method in ["ignore", "disabled", "link-local"] {
+        for (section, methods) in [
+            ("ipv4", &["shared", "link-local", "disabled"][..]),
+            ("ipv6", &["ignore", "disabled", "link-local"][..]),
+        ] {
+            for method in methods {
                 let s = with_method_and_dns(section, method);
                 let err = validate_settings(&s).expect_err("libnm rejects this");
                 assert!(
@@ -336,8 +342,11 @@ mod validate_tests {
 
     #[test]
     fn dns_on_an_accepting_method_is_accepted() {
-        for section in ["ipv4", "ipv6"] {
-            for method in ["auto", "dhcp", "manual", "static", "shared"] {
+        for (section, methods) in [
+            ("ipv4", &["auto", "manual"][..]),
+            ("ipv6", &["auto", "dhcp", "manual", "shared"][..]),
+        ] {
+            for method in methods {
                 let s = with_method_and_dns(section, method);
                 assert!(validate_settings(&s).is_ok(), "{section} {method}");
             }

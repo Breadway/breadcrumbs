@@ -1644,6 +1644,51 @@ fn connect_skips_ipv6_dns_when_method_rejects_it() {
     );
 }
 
+#[test]
+fn connect_skips_ipv4_dns_when_method_rejects_it() {
+    let _env = EnvSandbox::new();
+    let (nm, _dev) = setup_wifi(&[("Net", 80)]);
+    let path = nm.save_connection("Net", None);
+    // libnm rejects ipv4.dns on shared, link-local and disabled. Shared is
+    // the family-specific case: ipv6.method=shared accepts the property.
+    nm.set_ip_method(&path, "ipv4", "shared");
+    let def = net("Net", None);
+
+    // If apply_dns wrote ipv4.dns here, the fake's libnm rule would reject
+    // the whole Update2 and this call would log a failure instead.
+    breadcrumbs::nm::connect_verbose("wlan0", &def, 5, "10.0.0.1, 2606:4700:4700::1111")
+        .expect("the mixed-family pin must persist through Update2");
+
+    let s = nm.profile_settings(&path).expect("profile");
+    assert_eq!(
+        s["ipv4"]["method"].downcast_ref::<String>().unwrap(),
+        "shared",
+        "the profile's method must be left alone"
+    );
+    assert!(
+        !s["ipv4"].contains_key("dns"),
+        "ipv4.dns must not be written on a method that rejects it"
+    );
+    assert!(
+        !s["ipv4"].contains_key("ignore-auto-dns"),
+        "the rejected IPv4 section must be left untouched"
+    );
+    let v6: Vec<Vec<u8>> = s["ipv6"]["dns"]
+        .try_clone()
+        .unwrap()
+        .try_into()
+        .expect("ipv6.dns is aay");
+    assert_eq!(
+        v6,
+        vec!["2606:4700:4700::1111"
+            .parse::<Ipv6Addr>()
+            .unwrap()
+            .octets()
+            .to_vec()],
+        "the IPv6 half must still be written"
+    );
+}
+
 // ---------------------------------------------------------------------
 // status::connectivity: HTTP answer versus ICMP fallback
 // ---------------------------------------------------------------------
