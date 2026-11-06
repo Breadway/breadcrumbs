@@ -207,6 +207,14 @@ fn value_string(v: &OwnedValue) -> Option<String> {
     }
 }
 
+/// Whether a present value is an array with no elements. NetworkManager's
+/// dns verify rule only rejects a *non-empty* server list on the methods
+/// that carry no explicit servers, so an empty list must not be treated as
+/// an offending dns value (measured against libnm 1.58.1).
+fn is_empty_array(v: &OwnedValue) -> bool {
+    matches!(v.deref(), Value::Array(a) if a.inner().is_empty())
+}
+
 /// The subset of NetworkManager's own settings verification that a client
 /// can get wrong. Real NM rejects these profiles outright, so the fake must
 /// too, or a client bug passes every test and fails on real hardware.
@@ -244,12 +252,21 @@ fn validate_settings(s: &SettingsMap) -> fdo::Result<()> {
             // rejects shared/link-local/disabled (verified against libnm
             // 1.58.1), while ipv6 rejects ignore/disabled/link-local and
             // accepts shared. This is the rule CRUMB-48 and CRUMB-55 hit.
+            //
+            // libnm 1.58.1 only enforces that rule for a *non-empty* list:
+            // an explicitly set dns/dns-data of `[]` verifies on every
+            // method in both families, including these. The fake must model
+            // the rule at the same granularity or it over-rejects the empty
+            // list an unpin writes (CRUMB-57).
             if let Some(method) = ip.get("method").and_then(value_string) {
                 let rejects_dns = match section {
                     "ipv4" => matches!(method.as_str(), "shared" | "link-local" | "disabled"),
                     _ => matches!(method.as_str(), "ignore" | "disabled" | "link-local"),
                 };
-                if rejects_dns && (ip.contains_key("dns") || ip.contains_key("dns-data")) {
+                let has_dns_list = ["dns", "dns-data"]
+                    .iter()
+                    .any(|key| ip.get(*key).is_some_and(|v| !is_empty_array(v)));
+                if rejects_dns && has_dns_list {
                     return bad(&format!(
                         "{section}.dns: this property is not allowed for method={method}"
                     ));
@@ -308,28 +325,83 @@ mod validate_tests {
         }
     }
 
-    fn with_method_and_dns(section: &str, method: &str) -> SettingsMap {
+    fn dns_value(section: &str, servers: &[&str]) -> OwnedValue {
+        if section == "ipv4" {
+            let addrs: Vec<u32> = servers
+                .iter()
+                .map(|a| u32::from_ne_bytes(a.parse::<std::net::Ipv4Addr>().unwrap().octets()))
+                .collect();
+            ov(Value::from(addrs))
+        } else {
+            let addrs: Vec<Vec<u8>> = servers
+                .iter()
+                .map(|a| a.parse::<std::net::Ipv6Addr>().unwrap().octets().to_vec())
+                .collect();
+            ov(Value::from(addrs))
+        }
+    }
+
+    fn with_method_and_dns(section: &str, method: &str, servers: &[&str]) -> SettingsMap {
         let mut s = with_section(section, &["method"]);
         let ip = s.get_mut(section).unwrap();
         ip.insert("method".into(), ov(Value::from(method)));
-        let dns = if section == "ipv4" {
-            ov(Value::from(Vec::<u32>::new()))
-        } else {
-            ov(Value::from(Vec::<Vec<u8>>::new()))
-        };
-        ip.insert("dns".into(), dns);
+        ip.insert("dns".into(), dns_value(section, servers));
         s
     }
 
+    fn with_method_and_dns_data(section: &str, method: &str, servers: &[&str]) -> SettingsMap {
+        let mut s = with_section(section, &["method"]);
+        let ip = s.get_mut(section).unwrap();
+        ip.insert("method".into(), ov(Value::from(method)));
+        let data: Vec<String> = servers.iter().map(|s| s.to_string()).collect();
+        ip.insert("dns-data".into(), ov(Value::from(data)));
+        s
+    }
+
+    /// IPv4 methods libnm 1.58.1 rejects a non-empty dns list on.
+    const REJECTING_IPV4: &[&str] = &["shared", "link-local", "disabled"];
+    /// IPv6 methods libnm 1.58.1 rejects a non-empty dns list on.
+    const REJECTING_IPV6: &[&str] = &["ignore", "disabled", "link-local"];
+    /// Every real method of each family, accepting and rejecting alike.
+    const ALL_IPV4: &[&str] = &["auto", "manual", "shared", "link-local", "disabled"];
+    const ALL_IPV6: &[&str] = &[
+        "auto",
+        "dhcp",
+        "manual",
+        "shared",
+        "ignore",
+        "disabled",
+        "link-local",
+    ];
+
     #[test]
     fn dns_on_a_method_that_rejects_it_is_rejected() {
-        for (section, methods) in [
-            ("ipv4", &["shared", "link-local", "disabled"][..]),
-            ("ipv6", &["ignore", "disabled", "link-local"][..]),
+        for (section, methods, server) in [
+            ("ipv4", REJECTING_IPV4, "1.1.1.1"),
+            ("ipv6", REJECTING_IPV6, "2606:4700:4700::1111"),
         ] {
             for method in methods {
-                let s = with_method_and_dns(section, method);
-                let err = validate_settings(&s).expect_err("libnm rejects this");
+                let s = with_method_and_dns(section, method, &[server]);
+                let err = validate_settings(&s).expect_err("libnm rejects a non-empty list");
+                assert!(
+                    err.to_string().contains(&format!(
+                        "{section}.dns: this property is not allowed for method={method}"
+                    )),
+                    "{err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dns_data_on_a_method_that_rejects_it_is_rejected() {
+        for (section, methods, server) in [
+            ("ipv4", REJECTING_IPV4, "1.1.1.1"),
+            ("ipv6", REJECTING_IPV6, "2606:4700:4700::1111"),
+        ] {
+            for method in methods {
+                let s = with_method_and_dns_data(section, method, &[server]);
+                let err = validate_settings(&s).expect_err("libnm rejects a non-empty list");
                 assert!(
                     err.to_string().contains(&format!(
                         "{section}.dns: this property is not allowed for method={method}"
@@ -342,15 +414,65 @@ mod validate_tests {
 
     #[test]
     fn dns_on_an_accepting_method_is_accepted() {
-        for (section, methods) in [
-            ("ipv4", &["auto", "manual"][..]),
-            ("ipv6", &["auto", "dhcp", "manual", "shared"][..]),
+        for (section, methods, server) in [
+            ("ipv4", &["auto", "manual"][..], "1.1.1.1"),
+            (
+                "ipv6",
+                &["auto", "dhcp", "manual", "shared"][..],
+                "2606:4700:4700::1111",
+            ),
         ] {
             for method in methods {
-                let s = with_method_and_dns(section, method);
+                let s = with_method_and_dns(section, method, &[server]);
                 assert!(validate_settings(&s).is_ok(), "{section} {method}");
             }
         }
+    }
+
+    /// Measured against libnm 1.58.1: an explicitly set dns property that is
+    /// an empty list verifies on every method, including the reject set.
+    /// Only a non-empty list is "not allowed for method=...". This is the
+    /// exact rule the fake over-applied before CRUMB-57.
+    #[test]
+    fn present_but_empty_dns_is_accepted_on_every_method() {
+        for (section, methods) in [("ipv4", ALL_IPV4), ("ipv6", ALL_IPV6)] {
+            for method in methods {
+                let s = with_method_and_dns(section, method, &[]);
+                assert!(
+                    validate_settings(&s).is_ok(),
+                    "{section} {method}: libnm accepts a present but empty dns list"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn present_but_empty_dns_data_is_accepted_on_every_method() {
+        for (section, methods) in [("ipv4", ALL_IPV4), ("ipv6", ALL_IPV6)] {
+            for method in methods {
+                let s = with_method_and_dns_data(section, method, &[]);
+                assert!(
+                    validate_settings(&s).is_ok(),
+                    "{section} {method}: libnm accepts a present but empty dns-data list"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_dns_list_does_not_mask_the_method_requirement() {
+        // The empty-list exemption is about dns only; the method rule still
+        // applies to a section that names no method at all.
+        let mut s: SettingsMap = HashMap::new();
+        s.insert(
+            "ipv6".to_string(),
+            HashMap::from([("dns".to_string(), dns_value("ipv6", &[]))]),
+        );
+        let err = validate_settings(&s).expect_err("missing method must still be rejected");
+        assert!(
+            err.to_string().contains("ipv6.method: property is missing"),
+            "{err}"
+        );
     }
 
     #[test]
