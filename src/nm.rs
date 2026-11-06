@@ -824,18 +824,55 @@ fn set_ip_dns(
     }
 }
 
+/// IPv6 methods on which NetworkManager accepts an explicit `ipv6.dns` list.
+///
+/// libnm rejects the property outright on `ignore`, `disabled` and
+/// `link-local` ("ipv6.dns: this property is not allowed for method=<mode>"),
+/// including the empty list an unpin writes, so those sections must not be
+/// written at all. `auto`, `dhcp`, `manual` (nmcli also spells it `static`)
+/// and `shared` carry explicit servers. An unrecognised method is treated as
+/// not accepting the pin: skipping the IPv6 half keeps the rest of the
+/// profile (notably IPv4) persistable instead of failing the whole `Update2`.
+fn ipv6_method_accepts_dns(method: Option<&str>) -> bool {
+    matches!(
+        method,
+        Some("auto" | "dhcp" | "manual" | "static" | "shared")
+    )
+}
+
+/// Whether the profile's existing IPv6 section can carry a DNS list. A
+/// missing section is created with `method = auto`, which accepts one; a
+/// section whose method cannot be read is invalid for `Update2` anyway and
+/// is left alone.
+fn ipv6_section_accepts_dns(s: &SettingsMap) -> bool {
+    match s.get("ipv6") {
+        None => true,
+        Some(section) => ipv6_method_accepts_dns(
+            section
+                .get("method")
+                .and_then(|v| value_string(v))
+                .as_deref(),
+        ),
+    }
+}
+
 /// Apply the DNS pin (or unpin) for `dns` to a settings dict. Returns
 /// whether anything changed, so an already-correct profile is not
 /// rewritten to disk on every connect.
 ///
 /// A non-empty `dns` pins those servers on both IPv4 and IPv6 (servers of
 /// the other family are cleared, so no auto DNS leaks around the pin) and
-/// marks the profile in `user.data`. An empty `dns` removes a pin only if
-/// the marker shows breadcrumbs made it, restoring automatic DNS.
+/// marks the profile in `user.data`. The IPv6 half is only written when the
+/// profile's `ipv6.method` accepts a DNS list (see [`ipv6_method_accepts_dns`]);
+/// an incompatible method is left exactly as it was, so a mixed-family pin
+/// still persists its IPv4 servers instead of failing the whole `Update2`.
+/// An empty `dns` removes a pin only if the marker shows breadcrumbs made it,
+/// restoring automatic DNS.
 fn apply_dns(s: &mut SettingsMap, dns: &str) -> Result<bool, String> {
     let mut data = user_data(s);
     let pinned_by_us = data.contains_key(DNS_PIN_MARKER);
     let (v4, v6) = crate::dns::parse_servers(dns)?;
+    let pin_ipv6 = ipv6_section_accepts_dns(s);
 
     if v4.is_empty() && v6.is_empty() {
         if !pinned_by_us {
@@ -844,12 +881,32 @@ fn apply_dns(s: &mut SettingsMap, dns: &str) -> Result<bool, String> {
         if let Some(ip4) = s.get_mut("ipv4") {
             set_ip_dns(ip4, false, Value::from(Vec::<u32>::new()), Vec::new());
         }
-        if let Some(ip6) = s.get_mut("ipv6") {
-            set_ip_dns(ip6, false, Value::from(Vec::<Vec<u8>>::new()), Vec::new());
+        // libnm rejects `ipv6.dns` on ignore/disabled/link-local, including
+        // the empty list an unpin writes. Leave such a section untouched
+        // rather than turning the whole Update2 into a failure.
+        if pin_ipv6 {
+            if let Some(ip6) = s.get_mut("ipv6") {
+                set_ip_dns(ip6, false, Value::from(Vec::<Vec<u8>>::new()), Vec::new());
+            }
         }
         data.remove(DNS_PIN_MARKER);
     } else {
-        let want = format!("{v4:?}{v6:?}");
+        if !pin_ipv6 && v4.is_empty() {
+            // Clearing IPv4 auto DNS for a pin that cannot be applied
+            // anywhere would leave the profile with no usable DNS at all.
+            // Fail visibly and change nothing instead of silently wiping it.
+            return Err(format!(
+                "cannot pin IPv6 DNS {v6:?}: the profile's ipv6 method does not accept DNS"
+            ));
+        }
+        let want = if pin_ipv6 {
+            format!("{v4:?}{v6:?}")
+        } else {
+            // Record only the half that was applied, so a later switch to an
+            // accepting method pins the IPv6 servers instead of being
+            // suppressed by a marker that claims they were written.
+            format!("{v4:?}[]")
+        };
         if data.get(DNS_PIN_MARKER) == Some(&want) {
             return Ok(false);
         }
@@ -863,9 +920,12 @@ fn apply_dns(s: &mut SettingsMap, dns: &str) -> Result<bool, String> {
         // no section at all. Existing sections keep their method.
         let ip4 = s.entry("ipv4".to_string()).or_insert_with(auto_ip_section);
         set_ip_dns(ip4, true, Value::from(v4_wire), v4_str);
-        // Create the ipv6 section too, so auto DNS cannot leak around the pin.
-        let ip6 = s.entry("ipv6".to_string()).or_insert_with(auto_ip_section);
-        set_ip_dns(ip6, true, Value::from(v6_wire), v6_str);
+        // Create the ipv6 section too, so auto DNS cannot leak around the
+        // pin, unless its method rejects DNS (then it is left untouched).
+        if pin_ipv6 {
+            let ip6 = s.entry("ipv6".to_string()).or_insert_with(auto_ip_section);
+            set_ip_dns(ip6, true, Value::from(v6_wire), v6_str);
+        }
         data.insert(DNS_PIN_MARKER.to_string(), want);
     }
     let user = s.entry("user".to_string()).or_default();
@@ -876,6 +936,10 @@ fn apply_dns(s: &mut SettingsMap, dns: &str) -> Result<bool, String> {
 /// Pin (or unpin, see [`apply_dns`]) DNS on the active connection of `dev`:
 /// persist via Update2, then Reapply on the device so it takes effect
 /// without bouncing the link.
+///
+/// This is the only settings-update path for DNS: the payload is the map that
+/// [`apply_dns`] rewrote, so the mode-aware IPv6 rule applies to both the
+/// already-connected and the freshly-activated connect paths below.
 fn enforce_dns(conn: &Connection, dev: &OwnedObjectPath, dns: &str) -> Result<(), String> {
     let active = active_connection_path(conn, dev).ok_or("no active connection")?;
     let mut s = get_settings(conn, active.as_str()).ok_or("could not read profile settings")?;
@@ -1278,6 +1342,172 @@ mod tests {
             s["ipv6"]["method"].downcast_ref::<String>().unwrap(),
             "manual"
         );
+    }
+
+    fn settings_with_ipv6_mode(method: &str) -> SettingsMap {
+        let mut s = settings_with_ip();
+        s.get_mut("ipv6")
+            .unwrap()
+            .insert("method".into(), ov(Value::from(method)));
+        s
+    }
+
+    fn ipv6_dns_bytes(s: &SettingsMap) -> Option<Vec<Vec<u8>>> {
+        s.get("ipv6")
+            .and_then(|m| m.get("dns"))
+            .and_then(|v| v.try_clone().ok())
+            .and_then(|v| Vec::<Vec<u8>>::try_from(v).ok())
+    }
+
+    fn v6_octets(addr: &str) -> Vec<u8> {
+        addr.parse::<Ipv6Addr>().unwrap().octets().to_vec()
+    }
+
+    #[test]
+    fn ipv6_method_accepts_dns_only_for_methods_nm_allows() {
+        for method in ["auto", "dhcp", "manual", "static", "shared"] {
+            assert!(
+                ipv6_method_accepts_dns(Some(method)),
+                "{method} accepts ipv6.dns"
+            );
+        }
+        for method in ["ignore", "disabled", "link-local", "bogus"] {
+            assert!(
+                !ipv6_method_accepts_dns(Some(method)),
+                "{method} rejects ipv6.dns"
+            );
+        }
+        // A section with no readable method is invalid for Update2 anyway;
+        // do not add an ipv6.dns property to it.
+        assert!(!ipv6_method_accepts_dns(None));
+    }
+
+    /// The reported failure: with ipv6.method ignore/disabled/link-local,
+    /// libnm rejects ipv6.dns ("this property is not allowed for method=..."),
+    /// which used to fail the whole Update2 and lose the IPv4 pin too.
+    #[test]
+    fn apply_dns_skips_ipv6_dns_for_methods_that_reject_it() {
+        for method in ["ignore", "disabled", "link-local"] {
+            let mut s = settings_with_ipv6_mode(method);
+            let existing = vec![v6_octets("2001:db8::53")];
+            s.get_mut("ipv6")
+                .unwrap()
+                .insert("dns".into(), ov(Value::from(existing.clone())));
+            s.get_mut("ipv6")
+                .unwrap()
+                .insert("ignore-auto-dns".into(), ov(Value::from(false)));
+
+            assert!(
+                apply_dns(&mut s, "10.0.0.1, 2606:4700:4700::1111").unwrap(),
+                "{method}: the IPv4 half must still be applied"
+            );
+
+            let v4: Vec<u32> = s["ipv4"]["dns"].try_clone().unwrap().try_into().unwrap();
+            assert_eq!(v4, vec![u32::from_ne_bytes([10, 0, 0, 1])]);
+            assert!(get_bool(&s, "ipv4", "ignore-auto-dns"));
+
+            // The rejected IPv6 section is untouched: same method, same DNS
+            // list, same ignore-auto-dns. Nothing is cleared or replaced.
+            assert_eq!(
+                s["ipv6"]["method"].downcast_ref::<String>().unwrap(),
+                method
+            );
+            assert_eq!(ipv6_dns_bytes(&s).unwrap(), existing);
+            assert!(!get_bool(&s, "ipv6", "ignore-auto-dns"));
+
+            // The marker records only what was applied, so re-applying is a
+            // no-op rather than a disk write on every connect.
+            assert!(!apply_dns(&mut s, "10.0.0.1, 2606:4700:4700::1111").unwrap());
+        }
+    }
+
+    #[test]
+    fn apply_dns_pins_ipv6_for_methods_that_accept_it() {
+        for method in ["auto", "manual", "static", "dhcp", "shared"] {
+            let mut s = settings_with_ipv6_mode(method);
+            assert!(
+                apply_dns(&mut s, "2606:4700:4700::1111").unwrap(),
+                "{method} accepts the IPv6 pin"
+            );
+            assert_eq!(
+                s["ipv6"]["method"].downcast_ref::<String>().unwrap(),
+                method
+            );
+            assert_eq!(
+                ipv6_dns_bytes(&s).unwrap(),
+                vec![v6_octets("2606:4700:4700::1111")]
+            );
+            assert!(get_bool(&s, "ipv6", "ignore-auto-dns"));
+        }
+    }
+
+    #[test]
+    fn apply_dns_retries_skipped_ipv6_when_method_becomes_compatible() {
+        let mut s = settings_with_ipv6_mode("ignore");
+        assert!(apply_dns(&mut s, "10.0.0.1, 2606:4700:4700::1111").unwrap());
+        assert!(
+            ipv6_dns_bytes(&s).is_none(),
+            "the rejected method must not get an ipv6.dns property"
+        );
+        s.get_mut("ipv6")
+            .unwrap()
+            .insert("method".into(), ov(Value::from("auto")));
+        assert!(apply_dns(&mut s, "10.0.0.1, 2606:4700:4700::1111").unwrap());
+        assert_eq!(
+            ipv6_dns_bytes(&s).unwrap(),
+            vec![v6_octets("2606:4700:4700::1111")]
+        );
+    }
+
+    #[test]
+    fn apply_dns_unpin_leaves_rejected_ipv6_section_alone() {
+        for method in ["ignore", "disabled", "link-local"] {
+            let mut s = settings_with_ipv6_mode(method);
+            let stale = vec![v6_octets("2606:4700:4700::1111")];
+            s.get_mut("ipv6")
+                .unwrap()
+                .insert("dns".into(), ov(Value::from(stale.clone())));
+            let mut data = HashMap::new();
+            data.insert(DNS_PIN_MARKER.to_string(), "[1][]".to_string());
+            s.insert(
+                "user".into(),
+                HashMap::from([("data".into(), ov(Value::from(data)))]),
+            );
+
+            assert!(apply_dns(&mut s, "").unwrap(), "{method}");
+
+            assert!(!get_bool(&s, "ipv4", "ignore-auto-dns"));
+            // Writing the empty list would also be refused by libnm, so the
+            // section keeps its existing value and the marker still goes.
+            assert_eq!(ipv6_dns_bytes(&s).unwrap(), stale);
+            assert!(!user_data(&s).contains_key(DNS_PIN_MARKER));
+        }
+    }
+
+    #[test]
+    fn apply_dns_unpin_clears_ipv6_when_method_accepts_dns() {
+        let mut s = settings_with_ip();
+        assert!(apply_dns(&mut s, "1.1.1.1").unwrap());
+        assert!(apply_dns(&mut s, "").unwrap());
+        assert!(ipv6_dns_bytes(&s).unwrap().is_empty());
+        assert!(!get_bool(&s, "ipv6", "ignore-auto-dns"));
+    }
+
+    #[test]
+    fn ipv6_only_pin_on_rejected_method_errors_without_touching_ipv4() {
+        for method in ["ignore", "disabled", "link-local"] {
+            let mut s = settings_with_ipv6_mode(method);
+            let err = apply_dns(&mut s, "2606:4700:4700::1111").unwrap_err();
+            assert!(
+                err.contains("ipv6 method does not accept DNS"),
+                "{method}: {err}"
+            );
+            // Nothing was written: in particular IPv4 auto DNS was not
+            // cleared for a pin that cannot be applied.
+            assert!(!s["ipv4"].contains_key("ignore-auto-dns"));
+            assert!(!s["ipv4"].contains_key("dns"));
+            assert!(!user_data(&s).contains_key(DNS_PIN_MARKER));
+        }
     }
 
     #[test]
