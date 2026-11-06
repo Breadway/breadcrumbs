@@ -1689,6 +1689,35 @@ fn connect_skips_ipv4_dns_when_method_rejects_it() {
     );
 }
 
+#[test]
+fn unpin_clears_dns_on_a_method_that_rejects_nonempty_lists() {
+    let _env = EnvSandbox::new();
+    let (nm, _dev) = setup_wifi(&[("Net", 80)]);
+    let path = nm.save_connection("Net", None);
+    let def = net("Net", None);
+
+    // Pin on an accepting method, so breadcrumbs owns the marker.
+    breadcrumbs::nm::connect_verbose("wlan0", &def, 5, "10.0.0.1").unwrap();
+    // Another tool then switches IPv4 to a method that rejects servers.
+    nm.set_ip_method(&path, "ipv4", "shared");
+
+    breadcrumbs::nm::connect_verbose("wlan0", &def, 5, "")
+        .expect("libnm accepts a present but empty dns list on every method");
+
+    let s = nm.profile_settings(&path).expect("profile");
+    assert_eq!(
+        s["ipv4"]["method"].downcast_ref::<String>().unwrap(),
+        "shared",
+        "the unpin must not rewrite the method"
+    );
+    assert_eq!(
+        fake_nm::value_u32_list(&s["ipv4"]["dns"]),
+        Some(vec![]),
+        "the stale list must be cleared, not left behind"
+    );
+    assert!(!s["ipv4"]["ignore-auto-dns"].downcast_ref::<bool>().unwrap());
+}
+
 // ---------------------------------------------------------------------
 // status::connectivity: HTTP answer versus ICMP fallback
 // ---------------------------------------------------------------------

@@ -824,9 +824,9 @@ fn set_ip_dns(
     }
 }
 
-/// IPv4 methods on which NetworkManager accepts an explicit `ipv4.dns` list.
+/// IPv4 methods on which NetworkManager accepts a non-empty `ipv4.dns` list.
 ///
-/// libnm rejects the property on `shared`, `link-local` and `disabled`
+/// libnm rejects a non-empty list on `shared`, `link-local` and `disabled`
 /// ("ipv4.dns: this property is not allowed for method=<mode>"). `shared` is
 /// a DHCP-server mode and is not in the IPv6 reject set, so the two families
 /// cannot share one list. `auto` and `manual` carry explicit servers. IPv4
@@ -834,19 +834,27 @@ fn set_ip_dns(
 /// auto/link-local/manual/shared/disabled), so an unknown or missing method
 /// is treated as not accepting the pin: skipping the IPv4 half keeps the
 /// IPv6 half persistable instead of failing the whole `Update2`.
+///
+/// This gate is about pinning servers only. libnm 1.58.1 accepts a present
+/// but empty dns list on every method, so an unpin may clear a section
+/// regardless of its method.
 fn ipv4_method_accepts_dns(method: Option<&str>) -> bool {
     matches!(method, Some("auto" | "manual"))
 }
 
-/// IPv6 methods on which NetworkManager accepts an explicit `ipv6.dns` list.
+/// IPv6 methods on which NetworkManager accepts a non-empty `ipv6.dns` list.
 ///
-/// libnm rejects the property outright on `ignore`, `disabled` and
-/// `link-local` ("ipv6.dns: this property is not allowed for method=<mode>"),
-/// including the empty list an unpin writes, so those sections must not be
-/// written at all. `auto`, `dhcp`, `manual` (nmcli also spells it `static`)
-/// and `shared` carry explicit servers. An unrecognised method is treated as
-/// not accepting the pin: skipping the IPv6 half keeps the rest of the
-/// profile (notably IPv4) persistable instead of failing the whole `Update2`.
+/// libnm rejects a non-empty list on `ignore`, `disabled` and `link-local`
+/// ("ipv6.dns: this property is not allowed for method=<mode>"), so those
+/// sections must not be given servers. `auto`, `dhcp`, `manual` (nmcli also
+/// spells it `static`) and `shared` carry explicit servers. An unrecognised
+/// method is treated as not accepting the pin: skipping the IPv6 half keeps
+/// the rest of the profile (notably IPv4) persistable instead of failing the
+/// whole `Update2`.
+///
+/// This gate is about pinning servers only. libnm 1.58.1 accepts a present
+/// but empty dns list on every method, including these, so an unpin may
+/// clear a section regardless of its method.
 fn ipv6_method_accepts_dns(method: Option<&str>) -> bool {
     matches!(
         method,
@@ -885,12 +893,13 @@ fn ipv6_section_accepts_dns(s: &SettingsMap) -> bool {
 /// A non-empty `dns` pins those servers on both IPv4 and IPv6 (servers of
 /// the other family are cleared, so no auto DNS leaks around the pin) and
 /// marks the profile in `user.data`. Each family is only written when that
-/// profile's method accepts a DNS list (see [`ipv4_method_accepts_dns`] and
-/// [`ipv6_method_accepts_dns`]); an incompatible method is left exactly as
-/// it was, so a mixed-family pin still persists the servers it can instead
-/// of failing the whole `Update2`.
+/// profile's method accepts a non-empty DNS list (see
+/// [`ipv4_method_accepts_dns`] and [`ipv6_method_accepts_dns`]); an
+/// incompatible method is left exactly as it was, so a mixed-family pin still
+/// persists the servers it can instead of failing the whole `Update2`.
 /// An empty `dns` removes a pin only if the marker shows breadcrumbs made it,
-/// restoring automatic DNS.
+/// restoring automatic DNS. libnm accepts a present but empty DNS list on
+/// every method, so the unpin clears both sections regardless of their method.
 fn apply_dns(s: &mut SettingsMap, dns: &str) -> Result<bool, String> {
     let mut data = user_data(s);
     let pinned_by_us = data.contains_key(DNS_PIN_MARKER);
@@ -902,18 +911,14 @@ fn apply_dns(s: &mut SettingsMap, dns: &str) -> Result<bool, String> {
         if !pinned_by_us {
             return Ok(false);
         }
-        // libnm rejects a DNS list on ipv4 shared/link-local/disabled and
-        // ipv6 ignore/disabled/link-local. Leave such a section untouched
-        // rather than turning the whole Update2 into a failure.
-        if pin_ipv4 {
-            if let Some(ip4) = s.get_mut("ipv4") {
-                set_ip_dns(ip4, false, Value::from(Vec::<u32>::new()), Vec::new());
-            }
+        // An empty dns list is accepted on every method (measured against
+        // libnm 1.58.1), so the unpin clears both sections and leaves no
+        // stale list behind on a method that only rejects non-empty ones.
+        if let Some(ip4) = s.get_mut("ipv4") {
+            set_ip_dns(ip4, false, Value::from(Vec::<u32>::new()), Vec::new());
         }
-        if pin_ipv6 {
-            if let Some(ip6) = s.get_mut("ipv6") {
-                set_ip_dns(ip6, false, Value::from(Vec::<Vec<u8>>::new()), Vec::new());
-            }
+        if let Some(ip6) = s.get_mut("ipv6") {
+            set_ip_dns(ip6, false, Value::from(Vec::<Vec<u8>>::new()), Vec::new());
         }
         data.remove(DNS_PIN_MARKER);
     } else {
@@ -1502,13 +1507,16 @@ mod tests {
     }
 
     #[test]
-    fn apply_dns_unpin_leaves_rejected_ipv6_section_alone() {
+    fn apply_dns_unpin_clears_rejected_ipv6_methods_too() {
         for method in ["ignore", "disabled", "link-local"] {
             let mut s = settings_with_ipv6_mode(method);
             let stale = vec![v6_octets("2606:4700:4700::1111")];
             s.get_mut("ipv6")
                 .unwrap()
                 .insert("dns".into(), ov(Value::from(stale.clone())));
+            s.get_mut("ipv6")
+                .unwrap()
+                .insert("ignore-auto-dns".into(), ov(Value::from(true)));
             let mut data = HashMap::new();
             data.insert(DNS_PIN_MARKER.to_string(), "[1][]".to_string());
             s.insert(
@@ -1519,9 +1527,15 @@ mod tests {
             assert!(apply_dns(&mut s, "").unwrap(), "{method}");
 
             assert!(!get_bool(&s, "ipv4", "ignore-auto-dns"));
-            // Writing the empty list would also be refused by libnm, so the
-            // section keeps its existing value and the marker still goes.
-            assert_eq!(ipv6_dns_bytes(&s).unwrap(), stale);
+            // libnm accepts a present but empty dns list on every method, so
+            // the stale IPv6 list is cleared without failing the Update2.
+            assert!(ipv6_dns_bytes(&s).unwrap().is_empty(), "{method}");
+            assert!(!get_bool(&s, "ipv6", "ignore-auto-dns"));
+            assert_eq!(
+                s["ipv6"]["method"].downcast_ref::<String>().unwrap(),
+                method,
+                "the unpin must not rewrite the method"
+            );
             assert!(!user_data(&s).contains_key(DNS_PIN_MARKER));
         }
     }
@@ -1725,13 +1739,12 @@ mod tests {
     }
 
     #[test]
-    fn apply_dns_unpin_leaves_rejected_ipv4_section_alone() {
+    fn apply_dns_unpin_clears_rejected_ipv4_methods_too() {
         for method in ["shared", "link-local", "disabled"] {
             let mut s = settings_with_ipv4_mode(method);
             let ip4 = s.get_mut("ipv4").unwrap();
             ip4.insert("dns".into(), ov(Value::from(vec![v4_wire("192.0.2.53")])));
             ip4.insert("ignore-auto-dns".into(), ov(Value::from(true)));
-            let before = section_snapshot(&s, "ipv4");
             let mut data = HashMap::new();
             data.insert(DNS_PIN_MARKER.to_string(), "[]".to_string());
             s.insert(
@@ -1741,9 +1754,22 @@ mod tests {
 
             assert!(apply_dns(&mut s, "").unwrap(), "{method}");
 
-            // The IPv4 section keeps its existing value and the marker still
-            // goes; the accepting IPv6 half is cleared normally.
-            assert_eq!(section_snapshot(&s, "ipv4"), before, "{method}");
+            // An empty dns list is accepted on every method, so both halves
+            // are cleared and the marker goes.
+            assert!(ipv4_dns(&s).unwrap().is_empty(), "{method}");
+            assert!(!get_bool(&s, "ipv4", "ignore-auto-dns"));
+            // settings_with_ip carries dns-data on ipv4; it is cleared too.
+            let data: Vec<String> = s["ipv4"]["dns-data"]
+                .try_clone()
+                .unwrap()
+                .try_into()
+                .unwrap();
+            assert!(data.is_empty(), "{method}");
+            assert_eq!(
+                s["ipv4"]["method"].downcast_ref::<String>().unwrap(),
+                method,
+                "the unpin must not rewrite the method"
+            );
             assert!(ipv6_dns_bytes(&s).unwrap().is_empty());
             assert!(!get_bool(&s, "ipv6", "ignore-auto-dns"));
             assert!(!user_data(&s).contains_key(DNS_PIN_MARKER));
