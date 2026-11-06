@@ -1,11 +1,27 @@
 name: release
 
-# Manual only. Forgejo's .forgejo/workflows/release.yml is the authoritative
-# tag publisher (GitHub auto-mirrors from origin). Triggering this on `v*`
-# tags as well made one tag push run two publishers writing the same
-# /srv/breadway-dl path and running `gh release upload --clobber`.
+# Manual recovery publisher only. Forgejo's .forgejo/workflows/release.yml is
+# the authoritative stable tag publisher (GitHub auto-mirrors from origin).
+# Triggering this on `v*` tags as well made one tag push run two publishers
+# writing the same /srv/breadway-dl path and running `gh release upload
+# --clobber`.
+#
+# A manual dispatch must never publish a branch as a release: the old version
+# derived VERSION from GITHUB_REF_NAME, so dispatching on main published
+# breadcrumbs/main and repointed latest at it. A dispatch is now only accepted
+# with an explicit `version` input naming an existing stable tag (vX.Y.Z).
+# The validate job refuses anything else before the build job is scheduled,
+# and the build job checks that tag out, so the dispatch ref (main, a feature
+# branch, ...) never reaches a build or publish step. Beta and dev stays on
+# their own workflows; this path repoints stable `latest`, so RC tags are
+# refused too.
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Existing stable release tag to re-publish, for example v2.2.0'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -15,10 +31,43 @@ env:
   ECOSYSTEM_DIR: /home/breadway/Projects/bread-ecosystem
 
 jobs:
-  build:
+  validate:
+    name: validate release tag
     runs-on: [self-hosted]
+    outputs:
+      version: ${{ steps.validate.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: require an existing stable release tag
+        id: validate
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          tag="${REQUESTED_VERSION}"
+          if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version must be a stable release tag such as v2.2.0 (got '${tag}'); branch names and RC tags are refused"
+            exit 1
+          fi
+          if ! git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null; then
+            echo "::error::${tag} is not an existing tag in this repository; refusing to publish a version that was never released"
+            exit 1
+          fi
+          printf 'version=%s\n' "${tag}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: validate
+    # No validated tag, no publish effects. The checkout below pins the same
+    # tag, so nothing in this job can read a branch name as the version.
+    if: ${{ needs.validate.outputs.version != '' }}
+    runs-on: [self-hosted]
+    env:
+      RELEASE_TAG: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.validate.outputs.version }}
 
       - name: install build deps
         run: sudo apt-get install -y libnm-dev libdbus-1-dev pkg-config 2>/dev/null || true
@@ -31,8 +80,9 @@ jobs:
 
       - name: prepare artifacts
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          PKG_DIR="${DL_DIR}/breadcrumbs/${VERSION}"
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          PKG_DIR="${DL_DIR}/breadcrumbs/${version}"
           mkdir -p "${PKG_DIR}"
           cp target/release/breadcrumbs "${PKG_DIR}/breadcrumbs-x86_64"
           strip "${PKG_DIR}/breadcrumbs-x86_64"
@@ -40,10 +90,11 @@ jobs:
             > "${PKG_DIR}/breadcrumbs-x86_64.sha256"
           cp breadcrumbs.example.toml "${PKG_DIR}/"
           cp bakery.toml "${PKG_DIR}/bakery.toml"
-          ln -sfn "${VERSION}" "${DL_DIR}/breadcrumbs/latest"
+          ln -sfn "${version}" "${DL_DIR}/breadcrumbs/latest"
 
       - name: ensure bread-ecosystem
         run: |
+          set -euo pipefail
           if [[ -d "${ECOSYSTEM_DIR}/.git" ]]; then
             git -C "${ECOSYSTEM_DIR}" pull --ff-only
           else
@@ -58,11 +109,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          PKG_DIR="${DL_DIR}/breadcrumbs/${VERSION}"
-          gh release create "${GITHUB_REF_NAME}" \
-            --title "breadcrumbs v${VERSION}" --generate-notes 2>/dev/null || true
-          gh release upload "${GITHUB_REF_NAME}" \
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          PKG_DIR="${DL_DIR}/breadcrumbs/${version}"
+          gh release create "${RELEASE_TAG}" \
+            --title "breadcrumbs v${version}" --generate-notes 2>/dev/null || true
+          gh release upload "${RELEASE_TAG}" \
             "${PKG_DIR}/breadcrumbs-x86_64" \
             "${PKG_DIR}/breadcrumbs-x86_64.sha256" \
             --clobber
