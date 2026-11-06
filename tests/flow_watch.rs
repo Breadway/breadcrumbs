@@ -11,6 +11,7 @@
 mod common;
 
 use std::collections::BTreeMap;
+use std::net::Ipv6Addr;
 
 use bread_utils::bread_client::BreadEvent;
 use breadcrumbs::bread_events;
@@ -1575,6 +1576,72 @@ fn empty_dns_removes_only_a_pin_breadcrumbs_made() {
     assert!(!ignore, "the pin must be undone");
     let dns = fake_nm::value_u32_list(&s["ipv4"]["dns"]).unwrap();
     assert!(dns.is_empty());
+}
+
+#[test]
+fn connect_pins_both_families_when_ipv6_method_accepts_dns() {
+    let _env = EnvSandbox::new();
+    let (nm, _dev) = setup_wifi(&[("Net", 80)]);
+    let path = nm.save_connection("Net", None);
+    // No ipv6 section yet: apply_dns creates one with method auto.
+    let def = net("Net", None);
+
+    breadcrumbs::nm::connect_verbose("wlan0", &def, 5, "10.0.0.1, 2606:4700:4700::1111")
+        .expect("an auto ipv6 method accepts the pin");
+
+    let s = nm.profile_settings(&path).expect("profile");
+    assert_eq!(
+        fake_nm::value_u32_list(&s["ipv4"]["dns"]),
+        Some(vec![u32::from_ne_bytes([10, 0, 0, 1])])
+    );
+    let v6: Vec<Vec<u8>> = s["ipv6"]["dns"]
+        .try_clone()
+        .unwrap()
+        .try_into()
+        .expect("ipv6.dns is aay");
+    assert_eq!(
+        v6,
+        vec!["2606:4700:4700::1111"
+            .parse::<Ipv6Addr>()
+            .unwrap()
+            .octets()
+            .to_vec()]
+    );
+    assert_eq!(
+        s["ipv6"]["method"].downcast_ref::<String>().unwrap(),
+        "auto"
+    );
+}
+
+#[test]
+fn connect_skips_ipv6_dns_when_method_rejects_it() {
+    let _env = EnvSandbox::new();
+    let (nm, _dev) = setup_wifi(&[("Net", 80)]);
+    let path = nm.save_connection("Net", None);
+    nm.set_ip_method(&path, "ipv6", "ignore");
+    let def = net("Net", None);
+
+    // libnm rejects ipv6.dns on method=ignore, which used to fail the whole
+    // Update2 and lose the IPv4 half of the pin too.
+    breadcrumbs::nm::connect_verbose("wlan0", &def, 5, "10.0.0.1, 2606:4700:4700::1111")
+        .expect("the mixed-family pin must persist through Update2");
+
+    let s = nm.profile_settings(&path).expect("profile");
+    assert_eq!(
+        fake_nm::value_u32_list(&s["ipv4"]["dns"]),
+        Some(vec![u32::from_ne_bytes([10, 0, 0, 1])]),
+        "the IPv4 pin must still be written"
+    );
+    assert!(s["ipv4"]["ignore-auto-dns"].downcast_ref::<bool>().unwrap());
+    assert_eq!(
+        s["ipv6"]["method"].downcast_ref::<String>().unwrap(),
+        "ignore",
+        "the profile's method must be left alone"
+    );
+    assert!(
+        !s["ipv6"].contains_key("dns"),
+        "ipv6.dns must not be written on a method that rejects it"
+    );
 }
 
 // ---------------------------------------------------------------------

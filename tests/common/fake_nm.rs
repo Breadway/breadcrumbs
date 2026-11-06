@@ -200,6 +200,13 @@ pub fn value_u32_list(v: &OwnedValue) -> Option<Vec<u32>> {
     }
 }
 
+fn value_string(v: &OwnedValue) -> Option<String> {
+    match v.deref() {
+        Value::Str(s) => Some(s.as_str().to_string()),
+        _ => None,
+    }
+}
+
 /// The subset of NetworkManager's own settings verification that a client
 /// can get wrong. Real NM rejects these profiles outright, so the fake must
 /// too, or a client bug passes every test and fails on real hardware.
@@ -231,6 +238,19 @@ fn validate_settings(s: &SettingsMap) -> fdo::Result<()> {
         if let Some(ip) = s.get(section) {
             if ip.get("method").is_none() {
                 return bad(&format!("{section}.method: property is missing"));
+            }
+            // libnm rejects dns/dns-data outright on the methods that carry
+            // no explicit servers, even for an empty list: "ipv6.dns: this
+            // property is not allowed for method=ignore". This is the rule
+            // CRUMB-48 hit on real NetworkManager 1.46.
+            if let Some(method) = ip.get("method").and_then(value_string) {
+                if matches!(method.as_str(), "ignore" | "disabled" | "link-local")
+                    && (ip.contains_key("dns") || ip.contains_key("dns-data"))
+                {
+                    return bad(&format!(
+                        "{section}.dns: this property is not allowed for method={method}"
+                    ));
+                }
             }
         }
         if let Some(dns) = s.get(section).and_then(|m| m.get("dns")) {
@@ -282,6 +302,45 @@ mod validate_tests {
         for section in ["ipv4", "ipv6"] {
             let s = with_section(section, &["method"]);
             assert!(validate_settings(&s).is_ok(), "{section}");
+        }
+    }
+
+    fn with_method_and_dns(section: &str, method: &str) -> SettingsMap {
+        let mut s = with_section(section, &["method"]);
+        let ip = s.get_mut(section).unwrap();
+        ip.insert("method".into(), ov(Value::from(method)));
+        let dns = if section == "ipv4" {
+            ov(Value::from(Vec::<u32>::new()))
+        } else {
+            ov(Value::from(Vec::<Vec<u8>>::new()))
+        };
+        ip.insert("dns".into(), dns);
+        s
+    }
+
+    #[test]
+    fn dns_on_a_method_that_rejects_it_is_rejected() {
+        for section in ["ipv4", "ipv6"] {
+            for method in ["ignore", "disabled", "link-local"] {
+                let s = with_method_and_dns(section, method);
+                let err = validate_settings(&s).expect_err("libnm rejects this");
+                assert!(
+                    err.to_string().contains(&format!(
+                        "{section}.dns: this property is not allowed for method={method}"
+                    )),
+                    "{err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dns_on_an_accepting_method_is_accepted() {
+        for section in ["ipv4", "ipv6"] {
+            for method in ["auto", "dhcp", "manual", "static", "shared"] {
+                let s = with_method_and_dns(section, method);
+                assert!(validate_settings(&s).is_ok(), "{section} {method}");
+            }
         }
     }
 
@@ -1272,6 +1331,20 @@ impl FakeNmBus {
     pub fn profile_settings(&self, path: &str) -> Option<SettingsMap> {
         let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         st.connections.get(path).map(clone_settings)
+    }
+
+    /// Rewrite a saved profile's IP section method, the way a profile written
+    /// by another tool looks. Used to exercise methods that reject `dns`
+    /// without going through the app's own save path.
+    pub fn set_ip_method(&self, path: &str, section: &str, method: &str) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let s = st
+            .connections
+            .get_mut(path)
+            .unwrap_or_else(|| panic!("no saved profile at {path}"));
+        s.entry(section.to_string())
+            .or_default()
+            .insert("method".into(), ov(Value::from(method)));
     }
 
     pub fn has_profile(&self, path: &str) -> bool {
